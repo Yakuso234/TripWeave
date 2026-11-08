@@ -42,7 +42,16 @@ PostgreSQL 适合服务端多个连接下的事务型业务；MySQL 同样可满
 
 ## 地图供应商比较
 
+2026-11-08 补充：用户报告在高德遇到技术服务许可提示。此前核对了功能和请求合同，目标账号准入尚未验证。高德普通 Web 服务仍是已有适配，供应商的实际采用取决于账号能否创建凭据，以及必要接口能否在个人项目预算内调用。百度公开有个人开发者配额，作为待验证备选。准入和最小实测步骤见 DEPLOYMENT.md。
+
 百度地图的地点检索与步行/公交路线也覆盖首版所需合同。采用高德的依据是本轮已经完成地图适配及异常合同测试，一家供应商可贯通地点 ID、坐标与路线，官方 MCP 也提供相应查询能力，便于后续在保持数据来源一致的条件下验证工具协议。未做跨供应商在线对照，覆盖、精度、费用及配额优劣未判定。若已有百度 AK 或高德权限/配额不满足，用同一组城市和预约样本实测，再决定是否替换。替换时须重新确认地点标识、坐标格式和路线耗时单位，并校对展示来源；单换 Key 不足以切换。
 
 - [百度地点检索](https://lbsyun.baidu.com/docs/webapi?title=placev3%2Fguide%2Fwebservice-placeapiV3%2FinterfaceDocumentV3) 与 [百度轻量公交路线](https://lbsyun.baidu.com/docs/webapi?title=directionlite%2Fguide%2Fwebservice-lwrouteplanapi%2Ftransit)
 - [高德路线](https://lbs.amap.com/api/webservice/guide/api/direction) 与 [高德 MCP](https://lbs.amap.com/api/mcp-server/)
+
+## 无商业地图 Key 的候选路径
+
+- [MyTripPlanner](https://github.com/Prot10/MyTripPlanner) 用 Nominatim 查地点、OSRM 算公路路线，并缓存结果。其做法证明这类原型可以采用开放地图数据。它的自驾场景不直接验证上海步行、公交与餐饮覆盖。
+- [TravelPlanner](https://github.com/OSU-NLP-Group/TravelPlanner) 在评测中通过工具查询本地旅行数据库，由 Agent 针对不同请求生成行程。可借鉴固定数据版本和可复查评测的方法。
+- TripWeave 优先验证 [Geofabrik 上海 OpenStreetMap 数据](https://download.geofabrik.de/asia/china.html) 的单城市样本。先检查中文地名、酒店、餐饮和景点覆盖，再验证步行路网、缺路段处理和一次带固定预约的重新规划。实际运行前保留候选状态。公交、营业、房价和库存分别标记证据范围。导入时记录来源和快照日期，按 [ODbL](https://www.openstreetmap.org/copyright) 保留署名和数据授权信息。
+- 公共 [Nominatim 使用政策](https://operations.osmfoundation.org/policies/nominatim/) 有每秒一次的上限，禁止用系统性请求下载区域内所有地点。区域数据应从开放数据快照获取。
