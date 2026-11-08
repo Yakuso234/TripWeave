@@ -1,6 +1,6 @@
 [project]
 name = "tripweave"
-version = "0.1.0"
+version = "0.2.0"
 description = "A small, evidence-aware travel planning agent experiment"
 requires-python = ">=3.14,<3.15"
 dependencies = [
@@ -8,7 +8,12 @@ dependencies = [
   "uvicorn>=0.30,<1",
   "pydantic-ai-slim[openai]==2.66.0",
   "pydantic-settings>=2.12,<3",
+  "httpx2==2.16.0",
+  "sqlalchemy>=2.0.44,<2.1",
 ]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2,<4"]
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "httpx>=0.28,<1", "ruff>=0.11,<1"]

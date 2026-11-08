@@ -1,0 +1,31 @@
+"""Server-only provider configuration. Never return credentials to the browser."""
+
+from pathlib import Path
+
+from pydantic import AliasChoices, Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).resolve().parent.parent / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+    api_key: SecretStr | None = Field(
+        default=None, validation_alias=AliasChoices("DEEPSEEK_API_KEY", "LLM_API_KEY")
+    )
+    amap_api_key: SecretStr | None = None
+    base_url: str = Field(default="https://api.deepseek.com", validation_alias="LLM_BASE_URL")
+    model: str = Field(default="deepseek-flash", validation_alias="LLM_MODEL")
+    run_timeout: int = Field(default=90, ge=5, le=180, validation_alias="TRIPWEAVE_RUN_TIMEOUT")
+    max_requests: int = Field(default=6, ge=2, le=10, validation_alias="TRIPWEAVE_MAX_REQUESTS")
+    database: str = Field(
+        default=".runtime/tripweave.sqlite3", validation_alias="TRIPWEAVE_DATABASE"
+    )
+    database_url: SecretStr | None = Field(default=None, validation_alias="DATABASE_URL")
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key and self.api_key.get_secret_value().strip())

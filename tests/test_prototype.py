@@ -1,52 +1,45 @@
-import pytest
+"""API acceptance tests; HTTP transport is simulated, planner and DB are real code."""
+
+import httpx2
 from fastapi.testclient import TestClient
+from test_real_planner import handler
 
-from tripweave.app import create_app
-from tripweave.domain import Requirements, fixture_plan, validate_plan
-from tripweave.planner import plan
-
-
-@pytest.mark.asyncio
-async def test_real_framework_tool_feedback_and_retry_limit():
-    req = Requirements(date="2026-11-07")
-    result = await plan(req)
-    assert result["status"] == "ready"
-    assert result["usage"]["requests"] == 3
-    assert [t["event"] for t in result["trace"]] == [
-        "tool",
-        "fixture_fault",
-        "validation",
-        "validation",
-    ]
-    failed = await plan(req, always_invalid=True)
-    assert failed["status"] == "conflict" and failed["error"]
+import tripweave.app as application
+from tripweave.domain import Requirements
+from tripweave.real_planner import run_plan
 
 
-@pytest.mark.asyncio
-async def test_late_departure_conflict_and_cancelled_booking():
-    impossible = await plan(Requirements(date="2026-11-07", start_time="14:30"))
-    assert impossible["status"] == "conflict"
-    cancelled = await plan(Requirements(date="2026-11-07", booking_query=""))
-    assert cancelled["status"] == "ready"
-    assert not any(s["reason"] == "保留用户填写的固定预约" for s in cancelled["itinerary"]["stops"])
+def test_missing_key_blocks_instead_of_returning_demo(tmp_path, monkeypatch):
+    monkeypatch.setenv("AMAP_API_KEY", "")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+    client = TestClient(application.create_app(str(tmp_path / "test.db")))
+    config = client.get("/api/config").json()
+    assert config["supported_modes"] == []
+    assert not config["map_configured"]
+    assert "api_key" not in config
+    trip = client.post("/api/trips", json={"date": "2026-11-07"}).json()
+    response = client.post("/api/trips/" + trip["id"] + "/plan", json={})
+    assert response.status_code == 422 and "AMAP_API_KEY" in response.json()["detail"]
+    assert client.get("/api/catalog").json()["hotels"] == []
+    assert client.post("/api/hotels/preview", json={"date": "2026-11-07"}).status_code == 422
 
 
-def test_unknown_place_and_dropped_booking_are_detected():
-    req = Requirements(date="2026-11-07")
-    output = fixture_plan(req)
-    output.stops[-1].place_id = "invented"
-    assert {i["code"] for i in validate_plan(req, output)} >= {"unknown_place", "booking"}
+def test_full_api_versions_restore_and_pages(tmp_path, monkeypatch):
+    monkeypatch.setenv("AMAP_API_KEY", "test-map-key-not-real")
 
+    async def tested_planner(*args, **kwargs):
+        return await run_plan(*args, **kwargs, transport=httpx2.MockTransport(handler))
 
-def test_full_api_versions_restore_and_pages(tmp_path):
+    monkeypatch.setattr(application, "run_plan", tested_planner)
     path = str(tmp_path / "test.db")
-    client = TestClient(create_app(path))
+    client = TestClient(application.create_app(path))
     assert client.get("/").status_code == 200
     assert client.get("/static/app.js").status_code == 200
-    req = Requirements(date="2026-11-07").model_dump(mode="json")
+    req = Requirements(date="2026-11-07", days=2).model_dump(mode="json")
     trip = client.post("/api/trips", json=req).json()
     url = "/api/trips/" + trip["id"]
     first = client.post(url + "/plan", json={}).json()
+    assert first["status"] == "ready"
     accept = url + "/candidates/" + first["id"] + "/accept"
     assert client.post(accept).json()["accepted_version"] == 1
     assert client.post(accept).json()["accepted_version"] == 1
@@ -60,11 +53,19 @@ def test_full_api_versions_restore_and_pages(tmp_path):
     )
     assert client.post(url + "/candidates/" + stale["id"] + "/accept").status_code == 409
     revised = client.post(url + "/plan", json={}).json()
-    assert revised["itinerary"]["stops"][-1]["start_time"] == "14:00"
+    assert any(
+        s["kind"] == "booking" and s["start_time"] == "14:00" for s in revised["itinerary"]["stops"]
+    )
     assert client.post(url + "/candidates/" + revised["id"] + "/accept").status_code == 200
-    restored = TestClient(create_app(path)).get(url).json()
+    restored = TestClient(application.create_app(path)).get(url).json()
     assert restored["accepted_version"] == 2 and restored["requirements"]["start_time"] == "10:00"
-    assert client.post(url + "/plan", json={"mode": "live"}).status_code == 422
+    history = client.get(url + "/history").json()
+    assert len(history["candidates"]) == 3
+    assert history["candidates"][0]["id"] == revised["id"]
+    assert history["candidates"][-1]["requirements"]["start_time"] == "09:00"
+    assert sum(e["kind"] == "candidate_accepted" for e in history["events"]) == 2
+    assert client.get("/api/trips/missing/history").status_code == 404
+    assert client.post(url + "/plan", json={"mode": "replay"}).status_code == 422
     assert (
         client.post("/api/trips", json=req, headers={"origin": "https://other.test"}).status_code
         == 403

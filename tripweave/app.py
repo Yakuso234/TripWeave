@@ -1,72 +1,62 @@
-"""Local-only HTTP application and transactional prototype state."""
+"""Local HTTP workspace. Provider calls run outside short storage transactions."""
 
-import json
-import os
-import sqlite3
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import httpx2
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from sqlalchemy.exc import SQLAlchemyError
+from starlette.concurrency import run_in_threadpool
 
-from .domain import Requirements, place_id
+from .domain import Requirements
 from .identity import WORKSPACE_ID
-from .planner import plan
+from .maps import MapClient, MapError
+from .real_planner import map_configured, prepare, run_plan
+from .settings import Settings
+from .storage import Store, StoreError
 
 STATIC = Path(__file__).parent / "static"
 
 
 def create_app(database: str | None = None) -> FastAPI:
-    db_path = Path(database or os.environ.get("TRIPWEAVE_DATABASE", ".runtime/tripweave.sqlite3"))
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    settings = Settings()
+    target = database or (
+        settings.database_url.get_secret_value() if settings.database_url else settings.database
+    )
+    store = Store(target)
+    store.initialize()
 
-    @contextmanager
-    def connection():
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        await run_in_threadpool(store.dispose)
 
-    with connection() as db:
-        db.executescript(
-            "CREATE TABLE IF NOT EXISTS trips (id TEXT PRIMARY KEY, body TEXT NOT NULL);"
-            "CREATE TABLE IF NOT EXISTS candidates (id TEXT PRIMARY KEY, trip_id TEXT NOT NULL, body TEXT NOT NULL);"
-        )
+    app = FastAPI(title="TripWeave · 旅行规划工作台", lifespan=lifespan)
+    app.state.store = store
 
-    def read_trip(db, trip_id):
-        row = db.execute("SELECT body FROM trips WHERE id=?", (trip_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "行程不存在")
-        return json.loads(row[0])
+    @app.exception_handler(StoreError)
+    async def storage_error(request, exc):
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
 
-    def save_trip(db, trip):
-        db.execute(
-            "INSERT OR REPLACE INTO trips VALUES (?, ?)",
-            (trip["id"], json.dumps(trip, ensure_ascii=False)),
+    @app.exception_handler(SQLAlchemyError)
+    async def database_error(request, exc):
+        # Do not expose SQL parameters, private plans or credential-bearing DSNs.
+        return JSONResponse(
+            {"detail": "数据库暂时不可用，请稍后重试；当前操作未确认保存"}, status_code=503
         )
 
     def check_requirements(req):
-        try:
-            if req.city not in ("上海", "上海市"):
-                raise ValueError("当前离线实验只覆盖上海固定样本")
-            place_id(req.origin_query)
-            if req.booking_query:
-                place_id(req.booking_query)
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
-
-    app = FastAPI(title="TripWeave · 离线实验")
+        if not req.city.strip() or not req.origin_query.strip():
+            raise HTTPException(422, "请填写目的地城市和出发地点")
 
     @app.get("/api/health")
     def health():
-        return {"application": "tripweave", "workspace_id": WORKSPACE_ID, "mode": "replay"}
+        return {"application": "tripweave", "workspace_id": WORKSPACE_ID, "version": "0.2.0"}
 
     @app.middleware("http")
     async def same_origin(request: Request, call_next):
@@ -81,33 +71,55 @@ def create_app(database: str | None = None) -> FastAPI:
 
     @app.get("/api/config")
     def config():
+        settings = Settings()
+        tomorrow = (datetime.now(timezone(timedelta(hours=8))) + timedelta(days=1)).date()
         return {
-            "model_configured": False,
-            "map_configured": False,
-            "supported_modes": ["replay"],
-            "default_date": (datetime.now(timezone(timedelta(hours=8))) + timedelta(days=1))
-            .date()
-            .isoformat(),
+            "model_configured": settings.configured,
+            "map_configured": map_configured(settings),
+            "supported_modes": (["basic", "deepseek"] if settings.configured else ["basic"])
+            if map_configured(settings)
+            else [],
+            "model": settings.model,
+            "provider": "DeepSeek / 兼容接口",
+            "base_url": settings.base_url,
+            "default_date": tomorrow.isoformat(),
+            "defaults": Requirements(date=tomorrow, days=2).model_dump(mode="json"),
         }
+
+    @app.get("/api/catalog")
+    def catalog():
+        return {"places": [], "hotels": [], "source": "规划时查询高德真实地点，不使用固定样本"}
+
+    @app.post("/api/hotels/preview")
+    async def preview_hotels(req: Requirements):
+        check_requirements(req)
+        settings = Settings()
+        if not map_configured(settings):
+            raise HTTPException(422, "请先配置高德Web服务Key，再查询真实酒店")
+        try:
+            async with httpx2.AsyncClient(timeout=15) as client:
+                maps = MapClient(client, settings.amap_api_key.get_secret_value(), max_calls=8)
+                data = await prepare(req, maps, [], hotels_only=True)
+            return {"options": data["hotels"], "recommended": data["hotel"]}
+        except MapError as exc:
+            raise HTTPException(502, str(exc)) from exc
+
+    @app.get("/api/trips")
+    def list_trips():
+        return store.list_trips()
 
     @app.post("/api/trips")
     def create(req: Requirements):
         check_requirements(req)
-        trip = {
-            "id": uuid4().hex,
-            "requirements": req.model_dump(mode="json"),
-            "requirements_revision": 1,
-            "accepted_version": 0,
-            "accepted_plan": None,
-        }
-        with connection() as db:
-            save_trip(db, trip)
-        return trip
+        return store.create_trip(req.model_dump(mode="json"))
 
     @app.get("/api/trips/{trip_id}")
     def get(trip_id: str):
-        with connection() as db:
-            return read_trip(db, trip_id)
+        return store.get_trip(trip_id)
+
+    @app.get("/api/trips/{trip_id}/history")
+    def history(trip_id: str):
+        return store.history(trip_id)
 
     class Revision(Requirements):
         expected_revision: int
@@ -116,65 +128,46 @@ def create_app(database: str | None = None) -> FastAPI:
     def update(trip_id: str, payload: Revision):
         req = Requirements.model_validate(payload.model_dump())
         check_requirements(req)
-        with connection() as db:
-            db.execute("BEGIN IMMEDIATE")
-            trip = read_trip(db, trip_id)
-            if payload.expected_revision != trip["requirements_revision"]:
-                raise HTTPException(409, "需求已更新，请刷新后重试")
-            trip["requirements"] = req.model_dump(mode="json")
-            trip["requirements_revision"] += 1
-            save_trip(db, trip)
-        return trip
+        return store.update_requirements(
+            trip_id, req.model_dump(mode="json"), payload.expected_revision
+        )
 
     class PlanRequest(BaseModel):
-        mode: str = "replay"
+        mode: str = "basic"
 
     @app.post("/api/trips/{trip_id}/plan")
     async def generate(trip_id: str, payload: PlanRequest):
-        if payload.mode != "replay":
-            raise HTTPException(422, "此版仅支持固定模型＋固定地图，真实调用尚未接入")
-        with connection() as db:
-            trip = read_trip(db, trip_id)
+        if payload.mode not in ("basic", "deepseek"):
+            raise HTTPException(422, "请选择真实地图基础规划或DeepSeek模式")
+        settings = Settings()
+        if not map_configured(settings):
+            raise HTTPException(
+                422, "尚未配置AMAP_API_KEY，请先接入真实地图；系统不会输出固定演示行程"
+            )
+        if payload.mode == "deepseek" and not settings.configured:
+            raise HTTPException(422, "尚未配置DeepSeek API Key，请在项目.env填写后刷新配置")
+        trip = await run_in_threadpool(store.get_trip, trip_id)
         candidate = {
             "id": uuid4().hex,
             "trip_id": trip_id,
             "requirements_revision": trip["requirements_revision"],
             "base_version": trip["accepted_version"],
-            "mode": "replay",
+            "requirements": trip["requirements"],
+            "mode": payload.mode,
             "created_at": datetime.now(UTC).isoformat(),
-            **await plan(Requirements.model_validate(trip["requirements"])),
+            **await run_plan(
+                Requirements.model_validate(trip["requirements"]),
+                mode=payload.mode,
+                settings=settings,
+                previous_plan=trip["accepted_plan"],
+            ),
         }
-        with connection() as db:
-            db.execute(
-                "INSERT INTO candidates VALUES (?, ?, ?)",
-                (candidate["id"], trip_id, json.dumps(candidate, ensure_ascii=False)),
-            )
+        await run_in_threadpool(store.add_candidate, candidate)
         return candidate
 
     @app.post("/api/trips/{trip_id}/candidates/{candidate_id}/accept")
     def accept(trip_id: str, candidate_id: str):
-        with connection() as db:
-            db.execute("BEGIN IMMEDIATE")
-            trip = read_trip(db, trip_id)
-            if trip["accepted_plan"] and trip["accepted_plan"]["id"] == candidate_id:
-                return trip
-            row = db.execute(
-                "SELECT body FROM candidates WHERE id=? AND trip_id=?", (candidate_id, trip_id)
-            ).fetchone()
-            if not row:
-                raise HTTPException(404, "候选不存在")
-            candidate = json.loads(row[0])
-            if candidate["status"] != "ready":
-                raise HTTPException(409, "此候选未通过检查")
-            if (
-                candidate["requirements_revision"] != trip["requirements_revision"]
-                or candidate["base_version"] != trip["accepted_version"]
-            ):
-                raise HTTPException(409, "候选依据的需求或行程已过时，请重新生成")
-            trip["accepted_plan"] = candidate
-            trip["accepted_version"] += 1
-            save_trip(db, trip)
-        return trip
+        return store.accept_candidate(trip_id, candidate_id)
 
     @app.get("/")
     def index():

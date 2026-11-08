@@ -2,6 +2,8 @@
 
 2026-11-06；状态：采用用于离线原型，真实模型适配待验证。
 
+2026-11-07 补充：以下保留 v0.1 历史依据；v0.2 已替换固定产品路径，当前真实接口与数据库决策见 ADR-002，最新验证见 V02_QA.md。
+
 采用本机Python3.14.7、PydanticAI Slim2.66.0、Pydantic2.14.3、FastAPI0.162.0、SQLite、原生HTML/CSS/JavaScript、uv、pytest和Ruff。完整版本由uv.lock固定。
 
 ## 为什么采用
