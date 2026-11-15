@@ -19,7 +19,7 @@ from test_storage import (
     test_two_different_candidates_cannot_both_be_accepted as check_competing_candidates,
 )
 
-from tripweave.storage import Store
+from tripweave.storage import Store, StoreError
 
 
 @pytest.fixture
@@ -59,3 +59,14 @@ def postgres_store():
 )
 def test_postgres_transaction_contract(postgres_store, monkeypatch, check):
     check(postgres_store, monkeypatch)
+
+
+def test_postgres_profile_preferences_and_revision(postgres_store):
+    assert postgres_store.get_preferences()["revision"] == 0
+    saved = postgres_store.save_preferences({"pace": "relaxed"}, 0)
+    assert postgres_store.get_preferences() == saved
+    with pytest.raises(StoreError) as conflict:
+        postgres_store.save_preferences({"pace": "full"}, 0)
+    assert conflict.value.status_code == 409
+    updated = postgres_store.save_preferences({"pace": "full"}, 1)
+    assert postgres_store.get_preferences() == updated

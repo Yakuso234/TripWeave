@@ -3,7 +3,9 @@
 from datetime import date
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .planning_contracts import VisitConstraint
 
 Clock = Annotated[str, Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")]
 
@@ -17,30 +19,65 @@ def clock(value: int) -> str:
     return f"{value // 60:02d}:{value % 60:02d}"
 
 
-class Requirements(BaseModel):
-    city: str = Field(default="上海", max_length=40)
-    date: date
-    days: int = Field(default=1, ge=1, le=3)
-    party_size: int = Field(default=2, ge=1, le=6)
-    budget_total: int = Field(default=3000, ge=100, le=100000)
+class AttractionSelection(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=200)
+
+
+class TravelPreferences(BaseModel):
     hotel_budget: int = Field(default=450, ge=100, le=5000)
     hotel_preference: Literal["balanced", "value", "riverside"] = "balanced"
-    hotel_id: str | None = None
     pace: Literal["relaxed", "balanced", "full"] = "balanced"
     transport: Literal["walking", "mixed"] = "mixed"
-    origin_query: str = Field(default="人民广场", max_length=200)
-    start_time: Clock = "09:00"
-    end_time: Clock = "20:30"
     interests: str = Field(default="城市漫步、历史人文、美食探索", max_length=500)
+    custom_interests: str = Field(default="", max_length=300)
+    custom_pace: str = Field(default="", max_length=300)
+    custom_transport: str = Field(default="", max_length=300)
+    custom_hotel: str = Field(default="", max_length=300)
+    max_activities: int = Field(default=3, ge=1, le=5)
+
+
+class Requirements(TravelPreferences):
+    model_config = ConfigDict(extra="forbid")
+
+    city: str = Field(default="上海", max_length=40)
+    date: date
+    days: int = Field(default=1, ge=1, le=7)
+    nights: int | None = Field(default=None, ge=0, le=6)
+    party_size: int = Field(default=2, ge=1, le=6)
+    budget_total: int = Field(default=3000, ge=100, le=100000)
+    hotel_id: str | None = None
+    origin_query: str = Field(default="人民广场", max_length=200)
+    start_time: Clock = Field(
+        default="09:00", description="每天从当天起点出发的时刻，目的地当地时间"
+    )
+    end_time: Clock = Field(
+        default="20:30", description="每日所有站点结束的最晚边界，目的地当地时间"
+    )
+    must_visit: list[Annotated[str, Field(min_length=1, max_length=80)]] = Field(
+        default_factory=list, max_length=5
+    )
+    selected_attractions: list[AttractionSelection] = Field(default_factory=list, max_length=5)
+    visit_constraints: list[VisitConstraint] = Field(default_factory=list, max_length=10)
     notes: str = Field(default="", max_length=1500)
-    booking_query: str = Field(default="上海博物馆", max_length=200)
-    booking_day: int = Field(default=1, ge=1, le=3)
+    booking_query: str = Field(default="", max_length=200)
+    booking_day: int = Field(default=1, ge=1, le=7)
     booking_start: Clock = "14:00"
     booking_end: Clock = "15:00"
-    max_activities: int = Field(default=3, ge=1, le=5)
+
+    @property
+    def hotel_nights(self) -> int:
+        return self.days - 1 if self.nights is None else self.nights
 
     @model_validator(mode="after")
     def valid_windows(self):
+        ids = [constraint.constraint_id for constraint in self.visit_constraints]
+        if len(ids) != len(set(ids)):
+            raise ValueError("景点时间要求的标识不能重复")
+        if any(window.day > self.days for c in self.visit_constraints for window in c.windows):
+            raise ValueError("景点时间要求不能超出旅行天数，请调整可选日期")
+        if self.hotel_nights >= self.days:
+            raise ValueError("住宿晚数须少于旅行天数")
         if self.start_time >= self.end_time:
             raise ValueError("出发时间必须早于每日结束边界")
         if self.booking_query and (
@@ -51,10 +88,14 @@ class Requirements(BaseModel):
 
 
 class Stop(BaseModel):
-    day: int = Field(default=1, ge=1, le=3)
+    day: int = Field(ge=1, le=7)
     place_id: str
-    start_time: Clock
-    end_time: Clock
+    start_time: Clock = Field(
+        description="到达并开始本站的时刻，不是从上一站出发的时刻，目的地当地时间"
+    )
+    end_time: Clock = Field(
+        description="结束本站的时刻，也是前往下一站的最早出发时刻，目的地当地时间"
+    )
     kind: Literal["activity", "booking", "meal", "hotel"] = "activity"
     reason: str = Field(max_length=1000)
     title: str = Field(default="", max_length=100)
@@ -63,4 +104,4 @@ class Stop(BaseModel):
 class Itinerary(BaseModel):
     summary: str = Field(max_length=1500)
     hotel_id: str | None = None
-    stops: list[Stop] = Field(max_length=40)
+    stops: list[Stop] = Field(max_length=56)

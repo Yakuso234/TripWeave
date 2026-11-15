@@ -10,6 +10,7 @@ dependencies = [
   "pydantic-settings>=2.12,<3",
   "httpx2==2.16.0",
   "sqlalchemy>=2.0.44,<2.1",
+  "langgraph>=1,<2",
 ]
 
 [project.optional-dependencies]

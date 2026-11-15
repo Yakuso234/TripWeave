@@ -33,6 +33,8 @@ DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:PORT/tripweave
 
 重启应用后使用 PostgreSQL；不填写或留空则使用 `TRIPWEAVE_DATABASE` 的 SQLite 文件。数据不会自动从本地复制到远端；切换前保留本地库。初始化仅创建缺失的表/索引，不是通用 schema 迁移方案；未来表结构变更需补显式迁移。
 
+长期旅行偏好使用同一个数据库中的 `travel_preferences` 表，通过版本号防止旧编辑覆盖新偏好。当前每个本地工作台使用一份档案。新建旅行时复制偏好为当次需求。
+
 ## 部署后必须验收
 
 - 配置专用测试数据库的进程环境变量 `TRIPWEAVE_TEST_POSTGRES_URL` 后运行 `.\.venv\Scripts\python.exe -m pytest tests/test_postgres.py -q`。测试账号需 CREATE SCHEMA 权限；每个测试只新建和清理自身 UUID schema，不使用 public。不要把生产库当测试环境。

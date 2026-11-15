@@ -26,6 +26,17 @@ def make_candidate(trip, **changes):
     }
 
 
+@pytest.mark.parametrize(
+    "outcome", ["needs_information", "needs_user_decision", "incomplete", "service_error"]
+)
+def test_nonready_workflow_outcome_cannot_be_accepted_even_with_legacy_ready_status(store, outcome):
+    trip = store.create_trip({"city": "上海"})
+    candidate = store.add_candidate(make_candidate(trip, outcome=outcome, draft={"stops": []}))
+    with pytest.raises(StoreError, match="未通过检查"):
+        store.accept_candidate(trip["id"], candidate["id"])
+    assert store.get_trip(trip["id"])["accepted_version"] == 0
+
+
 @pytest.fixture
 def store(tmp_path):
     storage = Store(str(tmp_path / "test.sqlite3"))

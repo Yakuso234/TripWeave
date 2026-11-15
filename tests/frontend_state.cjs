@@ -13,6 +13,7 @@ const requirements = {
   start_time:'09:00', end_time:'20:30', interests:'历史人文', notes:'',
   booking_query:'上海博物馆', booking_day:1, booking_start:'14:00',
   booking_end:'15:00', max_activities:3,
+  visit_constraints:[],
 };
 
 function harness() {
@@ -40,7 +41,7 @@ function harness() {
     Blob, URL:{createObjectURL:() => 'blob:test', revokeObjectURL() {}},
   });
   vm.runInContext(source, context);
-  const app = vm.runInContext('({S,actions,dirty,stalePlan,canAccept,planRequirements,currentHotels,hotelQueryContext,exportPayload,changeDraft,itinerary,hotels,dateFor,stopHeading,loadPlanHistory,planningRecords,adoptTrip,render})', context);
+  const app = vm.runInContext('({S,actions,dirty,stalePlan,canAccept,planRequirements,currentHotels,hotelQueryContext,exportPayload,changeDraft,itinerary,hotels,dateFor,stopHeading,loadPlanHistory,planningRecords,adoptTrip,restoreAttractionDraft,render,preferences,visibleFieldsValid})', context);
   app.S.config = {defaults:copy(requirements), map_configured:true, model_configured:true, model:'test-model'};
   app.S.draft = copy(requirements);
   app.S.trip = {id:'trip-1', requirements:copy(requirements), requirements_revision:1,
@@ -205,4 +206,359 @@ test('input events during a pending action cannot change the planning snapshot',
   h.S.busy = true;
   h.listeners.input({target:{dataset:{field:'city'},type:'text',value:'杭州'}});
   assert.equal(h.S.draft.city, '上海');
+});
+
+test('saving preferences skips hotel search unless the traveler chooses hotels', async () => {
+  const h = harness();
+  await h.actions.finish({dataset:{}});
+  assert.equal(h.S.page, 'itinerary');
+  await h.actions.finish({dataset:{next:'hotels'}});
+  assert.equal(h.S.page, 'hotels');
+
+  h.S.draft.nights = 0;
+  h.S.trip.requirements.nights = 0;
+  await h.actions.finish({dataset:{next:'hotels'}});
+  assert.equal(h.S.page, 'itinerary');
+});
+
+test('collaborative selection uses current requirements and saves selected POI before planning', async () => {
+  const h = harness();
+  const calls = [];
+  const options = [{id:'museum',name:'博物馆',web_summary:'人文展览，预约待确认。',web_sources:[{title:'开放公告',url:'https://museum.example/visit'}]}];
+  const drafts = new Map();
+  const planned = copy(h.S.candidate);
+  h.context.fetch = async (url, request) => {
+    const body = request.body && JSON.parse(request.body);
+    calls.push({url, body, method:request.method});
+    let data;
+    if (url.endsWith('/confirm')) {
+      const draft = drafts.get(url.slice(0,-'/confirm'.length));
+      assert.equal(body.selection_revision,draft.selection_revision);
+      data = {...h.S.trip, requirements:{...h.S.trip.requirements,
+        selected_attractions:options.filter(p=>draft.selected_ids.includes(p.id)).map(({id,name})=>({id,name}))},
+        requirements_revision:h.S.trip.requirements_revision+1};
+    } else if (url.includes('/attractions/')) {
+      if (!drafts.has(url)) drafts.set(url, {options, selected_ids:[], selection_revision:1});
+      if (request.method === 'PUT') drafts.set(url, {options, selected_ids:body.selected_ids, selection_revision:body.selection_revision+1});
+      data = drafts.get(url);
+    } else {
+      data = url.endsWith('/requirements') ? {...h.S.trip, requirements:body, requirements_revision:h.S.trip.requirements_revision+1}
+        : {...planned, requirements_revision:h.S.trip.requirements_revision};
+    }
+    return {ok:true, json:async () => data};
+  };
+  await h.actions['choose-attractions']();
+  assert.match(h.elements.get('app').innerHTML, /人文展览，预约待确认。/);
+  assert.match(h.elements.get('app').innerHTML, /href="https:\/\/museum\.example\/visit"/);
+  await h.actions['toggle-attraction']({dataset:{id:'museum'}});
+  h.adoptTrip(h.S.trip);
+  await h.restoreAttractionDraft();
+  h.S.page = 'attractions';
+  h.render();
+  assert.match(h.elements.get('app').innerHTML, /确认已选 1 个并生成/);
+  h.changeDraft('date', '2026-11-08');
+  await h.actions['confirm-attractions']();
+  assert.equal(calls.length, 3);
+
+  await h.actions['choose-attractions']();
+  await h.actions['toggle-attraction']({dataset:{id:'museum'}});
+  await h.actions['confirm-attractions']();
+  assert.deepEqual(calls.map(call => [call.method, call.url]), [
+    ['POST', '/api/trips/trip-1/attractions/1'], ['PUT', '/api/trips/trip-1/attractions/1'],
+    ['GET', '/api/trips/trip-1/attractions/1'], ['PUT', '/api/trips/trip-1/requirements'],
+    ['POST', '/api/trips/trip-1/attractions/2'], ['PUT', '/api/trips/trip-1/attractions/2'],
+    ['POST', '/api/trips/trip-1/attractions/2/confirm'], ['POST', '/api/trips/trip-1/plan'],
+  ]);
+  assert.deepEqual(calls[6].body, {selection_revision:2});
+  assert.deepEqual(h.S.trip.requirements.selected_attractions,[{id:'museum',name:'博物馆'}]);
+  assert.equal(calls[7].body.expected_requirements_revision, 3);
+});
+
+test('a conflicting selection confirmation does not start a model planning request', async () => {
+  const h = harness(), calls = [];
+  const saved = {options:[{id:'museum',name:'博物馆'}],selected_ids:['museum'],selection_revision:2};
+  h.context.fetch = async (url,request={}) => {
+    calls.push(url);
+    if(url.endsWith('/confirm')) return {ok:false,status:409,json:async()=>({detail:'选景已更新'})};
+    return {ok:true,json:async()=>url.includes('/attractions/')?saved:copy(h.S.trip)};
+  };
+  await h.actions['choose-attractions']();
+  await h.actions['confirm-attractions']();
+  assert.ok(!calls.some(url=>url.endsWith('/plan')));
+  assert.match(h.elements.get('app').innerHTML,/选景已更新/);
+});
+
+test('long-term preferences prefill a new trip without changing the current trip', async () => {
+  const h = harness();
+  const values = {pace:'relaxed', custom_pace:'午饭后休息一小时'};
+  h.context.fetch = async url => {
+    assert.equal(url, '/api/preferences');
+    return {ok:true, json:async () => ({revision:1, values})};
+  };
+  await h.actions.profile();
+  assert.equal(h.S.draft.pace, 'balanced');
+  assert.match(h.elements.get('app').innerHTML, /午饭后休息一小时/);
+  await h.actions.new();
+  assert.equal(h.S.draft.pace, 'relaxed');
+  assert.equal(h.S.draft.custom_pace, '午饭后休息一小时');
+  assert.equal(h.S.page, 'preferences');
+});
+
+test('nonrepeating batches keep earlier choices, support revisiting and stop at exhaustion', async () => {
+  const h = harness();
+  const pool = Array.from({length:7}, (_,i) => ({id:'p'+i, name:'测试景点'+i,
+    photos:['https://photos.example/'+i+'/1.jpg','https://photos.example/'+i+'/2.jpg','https://photos.example/'+i+'/3.jpg'],
+    rating:4.5, web_summary:'看看建筑与展陈', audience:'喜欢人文的慢游旅行者'}));
+  let saved = {options:pool.slice(0,5), candidate_pool:pool, selected_ids:[], selection_revision:1,
+    seen_ids:pool.slice(0,5).map(p=>p.id), batch_number:1, exhausted:false};
+  const calls = [];
+  h.context.fetch = async (url, options={}) => {
+    const body = options.body && JSON.parse(options.body);
+    calls.push({url, body, method:options.method});
+    if (url.endsWith('/next')) {
+      assert.equal(body.selection_revision, saved.selection_revision);
+      saved = {...saved, options:pool.slice(5), seen_ids:pool.map(p=>p.id),
+        selection_revision:saved.selection_revision+1, batch_number:2, exhausted:true};
+    } else if (options.method === 'PUT') {
+      assert.equal(body.selection_revision, saved.selection_revision);
+      saved = {...saved, selected_ids:body.selected_ids, selection_revision:saved.selection_revision+1};
+    }
+    return {ok:true, json:async () => saved};
+  };
+  await h.actions['choose-attractions']();
+  let html = h.elements.get('app').innerHTML;
+  assert.equal((html.match(/class="card attraction-card/g)||[]).length, 5);
+  assert.match(html, /高德照片/);
+  assert.match(html, /喜欢人文的慢游旅行者/);
+  assert.match(html, /data-photo-gallery/);
+  await h.actions['toggle-attraction']({dataset:{id:'p0'}});
+  await h.actions['next-attractions']();
+  html = h.elements.get('app').innerHTML;
+  assert.equal((html.match(/class="card attraction-card/g)||[]).length, 2);
+  assert.match(html, /回看已浏览的 5 个景点/);
+  assert.match(html, /已选 1 \/ 5/);
+  assert.match(html, /本轮候选已看完/);
+  assert.match(html, /data-action="next-attractions"[^>]*disabled/);
+  const exhaustedCalls = calls.length;
+  await h.actions['next-attractions']();
+  assert.equal(calls.length, exhaustedCalls);
+  await h.actions['toggle-attraction']({dataset:{id:'p1'}});
+  await h.actions['toggle-attraction']({dataset:{id:'p5'}});
+  await h.actions['toggle-attraction']({dataset:{id:'p0'}});
+  assert.deepEqual(saved.selected_ids, ['p1','p5']);
+  h.adoptTrip(h.S.trip);
+  await h.restoreAttractionDraft();
+  h.S.page = 'attractions'; h.render();
+  assert.match(h.elements.get('app').innerHTML, /已选 2 \/ 5/);
+  assert.match(h.elements.get('app').innerHTML, /第 2 批/);
+  assert.equal(saved.seen_ids.length, 7);
+});
+
+test('itinerary summary matches required places by map ID and shows revision notes', () => {
+  const h = harness();
+  h.S.candidate.must_visit_ids = ['p'];
+  h.S.candidate.revision_notes = '第二天晚点出发';
+  const page = h.itinerary();
+  assert.match(page, /真实查询名称的模拟值 · 第 1 天/);
+  assert.match(page, /本次修改要求.*第二天晚点出发/);
+  assert.ok(page.indexOf('行程摘要') < page.indexOf('day-tabs'));
+});
+
+test('photo and introduction shortages are explicit without duplicated photos or invented summaries', async () => {
+  const h = harness();
+  const photos = ['https://photos.example/1.jpg','https://photos.example/1.jpg','https://photos.example/2.jpg'];
+  const options = [
+    {id:'zero',name:'无照片测试',photos:[],recommendation_reason:'与历史兴趣相关'},
+    {id:'one',name:'一张测试',photos:photos.slice(0,1),web_summary:'有来源的介绍',web_sources:[{url:'https://museum.example',title:'介绍页'}]},
+    {id:'two',name:'两张测试',photos,web_sources:[{url:'https://museum.example',title:'资料页'}]},
+  ];
+  h.context.fetch = async () => ({ok:true,json:async () => ({options,candidate_pool:options,
+    selected_ids:[],selection_revision:1,seen_ids:options.map(p=>p.id),exhausted:true})});
+  await h.actions['choose-attractions']();
+  const html = h.elements.get('app').innerHTML;
+  assert.match(html, /暂无可用实景照片/);
+  assert.match(html, /目前仅取得 1 张实景照片/);
+  assert.match(html, /目前仅取得 2 张实景照片/);
+  assert.equal((html.match(/class="photo-frame"/g)||[]).length, 3);
+  assert.match(html, /暂未取得可靠的景点介绍/);
+  assert.match(html, /推荐理由 · 与历史兴趣相关/);
+  assert.doesNotMatch(html, /attraction-summary">推荐理由/);
+  assert.match(html, /资料不足，适合人群待确认/);
+  assert.match(html, /不代表整座城市没有其他值得去的景点/);
+  const broken = {hidden:false,matches:()=>true,nextElementSibling:{hidden:true}};
+  h.listeners.error({target:broken});
+  assert.equal(broken.hidden,true);
+  assert.equal(broken.nextElementSibling.hidden,false);
+});
+
+test('upgraded choices keep their POI IDs and duplicate experiences must be resolved before planning', async () => {
+  const h = harness();
+  const preserved = [{id:'child',name:'旧建筑群',experience_group:'main'},
+    {id:'main',name:'旧主体',experience_group:'main'}];
+  const saved = {candidate_pool:[],options:[],selected_items:preserved,selected_ids:['child','main'],
+    selection_revision:2,seen_ids:['child','main'],exhausted:true};
+  let calls = 0;
+  h.context.fetch = async () => { calls++; return {ok:true,json:async () => saved}; };
+  await h.actions['choose-attractions']();
+  const html = h.elements.get('app').innerHTML;
+  assert.match(html, /旧建筑群/);
+  assert.match(html, /保留的选择中有景点属于同一游玩内容/);
+  assert.match(html, /data-action="confirm-attractions"[^>]*disabled/);
+  await h.actions['confirm-attractions']();
+  assert.equal(calls,1);
+});
+
+
+const inputVisit = (h, id, key, value) => h.listeners.input({target:{dataset:{visitField:key,constraintId:id},value}});
+
+test('time requirements save alternative days and preserve other requirements without mutating the saved version', async () => {
+  const h = harness();
+  h.S.step = 3;
+  h.actions['add-visit-constraint']();
+  const id = h.S.draft.visit_constraints[0].constraint_id;
+  assert.equal(h.S.trip.requirements.visit_constraints.length, 0);
+  assert.equal(h.S.config.defaults.visit_constraints.length, 0);
+  assert.equal(h.visibleFieldsValid(), false);
+  inputVisit(h,id,'place_query','测试自然博物馆');
+  inputVisit(h,id,'days','1,2');
+  inputVisit(h,id,'start_time','13:00');
+  inputVisit(h,id,'end_time','17:00');
+  inputVisit(h,id,'min_duration_minutes','120');
+  assert.equal(h.visibleFieldsValid(), true);
+  assert.equal(h.canAccept(), false);
+  const html = h.preferences();
+  assert.match(html,/完整游玩时段必须落在所填窗口内/);
+  assert.match(html,/任选一天/);
+  let saved;
+  h.context.fetch = async (url, options) => {
+    assert.equal(url,'/api/trips/trip-1/requirements');
+    assert.equal(options.method,'PUT');
+    const {expected_revision,...body} = JSON.parse(options.body);
+    assert.equal(expected_revision,1);
+    saved = body;
+    return {ok:true,json:async()=>({...h.S.trip,requirements:body,requirements_revision:2})};
+  };
+  await h.actions.finish({dataset:{}});
+  assert.equal(saved.notes,requirements.notes);
+  assert.equal(saved.booking_query,requirements.booking_query);
+  assert.equal(saved.visit_constraints[0].fixed,false);
+  assert.equal(saved.visit_constraints[0].place_query,'测试自然博物馆');
+  assert.equal(saved.visit_constraints[0].min_duration_minutes,120);
+  assert.deepEqual(saved.visit_constraints[0].windows,[
+    {day:1,start_time:'13:00',end_time:'17:00'},
+    {day:2,start_time:'13:00',end_time:'17:00'},
+  ]);
+  assert.equal(h.dirty(),false);
+  assert.equal(h.stalePlan(),true);
+});
+
+test('unfinished date input blocks planning and survives rendering without replacing valid saved windows', async () => {
+  const h = harness();
+  h.actions['add-visit-constraint']();
+  const id = h.S.draft.visit_constraints[0].constraint_id;
+  inputVisit(h,id,'place_query','测试景点');
+  inputVisit(h,id,'days','1,');
+  assert.equal(h.S.draft.visit_constraints[0].windows[0].day,1);
+  assert.equal(h.visibleFieldsValid(),false);
+  h.S.step = 3;
+  assert.match(h.preferences(),/value="1,"/);
+  let called = false;
+  h.context.fetch = ()=>{called=true;throw Error('should not submit');};
+  await h.actions.generate();
+  assert.equal(called,false);
+  assert.match(h.elements.get('toast').textContent,/不能重复或留空/);
+  inputVisit(h,id,'days','1,2');
+  assert.equal(h.visibleFieldsValid(),true);
+  inputVisit(h,id,'days','1,1');
+  assert.equal(h.visibleFieldsValid(),false);
+  inputVisit(h,id,'days','1，2');
+  assert.equal(h.visibleFieldsValid(),true);
+});
+
+test('changing the city clears city-specific time requirements, reducing days preserves them for correction', () => {
+  const h = harness();
+  h.actions['add-visit-constraint']();
+  const id = h.S.draft.visit_constraints[0].constraint_id;
+  inputVisit(h,id,'place_query','测试景点');
+  inputVisit(h,id,'days','2');
+  h.changeDraft('days',1);
+  assert.equal(h.S.draft.visit_constraints[0].windows[0].day,2);
+  assert.equal(h.visibleFieldsValid(),false);
+  assert.match(h.elements.get('toast').textContent,/须在本次旅行天数内/);
+  h.changeDraft('city','杭州');
+  assert.equal(h.S.draft.visit_constraints.length,0);
+  assert.match(h.elements.get('toast').textContent,/原城市的景点时间要求已清空/);
+});
+
+test('complex existing windows are preserved read-only and can be removed explicitly', () => {
+  const h = harness();
+  const original = {constraint_id:'existing',place_query:'测试馆',place_id:'known',fixed:false,min_duration_minutes:90,
+    windows:[{day:1,start_time:'10:00',end_time:'12:00'},{day:2,start_time:'14:00',end_time:'17:00'}]};
+  h.S.draft.visit_constraints = [copy(original)];
+  h.S.step = 3;
+  const html = h.preferences();
+  assert.match(html,/第 1 天 · 10:00–12:00/);
+  assert.match(html,/第 2 天 · 14:00–17:00/);
+  assert.match(html,/已完整保留/);
+  assert.doesNotMatch(html,/data-visit-field=/);
+  inputVisit(h,'existing','start_time','09:00');
+  assert.deepEqual(copy(h.S.draft.visit_constraints[0]),original);
+  h.changeDraft('notes','另加普通偏好');
+  assert.deepEqual(copy(h.S.draft.visit_constraints[0]),original);
+  h.actions['remove-visit-constraint']({dataset:{id:'existing'}});
+  assert.equal(h.S.draft.visit_constraints.length,0);
+});
+
+test('time requirement inputs cannot edit a pending planning snapshot and adding stops at ten', () => {
+  const h = harness();
+  for(let i=0;i<10;i++) h.actions['add-visit-constraint']();
+  const first = h.S.draft.visit_constraints[0];
+  h.actions['add-visit-constraint']();
+  assert.equal(h.S.draft.visit_constraints.length,10);
+  h.S.step = 3;
+  assert.match(h.preferences(),/data-action="add-visit-constraint"[^>]*disabled/);
+  h.S.busy = true;
+  inputVisit(h,first.constraint_id,'place_query','不可写入');
+  assert.equal(h.S.draft.visit_constraints[0].place_query,'');
+});
+
+test('all outcome types retain failed drafts without presenting or accepting them as usable itineraries', async () => {
+  const h = harness();
+  const outcomes = {
+    needs_information:'资料待补充',needs_user_decision:'需要调整要求',
+    incomplete:'本次未完成',service_error:'接口异常',
+  };
+  for(const [outcome,label] of Object.entries(outcomes)) {
+    h.S.candidate = {...copy(h.S.candidate),status:'conflict',outcome,error:null,itinerary:null,
+      draft:{summary:'未完成草稿',stops:[{day:1,place_id:'p',reason:'尚未校验的草稿内容'}]},
+      issues:[{category:'missing_fact',day:2,place_id:'p',message:'缺少可靠资料',missing_fields:['opening_hours']}]};
+    const html = h.itinerary();
+    assert.match(html,new RegExp(label));
+    assert.match(html,/草稿已保存，尚不可接受/);
+    assert.match(html,/待补充：开放时段/);
+    assert.doesNotMatch(html,/尚未校验的草稿内容|data-action="revise"/);
+    assert.match(html,/data-action="accept"[^>]*disabled/);
+    assert.equal(h.canAccept(),false);
+    let requested = false;
+    h.context.fetch = ()=>{requested=true;throw Error('should not accept');};
+    await h.actions.accept();
+    assert.equal(requested,false);
+  }
+  h.S.candidate.outcome = 'incomplete';
+  assert.match(h.itinerary(),/不代表你的旅行需求无解/);
+  const exported = h.exportPayload();
+  assert.equal(exported.candidate.draft.summary,'未完成草稿');
+});
+
+test('history reports the outcome reason and guards inconsistent ready records', () => {
+  const h = harness();
+  h.S.candidate.outcome = 'needs_information';
+  assert.equal(h.canAccept(),false);
+  assert.doesNotMatch(h.itinerary(),/data-action="revise"/);
+  h.S.historyOpen = true;
+  h.S.planHistory = ['needs_information','needs_user_decision','incomplete','service_error'].map((outcome,index)=>
+    ({...copy(h.S.candidate),id:'result-'+index,status:'conflict',outcome}));
+  const html = h.planningRecords();
+  for(const label of ['资料待补充','需要调整要求','本次未完成','接口异常']) assert.match(html,new RegExp(label));
+  assert.doesNotMatch(html,/存在冲突/);
 });

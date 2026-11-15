@@ -4,24 +4,149 @@ import json
 
 import httpx2
 import pytest
+from pydantic import ValidationError
 from test_real_planner import configured, handler, poi
 
 import tripweave.real_planner as planner
-from tripweave.domain import Requirements, Stop
+from tripweave.domain import Itinerary, Requirements, Stop
 from tripweave.maps import MapClient, MapError
 
 
+@pytest.mark.parametrize(
+    ("origin", "place", "expected"),
+    [
+        ({"citycode": "", "city": "上海市"}, {"citycode": "", "city": "上海市"}, True),
+        ({"citycode": "021", "city": "上海市"}, {"citycode": "", "city": "上海市"}, True),
+        ({"citycode": "021", "city": "上海市"}, {"citycode": "010", "city": "上海市"}, False),
+        ({"citycode": "", "city": "上海市"}, {"citycode": "", "city": "杭州市"}, False),
+        ({"citycode": "", "city": ""}, {"citycode": "", "city": ""}, False),
+        ({"citycode": " ", "city": " "}, {"citycode": " ", "city": " "}, False),
+    ],
+)
+def test_city_identity_uses_provider_fields_without_guessing(origin, place, expected):
+    assert planner.same_city(origin, place) is expected
+
+
+async def test_collaborative_basic_pois_with_cityname_but_no_citycode_can_be_required():
+    def provider(request):
+        response = handler(request)
+        if request.url.path.endswith("/place/text"):
+            payload = response.json()
+            for place in payload["pois"]:
+                place["cityname"] = "上海市"
+            return httpx2.Response(200, json=payload)
+        return response
+
+    req = Requirements(date="2026-11-21", selected_attractions=[{"id": "p7", "name": "接口景点7"}])
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(provider)) as client:
+        maps = MapClient(client, "test-map-key")
+        data = await planner.prepare(req, maps, [])
+        assert [p["id"] for p in data["must_visit"]] == ["p7"]
+        assert data["origin"]["citycode"] == ""
+        assert maps.calls == 3  # No extra detail lookup to recover a missing city code.
+
+
+async def test_collaborative_selection_is_resolved_by_id_and_required():
+    def provider(request):
+        response = handler(request)
+        if request.url.path.endswith("/place/text"):
+            payload = response.json()
+            for place in payload["pois"]:
+                place["citycode"] = "021"
+            return httpx2.Response(200, json=payload)
+        return response
+
+    req = Requirements(
+        date="2026-11-07",
+        must_visit=["接口景点6"],
+        selected_attractions=[{"id": "p7", "name": "接口景点7"}],
+    )
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(provider)) as client:
+        maps = MapClient(client, "test-map-key")
+        data = await planner.prepare(req, maps, [])
+        assert [place["id"] for place in data["must_visit"]] == ["p6", "p7"]
+        stop = Stop(day=1, place_id="p0", start_time="10:00", end_time="11:00", reason="游览")
+        issues = await planner.validate(req, Itinerary(summary="测试", stops=[stop]), data, maps)
+        assert [issue["code"] for issue in issues] == ["must_visit", "must_visit"]
+
+
+def test_model_stop_requires_explicit_day():
+    stop = {
+        "place_id": "p7",
+        "start_time": "10:00",
+        "end_time": "11:00",
+        "reason": "test outing",
+    }
+    with pytest.raises(ValidationError, match="day"):
+        Stop.model_validate(stop)
+    assert Stop.model_validate({**stop, "day": 2}).day == 2
+
+
+@pytest.mark.parametrize("fixed_booking", [False, True])
+async def test_duplicate_visit_identifies_edit_day_and_preserves_fixed_booking(fixed_booking):
+    req = Requirements(
+        date="2026-11-07",
+        days=2,
+        booking_query="上海博物馆" if fixed_booking else "",
+        booking_day=2,
+    )
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as client:
+        maps = MapClient(client, "test-map-key")
+        data = await planner.prepare(req, maps, [])
+        place_id = "b" if fixed_booking else "p0"
+        plan = Itinerary(
+            summary="测试",
+            hotel_id="h",
+            stops=[
+                Stop(day=1, place_id=place_id, start_time="10:00", end_time="11:00", reason="游览"),
+                Stop(
+                    day=1,
+                    place_id="h",
+                    kind="hotel",
+                    start_time="18:00",
+                    end_time="18:15",
+                    reason="回酒店",
+                ),
+                Stop(
+                    day=2,
+                    place_id=place_id,
+                    kind="booking" if fixed_booking else "activity",
+                    start_time=req.booking_start,
+                    end_time=req.booking_end,
+                    reason="游览",
+                ),
+            ],
+        )
+        issues = await planner.validate(req, plan, data, maps)
+    assert [issue["code"] for issue in issues] == ["duplicate"]
+    issue = issues[0]
+    assert issue["place_id"] == place_id
+    if fixed_booking:
+        assert issue["day"] == 1 and issue["keep_day"] == 2
+        assert issue["stop_number"] == issue["keep_stop_number"] == 1
+        assert issue["keep_kind"] == "booking"
+    else:
+        assert issue["related_days"] == [1, 2]
+        assert [(item["day"], item["stop_number"]) for item in issue["occurrences"]] == [
+            (1, 1),
+            (2, 1),
+        ]
+        assert "keep_day" not in issue and "day" not in issue
+
+
 @pytest.mark.asyncio
-async def test_overnight_location_must_match_next_morning_origin():
+@pytest.mark.parametrize("meal_place_id", ["p7", "h"])
+async def test_overnight_day_rejects_a_meal_as_final_stop(meal_place_id):
     req = Requirements(date="2026-11-07", days=2)
     async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as client:
         maps = MapClient(client, "test-map-key")
         data = await planner.prepare(req, maps, [])
+        assert data["booking"] is None
         plan = await planner.schedule(req, data, maps)
         # Checking in earlier does not account for a later outing's return leg.
         outing = Stop(
             day=1,
-            place_id="p7",
+            place_id=meal_place_id,
             start_time="20:00",
             end_time="20:20",
             kind="meal",
@@ -31,12 +156,18 @@ async def test_overnight_location_must_match_next_morning_origin():
             [s for s in plan.stops if s.day == 1] + [outing] + [s for s in plan.stops if s.day == 2]
         )
         issues = await planner.validate(req, plan, data, maps)
-        assert any(i["code"] == "hotel_return" for i in issues)
+        assert any(i["code"] == "hotel_return" and i["day"] == 1 for i in issues)
 
 
 @pytest.mark.asyncio
 async def test_morning_appointment_has_lunch_and_final_day_has_no_extra_night():
-    req = Requirements(date="2026-11-07", days=2, booking_start="10:30", booking_end="11:30")
+    req = Requirements(
+        date="2026-11-07",
+        days=2,
+        booking_query="上海博物馆",
+        booking_start="10:30",
+        booking_end="11:30",
+    )
     result = await planner.run_plan(
         req, "basic", configured(), transport=httpx2.MockTransport(handler)
     )
@@ -184,4 +315,4 @@ async def test_map_client_remains_open_during_final_model_validation(monkeypatch
         req, "deepseek", configured(), transport=httpx2.MockTransport(provider)
     )
     assert result["status"] == "ready", result["error"]
-    assert validations == [False, False]
+    assert validations == [False]

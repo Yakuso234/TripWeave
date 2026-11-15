@@ -12,9 +12,11 @@ from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import (
+    JSON,
     Column,
     ForeignKey,
     Index,
+    Integer,
     MetaData,
     String,
     Table,
@@ -26,8 +28,10 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.engine import URL, make_url
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.pool import StaticPool
+
+from .evidence import freeze_evidence, load_evidence, rebind_evidence
 
 
 class StoreError(Exception):
@@ -37,8 +41,24 @@ class StoreError(Exception):
 
 
 metadata = MetaData()
+travel_preferences = Table(
+    "travel_preferences",
+    metadata,
+    Column("id", String(20), primary_key=True),
+    Column("revision", Integer, nullable=False),
+    Column("body", JSON, nullable=False),
+)
+LOCAL_PROFILE_ID = "local"
 trips = Table(
     "trips", metadata, Column("id", Text, primary_key=True), Column("body", Text, nullable=False)
+)
+attraction_drafts = Table(
+    "attraction_drafts",
+    metadata,
+    Column("trip_id", Text, ForeignKey("trips.id"), primary_key=True),
+    Column("requirements_revision", Integer, primary_key=True),
+    Column("selection_revision", Integer, nullable=False),
+    Column("body", JSON, nullable=False),
 )
 candidates = Table(
     "candidates",
@@ -125,6 +145,45 @@ class Store:
     def dispose(self) -> None:
         self.engine.dispose()
 
+    def get_preferences(self) -> dict:
+        with self._transaction() as connection:
+            row = (
+                connection.execute(
+                    select(
+                        travel_preferences.c.revision, travel_preferences.c.body.label("values")
+                    ).where(travel_preferences.c.id == LOCAL_PROFILE_ID)
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return dict(row) if row else {"revision": 0, "values": {}}
+
+    def save_preferences(self, values: dict, expected_revision: int) -> dict:
+        revision = expected_revision + 1
+        conflict = "长期偏好已被其他操作更新，请重新读取后再保存。"
+        with self._transaction() as connection:
+            if expected_revision == 0:
+                try:
+                    connection.execute(
+                        travel_preferences.insert().values(
+                            id=LOCAL_PROFILE_ID, revision=revision, body=values
+                        )
+                    )
+                except IntegrityError:
+                    raise StoreError(409, conflict) from None
+            else:
+                changed = connection.execute(
+                    update(travel_preferences)
+                    .where(
+                        travel_preferences.c.id == LOCAL_PROFILE_ID,
+                        travel_preferences.c.revision == expected_revision,
+                    )
+                    .values(revision=revision, body=values)
+                )
+                if changed.rowcount != 1:
+                    raise StoreError(409, conflict)
+        return {"revision": revision, "values": values}
+
     @contextmanager
     def _transaction(self):
         try:
@@ -190,6 +249,170 @@ class Store:
             )
         return trip
 
+    def _attraction_draft(self, connection, trip_id: str, requirements_revision: int):
+        _, trip = self._read(connection, trip_id)
+        if trip["requirements_revision"] != requirements_revision:
+            raise StoreError(409, "旅行偏好已更新，请重新进入选景。")
+        key = (
+            attraction_drafts.c.trip_id == trip_id,
+            attraction_drafts.c.requirements_revision == requirements_revision,
+        )
+        row = connection.execute(select(attraction_drafts).where(*key)).mappings().one_or_none()
+        draft = {**row["body"], "selection_revision": row["selection_revision"]} if row else None
+        return key, draft
+
+    def get_attraction_draft(self, trip_id: str, requirements_revision: int) -> dict | None:
+        with self._transaction() as connection:
+            _, draft = self._attraction_draft(connection, trip_id, requirements_revision)
+            return draft
+
+    def create_attraction_draft(self, trip_id: str, requirements_revision: int, body: dict) -> dict:
+        with self._transaction() as connection:
+            _, existing = self._attraction_draft(connection, trip_id, requirements_revision)
+            if existing is not None:
+                return existing
+            try:
+                with connection.begin_nested():
+                    connection.execute(
+                        attraction_drafts.insert().values(
+                            trip_id=trip_id,
+                            requirements_revision=requirements_revision,
+                            selection_revision=1,
+                            body=body,
+                        )
+                    )
+            except IntegrityError:
+                _, existing = self._attraction_draft(connection, trip_id, requirements_revision)
+                if existing is not None:
+                    return existing
+                raise
+        return {**body, "selection_revision": 1}
+
+    def update_attraction_draft(
+        self,
+        trip_id: str,
+        requirements_revision: int,
+        selection_revision: int,
+        selected_ids: list[str],
+    ) -> dict:
+        with self._transaction() as connection:
+            key, draft = self._attraction_draft(connection, trip_id, requirements_revision)
+            if draft is None:
+                raise StoreError(404, "选景草稿不存在，请先查询候选。")
+            seen = set(draft.get("seen_ids", [place["id"] for place in draft["options"]]))
+            if not set(selected_ids) <= seen:
+                raise StoreError(422, "请选择本次查询中的景点。")
+            known = {
+                place["id"]: place
+                for place in draft.get("candidate_pool", draft["options"])
+                + draft.get("selected_items", [])
+            }
+            groups = set()
+            # Legacy choices can contain several duplicates. Allow gradual removal.
+            removing_only = set(selected_ids) < set(draft["selected_ids"])
+            for place_id in dict.fromkeys(selected_ids):
+                group = known.get(place_id, {}).get("experience_group")
+                if group and group in groups and not removing_only:
+                    raise StoreError(422, "这些景点属于同一游玩内容，请只保留其中一个。")
+                if group:
+                    groups.add(group)
+            draft.pop("selection_revision")
+            draft["selected_ids"] = list(dict.fromkeys(selected_ids))
+            revision = selection_revision + 1
+            updated = connection.execute(
+                update(attraction_drafts)
+                .where(*key, attraction_drafts.c.selection_revision == selection_revision)
+                .values(selection_revision=revision, body=draft)
+            )
+            if updated.rowcount != 1:
+                raise StoreError(409, "选景草稿已更新，请重新读取后再选择。")
+        return {**draft, "selection_revision": revision}
+
+    def replace_attraction_batch(
+        self, trip_id: str, requirements_revision: int, selection_revision: int, body: dict
+    ) -> dict:
+        saved = {key: value for key, value in body.items() if key != "selection_revision"}
+        revision = selection_revision + 1
+        with self._transaction() as connection:
+            key, draft = self._attraction_draft(connection, trip_id, requirements_revision)
+            if draft is None:
+                raise StoreError(404, "选景草稿不存在，请先查询景点。")
+            updated = connection.execute(
+                update(attraction_drafts)
+                .where(*key, attraction_drafts.c.selection_revision == selection_revision)
+                .values(selection_revision=revision, body=saved)
+            )
+            if updated.rowcount != 1:
+                raise StoreError(409, "选景已更新，请重新读取后再换一批。")
+        return {**saved, "selection_revision": revision}
+
+    def confirm_attractions(
+        self, trip_id: str, requirements_revision: int, selection_revision: int
+    ) -> dict:
+        """Atomically bridge an inspected selection to the next requirements version."""
+        with self._transaction() as connection:
+            old_body, trip = self._read(connection, trip_id)
+            prior = load_evidence(
+                trip.get("research_evidence"), trip["requirements"], trip["requirements_revision"]
+            )
+            # A lost HTTP response can be retried without confirming twice.
+            if (
+                prior
+                and trip["requirements_revision"] == requirements_revision + 1
+                and prior["source_requirements_revision"] == requirements_revision
+                and prior["selection_revision"] == selection_revision
+            ):
+                return trip
+            key, draft = self._attraction_draft(connection, trip_id, requirements_revision)
+            if draft is None or draft.get("picker_version") != 3:
+                raise StoreError(409, "请先按当前需求重新查询并选择景点。")
+            if draft["selection_revision"] != selection_revision:
+                raise StoreError(409, "选景已更新，请重新读取后确认。")
+            if not draft["selected_ids"]:
+                raise StoreError(422, "请至少选择一个景点。")
+            next_revision = requirements_revision + 1
+            try:
+                evidence = freeze_evidence(
+                    draft,
+                    city=trip["requirements"]["city"],
+                    source_requirements_revision=requirements_revision,
+                    requirements_revision=next_revision,
+                )
+            except ValueError:
+                raise StoreError(
+                    409, "选景资料不完整或存在重复体验，请重新读取并核对后确认。"
+                ) from None
+            reserved = connection.execute(
+                update(attraction_drafts)
+                .where(*key, attraction_drafts.c.selection_revision == selection_revision)
+                .values(selection_revision=selection_revision + 1)
+            )
+            if reserved.rowcount != 1:
+                raise StoreError(409, "选景已更新，请重新读取后确认。")
+            trip["requirements"] = {
+                **trip["requirements"],
+                "selected_attractions": [
+                    {"id": place["place_id"], "name": place["name"]}
+                    for place in evidence["selected"]
+                ],
+            }
+            trip["requirements_revision"] = next_revision
+            trip["research_evidence"] = evidence
+            trip["updated_at"] = now()
+            self._replace(connection, old_body, trip)
+            self._event(
+                connection,
+                trip_id,
+                "attractions_confirmed",
+                {
+                    "source_requirements_revision": requirements_revision,
+                    "selection_revision": selection_revision,
+                    "requirements_revision": next_revision,
+                    "selected_ids": draft["selected_ids"],
+                },
+            )
+        return trip
+
     def get_trip(self, trip_id: str) -> dict:
         with self._transaction() as connection:
             return self._read(connection, trip_id)[1]
@@ -223,6 +446,9 @@ class Store:
                 raise StoreError(409, "需求已更新，请刷新后重试")
             trip["requirements"] = requirements
             trip["requirements_revision"] += 1
+            trip["research_evidence"] = rebind_evidence(
+                trip.get("research_evidence"), requirements, trip["requirements_revision"]
+            )
             trip["updated_at"] = now()
             self._replace(connection, old_body, trip)
             self._event(
@@ -261,6 +487,17 @@ class Store:
             )
         return candidate
 
+    def get_candidate(self, trip_id: str, candidate_id: str) -> dict:
+        with self._transaction() as connection:
+            body = connection.execute(
+                select(candidates.c.body).where(
+                    candidates.c.id == candidate_id, candidates.c.trip_id == trip_id
+                )
+            ).scalar_one_or_none()
+        if body is None:
+            raise StoreError(404, "方案不存在")
+        return json.loads(body)
+
     def accept_candidate(self, trip_id: str, candidate_id: str) -> dict:
         try:
             with self._transaction() as connection:
@@ -276,7 +513,7 @@ class Store:
                 if body is None:
                     raise StoreError(404, "候选不存在")
                 candidate = json.loads(body)
-                if candidate["status"] != "ready":
+                if candidate["status"] != "ready" or candidate.get("outcome", "ready") != "ready":
                     raise StoreError(409, "此候选未通过检查")
                 if (
                     candidate["requirements_revision"] != trip["requirements_revision"]
