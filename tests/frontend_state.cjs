@@ -702,3 +702,160 @@ test('fee panel separates conditional legacy ranges, saved estimates and unknown
   assert.match(html,/模型＋搜索小计<\/span><strong>暂不可算/);
   assert.match(html,/思考已包含在输出中，不再加一次/);
 });
+
+function reviewFixture(h, status='disputed') {
+  const original=copy(h.S.candidate.itinerary);
+  original.summary='首次草稿摘要';
+  original.stops[0].reason='首次草稿站点安排';
+  const latest=copy(original);
+  latest.summary='当前未完成草稿摘要';
+  latest.stops[0].start_time='10:00';
+  latest.stops[0].reason='最新草稿站点安排';
+  const suggestion={suggestion_id:'R1',positions:[{day:1,stop_number:1,place_id:'p'}],
+    concern:'连续游玩后缺少休息',requirement_basis:'用户希望轻松游玩',proposed_change:'在午餐前留出休息时间'};
+  const second={...copy(suggestion),suggestion_id:'R2',concern:'到达时间早于备注',
+    requirement_basis:'说明文字应与时间字段一致',proposed_change:'修改说明中的到达时刻'};
+  const review={version:1,status,
+    initial:{summary:'发现两处可以改善的安排',suggestions:[suggestion,second]},
+    original_draft:original,
+    planner_response:{decisions:[
+      {suggestion_id:'R1',action:'decline',reason:'用户指定了完整参观时段，午餐后已有一小时自由时间'},
+      {suggestion_id:'R2',action:'revise',reason:'已使文字说明与时间字段一致'},
+    ],revised_itinerary:latest},
+    final:{summary:status==='approved'?'认可原休息安排与说明修订':'仍不能认同休息安排',
+      suggestions:status==='approved'?[]:[copy(suggestion)]}};
+  h.S.candidate={...h.S.candidate,mode:'deepseek',review,
+    thinking_configuration:{reviewer:{enabled:true,effort:'max'}},
+    status:status==='approved'?'ready':'conflict',outcome:status==='approved'?'ready':'needs_user_decision',
+    itinerary:status==='approved'?latest:null,draft:status==='approved'?null:latest,
+    issues:status==='approved'?[]:[{category:'review_disagreement',message:suggestion.concern,
+      day:1,stop_number:1,place_id:'p',suggestion_id:'R1'}]};
+  return h.S.candidate;
+}
+
+test('review disagreement shows both arguments, concrete positions and inspectable drafts without declaring infeasibility', async () => {
+  const h=harness();reviewFixture(h);
+  const html=h.itinerary();
+  for(const text of ['规划分歧 · 待你协调','用户希望轻松游玩','连续游玩后缺少休息',
+    '午餐后已有一小时自由时间','已使文字说明与时间字段一致','采纳并修订','保留原安排',
+    '原草稿位置：第 1 天 · 第 1 站 · 真实查询名称的模拟值','仍有分歧',
+    '最新草稿站点安排','首次草稿站点安排','当前未完成草稿摘要','思考强度 max']) {
+    assert.ok(html.includes(text),text);
+  }
+  assert.match(html,/<details class="review-draft"><summary>查看最新完整草稿（尚不可接受）/);
+  assert.match(html,/对照首次校验时的原草稿/);
+  assert.match(html,/这不代表你的需求无法满足/);
+  assert.doesNotMatch(html,/已确认的要求无法同时满足|data-action="revise"/);
+  assert.match(html,/协调后的继续处理方式待讨论/);
+  assert.match(html,/data-action="accept"[^>]*disabled/);
+  let requested=false;
+  h.context.fetch=()=>{requested=true;throw Error('must not accept');};
+  await h.actions.accept();
+  assert.equal(requested,false);
+  assert.deepEqual(copy(h.exportPayload().candidate.review),copy(h.S.candidate.review));
+});
+
+test('review approval permits acceptance only together with program readiness and current versions', () => {
+  const h=harness();reviewFixture(h,'approved');
+  assert.equal(h.canAccept(),true);
+  const html=h.itinerary();
+  assert.match(html,/校验 Agent 已认同当前安排及解释/);
+  assert.match(html,/接受仍需通过程序硬约束和版本检查/);
+  assert.doesNotMatch(html,/仍有分歧|当前未完成草稿摘要|尚不可接受/);
+  h.S.candidate.outcome='incomplete';
+  assert.equal(h.canAccept(),false);
+  h.S.candidate.outcome='ready';
+  h.changeDraft('notes','用户已修改需求');
+  assert.equal(h.canAccept(),false);
+});
+
+test('any unapproved review blocks inconsistent ready records while absent and null legacy reviews remain compatible', () => {
+  const h=harness();
+  for(const review of [{},{status:'pending'},{status:'awaiting_planner'},
+    {status:'awaiting_adjudication'},{status:'incomplete'},{status:'disputed'}]) {
+    h.S.candidate.review=review;
+    assert.equal(h.canAccept(),false,JSON.stringify(review));
+    assert.match(h.itinerary(),/data-action="accept"[^>]*disabled/);
+    if(review.status!=='disputed') assert.match(h.itinerary(),/校验协商未完成/);
+  }
+  h.S.candidate.review=null;
+  assert.equal(h.canAccept(),true);
+  assert.doesNotMatch(h.itinerary(),/行程校验与协商/);
+  delete h.S.candidate.review;
+  assert.equal(h.canAccept(),true);
+});
+
+test('unfinished negotiation identifies the pending stage and never calls budget exhaustion a disagreement', () => {
+  const h=harness();reviewFixture(h);
+  h.S.candidate.review={version:1,status:'incomplete',pending_stage:'final_review',
+    initial:h.S.candidate.review.initial,planner_response:h.S.candidate.review.planner_response};
+  h.S.candidate.outcome='incomplete';h.S.candidate.issues=[];
+  const html=h.itinerary();
+  assert.match(html,/协商未完成/);
+  assert.match(html,/停在校验复核/);
+  assert.match(html,/不代表你的旅行需求无解/);
+  assert.doesNotMatch(html,/规划分歧 · 待你协调|仍有分歧|已确认的要求无法同时满足/);
+  assert.equal(h.canAccept(),false);
+});
+
+test('new final-review concerns appear even without an earlier matching suggestion or planner response', () => {
+  const h=harness();reviewFixture(h);
+  h.S.candidate.review.final.suggestions.push({suggestion_id:'R3',
+    positions:[{day:1,stop_number:1,place_id:'p'}],concern:'修改后的长距离步行需要再确认',
+    requirement_basis:'同行老人希望减少步行',proposed_change:'考虑减少本段步行'});
+  const html=h.itinerary();
+  assert.match(html,/复核发现的新问题 · R3/);
+  assert.match(html,/同行老人希望减少步行/);
+  assert.match(html,/尚无逐项回应记录/);
+});
+
+test('review text, place names and saved draft content are HTML escaped', () => {
+  const h=harness();reviewFixture(h);
+  const payload='<img src=x onerror="alert(1)">';
+  const review=h.S.candidate.review;
+  review.initial.summary=payload;review.final.summary=payload;
+  for(const report of [review.initial,review.final]) for(const suggestion of report.suggestions) {
+    suggestion.suggestion_id=payload;suggestion.concern=payload;
+    suggestion.requirement_basis=payload;suggestion.proposed_change=payload;
+  }
+  review.planner_response.decisions=[{suggestion_id:payload,action:'decline',reason:payload}];
+  h.S.candidate.draft.summary=payload;h.S.candidate.draft.stops[0].reason=payload;
+  h.S.candidate.places[0].name=payload;
+  const html=h.itinerary();
+  assert.ok(html.includes('&lt;img src=x onerror=&quot;alert(1)&quot;&gt;'));
+  assert.doesNotMatch(html,/<img src=x|<script|onerror="alert/);
+});
+
+test('reloading saved negotiation history preserves disagreement and does not attach reviews to legacy plans', async () => {
+  const h=harness();const disputed=copy(reviewFixture(h));
+  const legacy={...copy(disputed),id:'legacy-accepted',status:'ready',outcome:'ready'};
+  delete legacy.review;delete legacy.draft;
+  legacy.itinerary={stops:[]};
+  h.context.fetch=async()=>({ok:true,json:async()=>({candidates:[disputed,legacy]})});
+  await h.loadPlanHistory(true);
+  assert.deepEqual(copy(h.S.candidate.review),disputed.review);
+  assert.equal(h.canAccept(),false);
+  h.S.historyOpen=true;
+  assert.match(h.planningRecords(),/规划分歧 · 待你协调/);
+  h.actions['show-candidate']({dataset:{id:'legacy-accepted'}});
+  assert.equal(h.S.candidate.review,undefined);
+  assert.equal(h.canAccept(),true);
+  assert.doesNotMatch(h.itinerary(),/行程校验与协商/);
+});
+
+test('reviewer usage and its saved output cap are visible without replacing historical budgets', () => {
+  const h=harness();observedCalls(h);
+  const observation=h.S.candidate.usage_observation;
+  observation.budget.reviewer_max_output_tokens=6100;
+  observation.model_calls[1]={...observation.model_calls[1],role:'reviewer',max_output_tokens:6100};
+  h.S.config.planning_budget={max_model_requests:10,run_timeout_seconds:180,
+    planner_max_output_tokens:9000,research_max_output_tokens:8000,reviewer_max_output_tokens:9999};
+  const html=h.itinerary();
+  assert.match(html,/2 · 校验/);
+  assert.match(html,/校验 6,100 tokens/);
+  assert.doesNotMatch(html,/9,999/);
+  h.S.page='settings';h.render();
+  const settings=h.elements.get('app').innerHTML;
+  assert.match(settings,/排程、研究、校验三个角色共享 10 次模型请求 \/ 180 秒/);
+  assert.match(settings,/校验 9999 tokens/);
+});

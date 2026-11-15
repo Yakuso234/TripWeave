@@ -36,6 +36,13 @@ from .planning_contracts import (
     validate_visit_constraints,
 )
 from .planning_research import research_missing_information
+from .planning_review import (
+    ReviewContractError,
+    ReviewReport,
+    ReviewSession,
+    validate_positions,
+    validate_response,
+)
 from .settings import Settings
 
 
@@ -589,6 +596,7 @@ class PlanningState(TypedDict, total=False):
     research_facts: list[dict]
     research_search_calls: int
     facts_updated: bool
+    review: dict
 
 
 def model_context(value):
@@ -738,6 +746,7 @@ async def run_planning_graph(
     research_context: dict | None = None,
     *,
     researcher=None,
+    review_session,
     progress: dict | None = None,
 ) -> PlanningState:
     # This in-process snapshot survives a node exception so a failed draft can
@@ -764,6 +773,7 @@ async def run_planning_graph(
                 "research_facts": [],
                 "research_search_calls": 0,
                 "facts_updated": False,
+                "review": {"version": 1, "status": "pending"},
                 "issues": issues,
                 "outcome": "needs_user_decision" if issues else None,
             }
@@ -878,6 +888,13 @@ async def run_planning_graph(
                 "queried_data": model_context(data),
                 "previous_plan": model_context(previous_plan),
             }
+        if not state.get("messages"):
+            prompt["requirements"] = {
+                **req.model_dump(mode="json"),
+                "hotel_nights": req.hotel_nights,
+            }
+            prompt["queried_data"] = model_context(data)
+            prompt["revision_request"] = (previous_plan or {}).get("revision_request")
         if state.get("research_facts"):
             prompt["planning_facts"] = state["research_facts"]
             prompt["fact_instruction"] = (
@@ -1009,16 +1026,149 @@ async def run_planning_graph(
                 or "已知时间、预约、地点与预算预留检查通过",
             }
         )
-        outcome = (
-            "needs_information"
-            if critical
-            else "ready"
-            if not issues
-            else "incomplete"
-            if state["attempts"] >= 3
-            else None
-        )
+        outcome = None
+        if critical:
+            outcome = "needs_information"
+        elif issues and state["attempts"] >= 3:
+            outcome = "incomplete"
         return record({"issues": issues, "outcome": outcome})
+
+    def review_context(state):
+        return {
+            "requirements": {**req.model_dump(mode="json"), "hotel_nights": req.hotel_nights},
+            "revision_request": (previous_plan or {}).get("revision_request"),
+            "queried_data": model_context(data),
+            "known_places": model_context(list(maps.places.values())),
+            "verified_routes": list(maps.cache.values()),
+            "draft": state["candidate"].model_dump(mode="json"),
+            "program_issues": state["issues"],
+            # Avoid repeating full original and revised itineraries inside review.
+            # The latest full draft is above; the reviewer's own history retains
+            # its original input, while only explicit decisions cross roles.
+            "review": {
+                "status": state["review"]["status"],
+                "initial": state["review"].get("initial"),
+                "planner_decisions": state["review"].get("planner_response", {}).get("decisions"),
+            },
+        }
+
+    def review_budget(stage):
+        if usage.requests < settings.max_requests:
+            return None
+        return record(
+            {
+                "outcome": "incomplete",
+                "error": "共享模型请求预算已用完，校验协商尚未完成；不代表规划分歧或需求无解。",
+                "review": {
+                    **progress.get("review", {}),
+                    "status": "incomplete",
+                    "pending_stage": stage,
+                },
+            }
+        )
+
+    async def review_candidate(state):
+        if stopped := review_budget("initial_review"):
+            return stopped
+        trace.append(
+            {"event": "review", "role": "reviewer", "detail": "独立校验Agent检查完整行程与用户体验"}
+        )
+        report = await review_session.review(review_context(state))
+        validate_positions(report, state["candidate"])
+        approved = not report.suggestions
+        return record(
+            {
+                "outcome": "ready" if approved else None,
+                "review": {
+                    "version": 1,
+                    "status": "approved" if approved else "awaiting_planner",
+                    "initial": report.model_dump(mode="json"),
+                    "original_draft": state["candidate"].model_dump(mode="json"),
+                },
+            }
+        )
+
+    async def respond_to_review(state):
+        if stopped := review_budget("planner_response"):
+            return stopped
+        response = await review_session.respond(review_context(state))
+        validate_response(response, ReviewReport.model_validate(state["review"]["initial"]))
+        trace.append(
+            {
+                "event": "review_response",
+                "role": "planner",
+                "detail": "规划Agent逐项解释采纳或不修改的理由，重新运行程序检查",
+            }
+        )
+        updated = {
+            **state["review"],
+            "status": "awaiting_adjudication",
+            "planner_response": response.model_dump(mode="json"),
+        }
+        if response.revised_itinerary is not None and state["attempts"] >= 3:
+            return record(
+                {
+                    "review": {
+                        **updated,
+                        "status": "incomplete",
+                        "pending_stage": "candidate_limit",
+                    },
+                    "outcome": "incomplete",
+                    "error": "已达到最多3份候选草稿，未继续采用额外修订；不代表双方分歧或需求无解。",
+                }
+            )
+        return record(
+            {
+                "review": updated,
+                "candidate": response.revised_itinerary or state["candidate"],
+                "attempts": state["attempts"] + (response.revised_itinerary is not None),
+                # Discard stale draft messages before any program-driven repair.
+                "messages": [],
+                "outcome": None,
+            }
+        )
+
+    async def adjudicate_review(state):
+        if stopped := review_budget("final_review"):
+            return stopped
+        report = await review_session.review(review_context(state))
+        validate_positions(
+            report, state["candidate"], Itinerary.model_validate(state["review"]["original_draft"])
+        )
+        approved = not report.suggestions
+        trace.append(
+            {
+                "event": "review_adjudication",
+                "role": "reviewer",
+                "detail": "校验Agent认同最新方案及解释"
+                if approved
+                else "双方仍有规划分歧，保留草稿与双方理由，等待用户协调",
+            }
+        )
+        return record(
+            {
+                "outcome": "ready" if approved else "needs_user_decision",
+                "review": {
+                    **state["review"],
+                    "status": "approved" if approved else "disputed",
+                    "final": report.model_dump(mode="json"),
+                },
+                "issues": []
+                if approved
+                else [
+                    {
+                        "category": "review_disagreement",
+                        "code": "review_disagreement",
+                        "message": s.concern,
+                        "day": s.positions[0].day,
+                        "stop_number": s.positions[0].stop_number,
+                        "place_id": s.positions[0].place_id,
+                        "suggestion_id": s.suggestion_id,
+                    }
+                    for s in report.suggestions
+                ],
+            }
+        )
 
     def after_preflight(state):
         return END if state.get("outcome") else "prepare_evidence"
@@ -1035,7 +1185,15 @@ async def run_planning_graph(
         return END if state.get("outcome") else "propose"
 
     def next_step(state):
-        return END if state.get("outcome") else "propose"
+        if state.get("outcome"):
+            return END
+        if state["issues"]:
+            return "propose"
+        return (
+            "adjudicate_review"
+            if state["review"]["status"] == "awaiting_adjudication"
+            else "review_candidate"
+        )
 
     graph = StateGraph(PlanningState)
     graph.add_node("preflight", preflight)
@@ -1043,12 +1201,22 @@ async def run_planning_graph(
     graph.add_node("propose", propose)
     graph.add_node("research_information", research_information)
     graph.add_node("check_candidate", check_candidate)
+    graph.add_node("review_candidate", review_candidate)
+    graph.add_node("respond_to_review", respond_to_review)
+    graph.add_node("adjudicate_review", adjudicate_review)
     graph.add_edge(START, "preflight")
     graph.add_conditional_edges("preflight", after_preflight)
     graph.add_conditional_edges("prepare_evidence", after_prepare)
     graph.add_conditional_edges("propose", after_proposal)
     graph.add_conditional_edges("research_information", after_research)
     graph.add_conditional_edges("check_candidate", next_step)
+    graph.add_conditional_edges(
+        "review_candidate", lambda state: END if state.get("outcome") else "respond_to_review"
+    )
+    graph.add_conditional_edges(
+        "respond_to_review", lambda state: END if state.get("outcome") else "check_candidate"
+    )
+    graph.add_edge("adjudicate_review", END)
     return await graph.compile().ainvoke({})
 
 
@@ -1144,6 +1312,9 @@ async def run_plan(
                             retries=2,
                             instructions=(
                                 "你是旅行规划助手。按用户需求和真实工具证据生成方案。"
+                                "当输入task=respond_to_review时进入校验协商，"
+                                "使用respond_to_review输出合同逐项采纳修订或带具体理由拒绝，"
+                                "此时不使用普通final_result或request_information输出合同。"
                                 "首次生成输出完整Itinerary，收到revision_days时仅提交需要修订日期的完整站点。"
                                 "仅使用本次查询或原方案已核实的地点ID。"
                                 "每一站都必须填写day，取值从1到旅行总天数。"
@@ -1222,7 +1393,8 @@ async def run_plan(
                                 "交研究Agent定向补查；无需重做推荐或对所有未知逐一研究。"
                                 "收到planning_facts后结合原需求及全程草稿继续规划，网页报告不等于已预订或官方保证。"
                                 "补查仍未知时如实报告，不假设全天开放。草稿排错应修订草稿；"
-                                "不能仅因自己排不下就声称需求已证无解。只输出计划或资料请求，不执行支付或预订。"
+                                "不能仅因自己排不下就声称需求已证无解。"
+                                "仅按当前任务输出计划、资料请求或校验协商回应，不执行支付或预订。"
                             ),
                         )
 
@@ -1306,6 +1478,9 @@ async def run_plan(
                             model_usage,
                             research_context,
                             researcher=research,
+                            review_session=ReviewSession(
+                                model, agent, settings, model_usage, recorder
+                            ),
                             progress=progress,
                         )
                         issues = state.get("issues", [])
@@ -1331,7 +1506,7 @@ async def run_plan(
                 issues = issues + information_issues(progress["information_request"])
             error = (
                 str(exc)
-                if isinstance(exc, MapError)
+                if isinstance(exc, (MapError, ReviewContractError))
                 else f"本次规划未完成（{type(exc).__name__}），请检查接口配置或减少活动后重试；没有改用固定数据。"
             )
         routes = []
@@ -1389,6 +1564,7 @@ async def run_plan(
             if result is None and progress.get("candidate")
             else None,
             "research_facts": progress.get("research_facts", []),
+            "review": progress.get("review") if mode == "deepseek" else None,
             "pending_information": progress["information_request"].model_dump(mode="json")
             if progress.get("information_request")
             else None,
@@ -1420,6 +1596,7 @@ async def run_plan(
             "thinking_configuration": {
                 "planner": {"enabled": True, "effort": settings.planner_effort},
                 "research": {"enabled": True, "effort": settings.research_effort},
+                "reviewer": {"enabled": True, "effort": settings.reviewer_effort},
             }
             if mode == "deepseek"
             else None,

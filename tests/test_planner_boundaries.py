@@ -5,6 +5,7 @@ import json
 import httpx2
 import pytest
 from pydantic import ValidationError
+from review_mock import with_approved_review
 from test_real_planner import configured, handler, poi
 
 import tripweave.real_planner as planner
@@ -38,7 +39,9 @@ async def test_collaborative_basic_pois_with_cityname_but_no_citycode_can_be_req
         return response
 
     req = Requirements(date="2026-11-21", selected_attractions=[{"id": "p7", "name": "接口景点7"}])
-    async with httpx2.AsyncClient(transport=httpx2.MockTransport(provider)) as client:
+    async with httpx2.AsyncClient(
+        transport=httpx2.MockTransport(with_approved_review(provider))
+    ) as client:
         maps = MapClient(client, "test-map-key")
         data = await planner.prepare(req, maps, [])
         assert [p["id"] for p in data["must_visit"]] == ["p7"]
@@ -61,7 +64,9 @@ async def test_collaborative_selection_is_resolved_by_id_and_required():
         must_visit=["接口景点6"],
         selected_attractions=[{"id": "p7", "name": "接口景点7"}],
     )
-    async with httpx2.AsyncClient(transport=httpx2.MockTransport(provider)) as client:
+    async with httpx2.AsyncClient(
+        transport=httpx2.MockTransport(with_approved_review(provider))
+    ) as client:
         maps = MapClient(client, "test-map-key")
         data = await planner.prepare(req, maps, [])
         assert [place["id"] for place in data["must_visit"]] == ["p6", "p7"]
@@ -312,7 +317,10 @@ async def test_map_client_remains_open_during_final_model_validation(monkeypatch
         )
 
     result = await planner.run_plan(
-        req, "deepseek", configured(), transport=httpx2.MockTransport(provider)
+        req,
+        "deepseek",
+        configured(),
+        transport=httpx2.MockTransport(with_approved_review(provider)),
     )
     assert result["status"] == "ready", result["error"]
     assert validations == [False]

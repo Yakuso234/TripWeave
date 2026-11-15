@@ -6,6 +6,7 @@ from copy import deepcopy
 import httpx2
 import pytest
 from fastapi.testclient import TestClient
+from review_mock import with_approved_review
 from test_planning_research import fact, sources
 from test_planning_research import final as research_final
 from test_real_planner import configured, handler
@@ -69,7 +70,9 @@ def tool_names(body):
 
 async def run(req, provider, *, limit=6):
     settings = configured().model_copy(update={"max_requests": limit})
-    return await run_plan(req, "deepseek", settings, transport=httpx2.MockTransport(provider))
+    return await run_plan(
+        req, "deepseek", settings, transport=httpx2.MockTransport(with_approved_review(provider))
+    )
 
 
 async def test_declared_booking_outside_daily_bounds_stops_before_any_supplier_call():
@@ -167,7 +170,7 @@ async def test_known_draft_error_revises_only_affected_day_and_checks_whole_plan
 
     result = await run(requirements(days=2, max_activities=1), provider)
     assert result["status"] == result["outcome"] == "ready", result
-    assert result["usage"]["requests"] == len(calls) == 2
+    assert result["usage"]["requests"] == len(calls) + 1 == 3
     revision = json.loads(calls[1]["messages"][-1]["content"])
     assert revision["revision_days"] == [1]
     assert revision["reference_stops"][0]["day"] == 2
@@ -207,7 +210,7 @@ async def test_pacing_violation_returns_actual_limit_and_segments_for_local_revi
     assert issue["occurrences"][0]["end_time"] == "12:00"
     assert result["itinerary"] == original
     assert [row["sightseeing_minutes"] for row in result["daily_metrics"]] == [60, 60]
-    assert result["usage"]["requests"] == 2
+    assert result["usage"]["requests"] == 3
 
 
 async def test_planner_research_return_uses_independent_context_and_shared_usage():
@@ -240,9 +243,9 @@ async def test_planner_research_return_uses_independent_context_and_shared_usage
 
     result = await run(requirements(notes=PRIVATE_NOTE), provider)
     assert result["outcome"] == "ready", result
-    assert result["usage"]["requests"] == 4
-    assert result["usage"]["input_tokens"] == 42 * 4
-    assert result["usage"]["output_tokens"] == 20 * 4
+    assert result["usage"]["requests"] == 5
+    assert result["usage"]["input_tokens"] == 42 * 5
+    assert result["usage"]["output_tokens"] == 20 * 5
     assert result["research_rounds"] == result["research_search_calls"] == len(searches) == 1
     assert events == [
         "planner_gap",
@@ -298,9 +301,11 @@ async def test_fact_return_allows_one_full_revision_then_restores_local_repairs(
         return completion("revise_days", {"stops": [original["stops"][1]]}, number)
 
     result = await run(requirements(days=2, notes=PRIVATE_NOTE), provider)
-    assert result["outcome"] == "ready", result
+    # Six calls repaired the draft, leaving no budget for the required reviewer.
+    assert result["outcome"] == "incomplete", result
+    assert result["review"]["pending_stage"] == "initial_review"
     assert result["usage"]["requests"] == len(calls) == 6
-    assert result["itinerary"] == original
+    assert result["itinerary"] is None and result["draft"] == original
     research_input = json.dumps([body["messages"] for body in calls[2:4]])
     assert "PRIVATE-DRAFT-REASON" not in research_input and PRIVATE_NOTE not in research_input
     after_facts = json.loads(calls[4]["messages"][-1]["content"])

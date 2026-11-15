@@ -34,7 +34,7 @@ def assert_mode(body, effort):
 
 @pytest.mark.parametrize("planner,research", [("max", "high"), ("high", "max")])
 async def test_both_roles_think_at_configured_effort_and_keep_reasoning_separate(planner, research):
-    counters = {"planner": 0, "research": 0}
+    counters = {"planner": 0, "research": 0, "reviewer": 0}
     calls = []
 
     def provider(request):
@@ -43,17 +43,28 @@ async def test_both_roles_think_at_configured_effort_and_keep_reasoning_separate
         if request.url.path.endswith("/tools/search"):
             return sources()
         body = json.loads(request.content)
-        role = "research" if "search_place_information" in tool_names(body) else "planner"
+        role = (
+            "reviewer"
+            if "review_report" in tool_names(body)
+            else "research"
+            if "search_place_information" in tool_names(body)
+            else "planner"
+        )
         counters[role] += 1
         number = counters[role]
-        assert_mode(body, planner if role == "planner" else research)
+        assert_mode(
+            body, research if role == "research" else "max" if role == "reviewer" else planner
+        )
         other = "planner" if role == "research" else "research"
         assert f"PRIVATE-THINKING-{other}" not in json.dumps(body["messages"])
         if number > 1:
             assistants = [m for m in body["messages"] if m["role"] == "assistant"]
             assert assistants[0]["reasoning_content"] == f"PRIVATE-THINKING-{role}-1"
         calls.append(body)
-        if role == "research":
+        if role == "reviewer":
+            assert "PRIVATE-THINKING" not in json.dumps(body["messages"])
+            response = completion("review_report", {"summary": "模拟认可", "suggestions": []}, 5)
+        elif role == "research":
             response = (
                 completion("search_place_information", {"place_id": "p0", "day": 1}, 2)
                 if number == 1
@@ -74,14 +85,15 @@ async def test_both_roles_think_at_configured_effort_and_keep_reasoning_separate
         requirements(), "deepseek", settings, transport=httpx2.MockTransport(provider)
     )
     assert result["outcome"] == "ready", result
-    assert counters == {"planner": 2, "research": 2}
-    assert result["usage"]["requests"] == 4
+    assert counters == {"planner": 2, "research": 2, "reviewer": 1}
+    assert result["usage"]["requests"] == 5
     assert result["thinking_configuration"] == {
         "planner": {"enabled": True, "effort": planner},
         "research": {"enabled": True, "effort": research},
+        "reviewer": {"enabled": True, "effort": "max"},
     }
     assert "PRIVATE-THINKING" not in json.dumps(result)
-    assert [b["max_completion_tokens"] for b in calls] == [6000, 4000, 4000, 6000]
+    assert [b["max_completion_tokens"] for b in calls] == [6000, 4000, 4000, 6000, 6000]
 
 
 async def test_planner_tool_and_local_repair_replay_all_thinking_fields():
@@ -100,7 +112,12 @@ async def test_planner_tool_and_local_repair_replay_all_thinking_fields():
                 assert message["reasoning_content"].startswith("PRIVATE-THINKING-round-")
         calls.append(body)
         number = len(calls)
-        if number == 1:
+        if "review_report" in tool_names(body):
+            assert "PRIVATE-THINKING" not in json.dumps(body["messages"])
+            response = completion(
+                "review_report", {"summary": "模拟认可", "suggestions": []}, number
+            )
+        elif number == 1:
             response = completion("lookup_places", {}, number)
         elif number == 2:
             response = completion("final_result", broken, number)
@@ -113,17 +130,18 @@ async def test_planner_tool_and_local_repair_replay_all_thinking_fields():
         requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
     )
     assert result["outcome"] == "ready", result
-    assert len(calls) == 3 and result["usage"]["requests"] == 3
-    assert result["usage_observation"]["model_http_attempts"] == 3
+    assert len(calls) == 4 and result["usage"]["requests"] == 4
+    assert result["usage_observation"]["model_http_attempts"] == 4
     assert [row["role"] for row in result["usage_observation"]["model_calls"]] == [
         "planner",
         "planner",
         "planner",
+        "reviewer",
     ]
     assert "PRIVATE-THINKING" not in json.dumps(result)
 
 
-@pytest.mark.parametrize("field", ["planner_effort", "research_effort"])
+@pytest.mark.parametrize("field", ["planner_effort", "research_effort", "reviewer_effort"])
 def test_invalid_effort_is_rejected(field):
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **{field: "invalid"})

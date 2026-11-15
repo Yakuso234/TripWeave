@@ -1,6 +1,6 @@
 # 当前核心链路与阅读备注
 
-核对日期：2026-11-15。本文对应当前实现。当前已实现 **LangGraph分类编排＋排程Agent＋按需定向事实研究Agent**；初始选景排序与短摘要仍是HTTP函数流水线。两个Agent的职责与剩余边界见[多Agent架构](MULTI_AGENT_PLAN.md)，历史真实测试过程见[QA记录](evaluations/V02_QA.md)。
+核对日期：2026-11-15。本文对应当前实现：**LangGraph分类编排＋排程Agent＋按需定向事实研究Agent＋独立校验Agent**。初始选景排序与短摘要仍是HTTP函数流水线。三角色职责见[多Agent架构](MULTI_AGENT_PLAN.md)，协商合同见[校验协商](REVIEW_NEGOTIATION.md)，真实测试过程见[QA记录](evaluations/V02_QA.md)。
 
 ## 整体链路
 
@@ -13,7 +13,7 @@
                                                 ↓
 LangGraph：preflight → prepare_evidence → propose → check_candidate
              │              │              │             │
-             │              │              │             ├─通过→ready
+             │              │              │             ├─通过→review_candidate独立初审
              │              │              │             ├─草稿有错→propose局部修订
              │              │              │             └─仍缺关键事实/耗尽→明确结束
              │              │              └─明确资料缺口→research_information
@@ -22,12 +22,17 @@ LangGraph：preflight → prepare_evidence → propose → check_candidate
              │              │                                  └─未知/异常/耗尽→明确结束
              └─用户硬要求互斥┴─核实身份/必要交通后仍互斥→needs_user_decision
                                                 ↓
-                              保存结果/草稿/事实/问题至SQLite
+      初审有意见 → respond_to_review修改或解释 → 程序再检查 → adjudicate_review复核
+      初审无意见或复核认同 → ready；复核仍分歧 → needs_user_decision（不是无解证明）
+                                                ↓
+                              保存结果/草稿/事实/协商/问题至SQLite
                                                 ↓
                               仅ready可接受，事务核对需求与接受版本
 ```
 
-图中的预检、地图读取和业务检查是普通程序节点。研究和排程各有自己的Pydantic AI Agent、工具范围、消息上下文及结构化输出，共享本次规划的模型用量与运行时限。
+图中的预检、地图读取和业务检查是普通程序节点。研究、排程和校验各有自己的Pydantic AI角色、工具范围、消息上下文及结构化输出，共享本次规划的模型用量与运行时限。校验没有搜索或执行工具，意见不能覆盖程序检查。
+
+基于旧方案修改时，`revision_request`是本次用户意图，独立传给校验初审、排程协商和校验复核；协商后清空旧消息再修复草稿时也显式保留，不能仅凭旧需求或旧草稿否定本次修订。
 
 ## 一、需求与选景
 
@@ -50,7 +55,7 @@ LangGraph：preflight → prepare_evidence → propose → check_candidate
 
 目的地与所选ID/名称不变时可重新绑定需求版本；换城市或换点则清空。生成前再次核对当前版本与身份，失效快照在供应商调用前拒绝。这份选景资料用于了解游玩内容，不是营业或预约承诺。
 
-## 三、五个LangGraph节点
+## 三、八个LangGraph节点
 
 实际入口是[real_planner.run_plan](../tripweave/real_planner.py)，图在`run_planning_graph`构建。
 
@@ -60,13 +65,16 @@ LangGraph：preflight → prepare_evidence → propose → check_candidate
 | `prepare_evidence` | 高德解析出发点、酒店、必去和约束地点，加载可信选景快照；按已核实身份再次预检，并核对固定承诺之间的必要交通。 | 硬冲突结束；其余到`propose` |
 | `propose` | 排程Agent读取本次需求、证据和草稿，输出`Itinerary`，或输出具体`PlanningInformationRequest`。 | 行程到`check_candidate`；资料缺口到`research_information`；预算/范围错误结束 |
 | `research_information` | 研究Agent只补指定地点、日期和字段，核对实际来源后将事实交回图状态。最多一轮。 | 事实齐备到`propose`；仍未知、服务异常或预算耗尽结束 |
-| `check_candidate` | Python检查整份候选，以及已声明关键事实是否适用于实际安排日期。 | 通过结束；可修草稿回`propose`；关键事实仍缺失或轮数耗尽结束 |
+| `check_candidate` | Python检查整份候选，以及已声明关键事实是否适用于实际安排日期。 | 初次通过到`review_candidate`；已有协商回应则到`adjudicate_review`；可修草稿回`propose`；关键事实仍缺失或轮数耗尽结束 |
+| `review_candidate` | 独立校验Agent读取完整多天安排、用户要求与已知证据，最多5条意见须定位具体站点。 | 无意见ready；有意见到`respond_to_review`；预算不足未完成 |
+| `respond_to_review` | 排程Agent逐条采纳修订或拒绝并解释；有修订返回完整方案，全部拒绝则原草稿不变。 | 回`check_candidate`全量检查；合同或候选/请求预算不足未完成 |
+| `adjudicate_review` | 校验Agent复核最新完整草稿、原意见及逐项回应。 | 认同ready；仍不同意`needs_user_decision/review_disagreement`，不再自动辩论 |
 
 地点必须唯一、身份正确；找不到就提示核对，不用附近地点替代。双方代码完整时比较城市代码，否则仅接受供应商返回的相同非空城市名。酒店只是位置候选，房价、房型和空房未确认。
 
 必要交通预检只处理用户固定承诺：前一预约结束加地图耗时，必须不晚于后一预约开始；已确定的当天起点也检查到首预约的最低耗时。过夜后若酒店尚未手选，不拿程序推荐酒店强行证明用户要求无解。相同地点相同固定窗口可由同一站满足；同地点不同合法预约不会只因重复而被拒绝。预检通过只是未发现这些必要条件冲突，不是对所有组合做完整可行性证明。
 
-## 四、两个Agent如何交接
+## 四、排程与研究的定向交接
 
 排程Agent的工具是`lookup_places`、已知ID之间的`route`、`nearby_restaurants`；基于原方案修改时另有`find_place`。它不能支付、预订或自行放宽用户硬要求。
 
@@ -108,25 +116,27 @@ PlanningInformationRequest(
 
 | outcome | 含义 |
 | --- | --- |
-| `ready` | 当前已知合同与程序检查通过，仍应阅读未核实项 |
-| `needs_user_decision` | 用户明确硬要求之间，或与本次地图最低交通证据之间发现必要条件冲突，请用户调整要求 |
+| `ready` | 当前已知合同与程序检查通过，新版还须校验初审或复核认同；仍应阅读未核实项 |
+| `needs_user_decision` | 原硬要求必要条件冲突，或校验复核仍有模型意见分歧；前端按`hard_conflict/review_disagreement`区分原因，不把分歧说成需求无解 |
 | `needs_information` | 关键资料仍缺失、第二次补查请求或换日后资料不适用，停止本轮研究 |
 | `incomplete` | 请求/时限/候选轮数用完，或本次未得到有效结果；不表示需求无解 |
 | `service_error` | 外部接口、地点解析或服务响应异常，本次未完成 |
 
-`app.generate`把原需求与版本、最终结果、失败`draft`、`research_facts`、`issues`、轨迹及用量一起写入候选。捕获到的失败可保存已有草稿；没有草稿时保持空。数据库重启后可回看这些记录。`Store.accept_candidate`仅允许`ready`且需求/接受版本仍匹配的候选，事务内条件更新并写事件。
+`app.generate`把原需求与版本、最终结果、失败`draft`、`research_facts`、`review`初审/回应/复核、`issues`、轨迹及用量一起写入候选。捕获到的失败可保存已有草稿；没有草稿时保持空。数据库重启后可回看这些记录。`Store.accept_candidate`要求`status/outcome=ready`，有新`review`字段时还须`approved`，且需求/接受版本仍匹配；事务内条件更新并写事件。旧记录无校验字段时保持兼容，不回填虚假的审批。
+
+复核仍有分歧时，页面显示意见对应的日期、站序和地点、依据与建议，排程Agent采纳或拒绝的具体理由，以及最终未解决意见；可展开最新未接受草稿供用户对照。这里不新增用户强制接受、跨请求仲裁或自动放宽需求的操作，协调后的处理留待讨论。
 
 这属于候选结果持久化，**不是LangGraph checkpoint续跑**。进程在请求中突然退出时不能保证内存中的每一步已落库；当前没有自动从任意图节点恢复、后台重试或跨请求继续失败草稿的接口。
 
 ## 七、运行限额与验证边界
 
-按用户最新决定，先完成核心架构，质量评测与成本优化后置。本轮未安装评测/优化框架。现有基线保留：一次规划默认最多6次模型请求、90秒、3轮候选校验；排程与定向研究共用同一`RunUsage`和限额，切换Agent不重置。定向研究最多1轮、最多5个地点日期搜索，同轮重复结果复用；地图本轮最多50次请求并缓存路线。模型请求和时限可由现有设置调整。
+按用户最新决定，先完成核心架构，质量评测与成本优化后置。本轮未安装评测/优化框架。现有基线保留：一次规划默认最多6次模型请求、90秒、最多检查3份草稿；排程、定向研究和校验共用同一`RunUsage`和限额，切换Agent不重置。校验初审、排程回应和校验复核各消耗请求，协商最多一轮，完整修订计入候选上限。预算不足的未复核草稿结束为未完成，不是分歧。定向研究最多1轮、最多5个地点日期搜索，同轮重复结果复用；地图本轮最多50次请求并缓存路线。
 
 初始选景排序/摘要和用户主动换批属于其他请求，尚无贯穿选景到排程的整趟token/费用总账。共享模型请求上限不是人民币费用保证，也不代表模型质量已经评估。
 
-当前验证：Python **256 passed、4 PostgreSQL skipped**；前端 **27 passed**，Ruff与格式通过。真SDK＋LangGraph使用HTTP模拟验证了研究回流、共享预算、局部/完整修订切换、关键日期缺口、固定预约交通预检，以及结果重启恢复。浏览器检查了时间要求表单与本机硬互斥分支，API回读为地图0次/模型0次，未接受候选。
+此前两角色与用量估算基线为306项Python通过、4项PostgreSQL跳过、34项前端通过。第三校验角色本次仍用真SDK＋LangGraph配合HTTP模拟检查合同、协商路由及预算，最终结果见[QA记录](evaluations/V02_QA.md)。此前浏览器时间要求与硬互斥预检为地图0次/模型0次，不作为真实规划质量证据。
 
-本轮没有新增真实模型、地图或网页搜索；双Agent的真实模型协作行为仍待少量联调。当前本机服务为`http://127.0.0.1:8776/`，凭据只恢复到进程内。浏览器截图在`.runtime/architecture-time-form-20261113.jpg`，回读记录在`.runtime/architecture-ui-check-20261113.json`；两者是本机架构验收，不是真实旅游规划效果证明。旧真实案例及人工发现的问题保留在[QA记录](evaluations/V02_QA.md)。
+本次没有新增真实模型、地图或网页搜索，三角色的真实协商效果待明确授权后少量联调。浏览器历史截图在`.runtime/architecture-time-form-20261113.jpg`，回读在`.runtime/architecture-ui-check-20261113.json`。研究回流已有历史真实样本，但新版仍无可接受方案的真实通过证据，不能把旧成功当本次验收。
 
 
 ## 2026-11-14 真实验证更新
@@ -134,13 +144,11 @@ PlanningInformationRequest(
 此前“未做真实双角色联调”是2026-11-13状态，现已被一次真实回流样本补充：首次因服务沙箱网络10013失败、模型0；修正启动环境后，经用户另行授权再试，同输入24.706秒、6模型/17地图/1搜索，研究返回官网常规开放等3字段，排程生成草稿，但9项业务错误未通过且额度耗尽未完成修订，outcome=incomplete。两条记录保存，均未接受。证明实际研究交接发生，不证明最终规划可行或效果稳定。细节与截图见[evaluations/V02_QA.md](evaluations/V02_QA.md)，本轮未改业务代码、未再发第三次规划。
 
 
-## 2026-11-15 两角色思考配置更新
+## 当前思考配置
 
-用户明确指定两个Agent都启用思考：排程max、研究high。本轮源码已落实，环境变量TRIPWEAVE_PLANNER_EFFORT/TRIPWEAVE_RESEARCH_EFFORT控制强度，thinking固定enabled。SDK显式用reasoning_content字段在各自工具循环内回传，max实际请求值已由HTTP模拟验证，不静默降级；完整思考正文不写候选/轨迹。候选与/api/config记录角色配置，不记录原始思考。
+用户指定全部开启思考，默认排程max、研究high、校验max。环境变量`TRIPWEAVE_PLANNER_EFFORT/TRIPWEAVE_RESEARCH_EFFORT/TRIPWEAVE_REVIEWER_EFFORT`控制强度，thinking固定enabled。SDK显式用reasoning_content字段在各自角色历史内回传；完整思考不写候选或轨迹、不跨角色传递。候选与`/api/config`记录配置。
 
-新增5项真SDK HTTP模拟测试覆盖双角色强度、工具/局部修订历史回传、角色隔离及无正文泄露；全套261Python通过/4PG跳过、27前端通过。现有6次/90秒及6000/4000输出上限未增加，尚未验证其对max/high真实运行是否充足。服务本轮检查8776空闲，未启动；下次启动加载新代码，不追加真实模型/地图测试。既有活动计数逻辑尚未修改。
-
-游玩占比的分母已由用户确认为每日出发到结束窗口；指标改造尚未实施。参数依据：[DeepSeek思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)。
+默认6次/90秒不提高；排程6000、研究4000、校验6000输出tokens上限。尚未真实比较三角色的效果、时延或总费用；强度不是质量保证。参数依据：[DeepSeek思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)。
 
 
 2026-11-15补充：旧活动上限已替换为四项每日节奏指标，同景点当天分段计1、游玩分钟累计，比例分母固定；程序同步检查并返回具体日期/实际/上限，由排程Agent局部修订。每日统计随候选入SQLite。具体口径见[PROMPTS_CURRENT](PROMPTS_CURRENT.md#2026-11-15-每日节奏指标替代旧活动计数)。本次没有新增真实供应商测试。

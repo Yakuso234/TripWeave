@@ -4,6 +4,7 @@ import json
 
 import httpx2
 import pytest
+from review_mock import with_approved_review
 
 from tripweave.domain import Requirements
 from tripweave.maps import MapError
@@ -64,7 +65,7 @@ async def test_unresolved_booking_is_returned_without_calling_deepseek(pois):
         Requirements(date="2026-11-07", booking_query="上海博物馆（人民广场馆）"),
         "deepseek",
         configured(),
-        transport=httpx2.MockTransport(provider),
+        transport=httpx2.MockTransport(with_approved_review(provider)),
     )
     assert result["status"] == "conflict" and result["itinerary"] is None
     assert "高德未找到匹配的预约地点「上海博物馆（人民广场馆）」" in result["error"]
@@ -202,12 +203,14 @@ async def test_deepseek_contract_feedback_and_usage(
         )
 
     settings = configured().model_copy(update={"max_requests": request_limit})
-    output = await run_plan(req, "deepseek", settings, transport=httpx2.MockTransport(provider))
+    output = await run_plan(
+        req, "deepseek", settings, transport=httpx2.MockTransport(with_approved_review(provider))
+    )
     expected_calls = 4 + outside_scope if repair else min(5, request_limit)
     assert len(calls) == expected_calls
     assert calls[0]["model"] == "deepseek-flash"
-    assert output["usage"]["requests"] == expected_calls
-    assert output["usage"]["input_tokens"] == 42 * expected_calls
+    assert output["usage"]["requests"] == expected_calls + int(repair)
+    assert output["usage"]["input_tokens"] == 42 * (expected_calls + int(repair))
     if len(calls) > 3:
         revision = json.loads(calls[3]["messages"][-1]["content"])
         assert revision["revision_days"] == revision_days

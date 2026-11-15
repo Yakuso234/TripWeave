@@ -515,6 +515,11 @@ class Store:
                 candidate = json.loads(body)
                 if candidate["status"] != "ready" or candidate.get("outcome", "ready") != "ready":
                     raise StoreError(409, "此候选未通过检查")
+                review = candidate.get("review")
+                if review is not None and (
+                    not isinstance(review, dict) or review.get("status") != "approved"
+                ):
+                    raise StoreError(409, "此候选尚未完成校验Agent复核")
                 if (
                     candidate["requirements_revision"] != trip["requirements_revision"]
                     or candidate["base_version"] != trip["accepted_version"]

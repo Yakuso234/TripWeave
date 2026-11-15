@@ -121,3 +121,8 @@
 @media(max-width:700px){.usage-totals{grid-template-columns:repeat(2,minmax(0,1fr))}.usage-budget{grid-template-columns:1fr}.usage-totals strong{font-size:21px}}
 section.summary-card{position:static}
 .usage-cost{padding:18px;background:var(--paper);border-radius:10px;margin:20px 0}.usage-cost .cost-row{gap:16px}.usage-cost .cost-row strong{text-align:right;overflow-wrap:anywhere}
+.review-panel{margin:20px 0;overflow-wrap:anywhere}.review-panel>.section-title{margin-top:0;gap:12px;flex-wrap:wrap}
+.review-opinion{padding:20px;border:1px solid var(--line);border-radius:12px;margin:16px 0}.review-opinion h3{margin:0 0 10px}.review-position{color:var(--muted);font-size:12px}
+.review-exchange{margin:14px 0 0}.review-exchange>div{display:grid;grid-template-columns:100px minmax(0,1fr);gap:16px;padding:12px 0;border-top:1px solid var(--line)}.review-exchange dt{font-size:13px;font-weight:600;padding-top:3px}.review-exchange dd{margin:0}.review-exchange p{margin:0 0 8px}.review-exchange p:last-child{margin-bottom:0}.review-unresolved dt{color:var(--orange)}
+.review-draft{margin-top:18px;padding:16px;background:var(--paper);border-radius:10px}.review-draft summary{cursor:pointer;color:var(--green)}.review-draft ol{padding-left:22px}.review-draft li{padding:12px 0;border-bottom:1px solid var(--line)}.review-draft li>strong,.review-draft li>span{display:block}.review-draft li>span{margin-top:5px;color:var(--muted)}.review-draft li p{margin-bottom:0}
+@media(max-width:600px){.review-opinion{padding:14px}.review-exchange>div{grid-template-columns:minmax(0,1fr);gap:7px}.review-draft{padding:12px}}

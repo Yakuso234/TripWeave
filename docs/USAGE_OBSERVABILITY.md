@@ -4,11 +4,11 @@
 
 ## 统计来源与范围
 
-`real_planner.run_plan`创建共享的Pydantic AI `RunUsage`，排程、定向研究、工具往返与修订均累计到同一对象。`usage.requests/input_tokens/output_tokens`为SDK从供应商响应usage中提取并累加的值，不按字符数或中文字数估计。它只覆盖当前一次规划请求，不含之前独立发生的选景排序/摘要，也不是整个API Key账户总用量。
+`real_planner.run_plan`创建共享的Pydantic AI `RunUsage`，排程、定向研究、独立校验、工具往返与修订均累计到同一对象。`usage.requests/input_tokens/output_tokens`为SDK从供应商响应usage中提取并累加的值，不按字符数或中文字数估计。它只覆盖当前一次规划请求，不含之前独立发生的选景排序/摘要，也不是整个API Key账户总用量。
 
 每次HTTP请求的输入可包含提示词、用户需求、工具合同、历史消息和工具结果。重复发送的历史仍计入当次输入；缓存命中属于输入的一部分，价格与未命中可能不同。
 
-新增`ModelUsageRecorder`挂在已有模型HTTPX2客户端的请求/响应钩子上，只观察非流式`/chat/completions`，不发第二个统计请求。逐次记录角色、输入/输出、思考、缓存命中/未命中、耗时、HTTP状态、finish_reason与该次输出上限。角色通过每轮独立ContextVar标记，研究结束恢复排程角色。不记录headers、Key、完整prompt、工具参数、响应正文或思考正文。
+`ModelUsageRecorder`挂在已有模型HTTPX2客户端的请求/响应钩子上，只观察非流式`/chat/completions`，不发第二个统计请求。逐次记录角色、输入/输出、思考、缓存命中/未命中、耗时、HTTP状态、finish_reason与该次输出上限。角色通过每轮独立ContextVar标记；研究或校验结束恢复排程角色。不记录headers、Key、完整prompt、工具参数、响应正文或思考正文。
 
 `usage_observation`随候选JSON入原SQLite表，包括失败候选，无新增表；保存本轮预算快照及耗时。耗时从run_plan开始至生成结果，含地图/模型/研究，未包含最终数据库写入和浏览器渲染。HTTP尝试数与SDK请求数在失败时可能不同，不混为成功调用。
 
@@ -22,12 +22,15 @@
 
 | 环境变量 | 默认 | 作用 |
 | --- | --- | --- |
-| TRIPWEAVE_MAX_REQUESTS | 6 | 排程与研究共享模型请求次数，含工具往返/修订 |
+| TRIPWEAVE_MAX_REQUESTS | 6 | 排程、研究、校验共享模型请求次数，含工具往返/修订/协商 |
 | TRIPWEAVE_RUN_TIMEOUT | 90 | 整轮规划秒数 |
 | TRIPWEAVE_PLANNER_MAX_TOKENS | 6000 | 排程每次请求输出上限 |
 | TRIPWEAVE_RESEARCH_MAX_TOKENS | 4000 | 研究每次请求输出上限 |
+| TRIPWEAVE_REVIEWER_MAX_TOKENS | 6000 | 校验初审或复核每次请求输出上限 |
 
-本次保持默认数值和max/high思考不变。输出参数入口范围1–393216依据当日DeepSeek官方Chat Completions规范；兼容接口或不同账号的实际模型能力仍须独立核对。尚未设置整轮输入tokens硬上限，没有人民币预算拦截。
+默认请求数与时限不变，思考为排程max、研究high、校验max，分别由`TRIPWEAVE_PLANNER_EFFORT/TRIPWEAVE_RESEARCH_EFFORT/TRIPWEAVE_REVIEWER_EFFORT`控制。输出参数入口范围1–393216依据当日DeepSeek官方Chat Completions规范；兼容接口或不同账号的实际能力仍须核对。尚未设置整轮输入tokens硬上限，没有人民币预算拦截。
+
+校验初审、排程回应和校验复核都算普通模型请求；新增角色不会多给6次。无工具和格式重试时初审直接通过至少2次请求，有协商通常至少4次。预算不足就保存未完成结果，不得当成双方分歧。`role=reviewer`的调用与费用进入本轮明细，完整协商见[REVIEW_NEGOTIATION](REVIEW_NEGOTIATION.md)。
 
 ## 用量与费用
 
@@ -43,6 +46,6 @@
 
 ## 验证边界
 
-7项新增Python用例使用真SDK＋HTTP模拟验证角色交接、原始计数与SDK合计一致、思考/缓存不重复计数、参数实际下发、缺失usage、HTTP429、未完成响应、长度结束原因、并发角色隔离与SQLite重启；既有工具/局部修订用例增加逐次统计断言。另21项费用用例覆盖Decimal精度、峰闲/假日/时区、未来年份、缓存缺失和矛盾、未知模型/接口、搜索状态及旧记录只读回算；研究搜索用例增加计费断言。前端4项新增用例覆盖旧历史、预算、未知/0与费用区间。全套306 Python通过、4 PostgreSQL跳过，34 Node通过。
+用量与费用基线为306项Python通过、4项PostgreSQL跳过、34项Node通过。其中HTTP模拟检查原始计数、SDK合计、角色隔离、参数、错误/缺失usage、SQLite重启；费用用例覆盖精度、峰闲/时区/假日、缺失和矛盾缓存、未知价格、搜索计费及旧记录只读回算。本次校验协商继续使用离线HTTP模拟核对第三角色计入共享预算、统计与费用；最终结果见[QA记录](evaluations/V02_QA.md)。未新增真实供应商调用，不能据此声称三角色实际费用更低。
 
 浏览器展示此前一次真实测试的3请求、13228输入、3965输出、17193合计及5地图/1搜索；旧记录无明细提示正确，费用条件区间可见。修正全宽摘要的sticky样式，避免遮住用量面板；设置页核对6次/90秒及6000/4000预算。新逐次明细与费用由SDK HTTP模拟验证，尚未新增真实供应商验证，不冒充费用账单。截图仅本地`.runtime/model-usage-panel-20261115.jpg`与`.runtime/model-cost-panel-20261115.jpg`。

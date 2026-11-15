@@ -17,6 +17,7 @@ def planning_budget(settings) -> dict:
         "run_timeout_seconds": settings.run_timeout,
         "planner_max_output_tokens": settings.planner_max_tokens,
         "research_max_output_tokens": settings.research_max_tokens,
+        "reviewer_max_output_tokens": settings.reviewer_max_tokens,
         "input_token_limit": None,
     }
 

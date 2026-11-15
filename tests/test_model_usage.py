@@ -20,7 +20,7 @@ from tripweave.storage import Store
 
 
 async def test_role_requests_tokens_and_limits_match_supplier_without_double_counting(tmp_path):
-    roles = {"planner": 0, "research": 0}
+    roles = {"planner": 0, "research": 0, "reviewer": 0}
     bodies = []
 
     def provider(request):
@@ -30,10 +30,18 @@ async def test_role_requests_tokens_and_limits_match_supplier_without_double_cou
             return sources()
         body = json.loads(request.content)
         bodies.append(body)
-        role = "research" if "search_place_information" in tool_names(body) else "planner"
+        role = (
+            "reviewer"
+            if "review_report" in tool_names(body)
+            else "research"
+            if "search_place_information" in tool_names(body)
+            else "planner"
+        )
         roles[role] += 1
         n = len(bodies)
-        if role == "planner":
+        if role == "reviewer":
+            reply = completion("review_report", {"summary": "模拟认可", "suggestions": []}, n)
+        elif role == "planner":
             reply = (
                 completion("request_information", gap(), n)
                 if roles[role] == 1
@@ -64,16 +72,16 @@ async def test_role_requests_tokens_and_limits_match_supplier_without_double_cou
         requirements(), "deepseek", settings, transport=httpx2.MockTransport(provider)
     )
     assert result["outcome"] == "ready", result
-    assert result["usage"] == {"requests": 4, "input_tokens": 1000, "output_tokens": 100}
+    assert result["usage"] == {"requests": 5, "input_tokens": 1500, "output_tokens": 150}
     observation = result["usage_observation"]
-    assert observation["model_http_attempts"] == 4 and observation["usage_complete"]
+    assert observation["model_http_attempts"] == 5 and observation["usage_complete"]
     rows = observation["model_calls"]
-    assert [r["role"] for r in rows] == ["planner", "research", "research", "planner"]
-    assert [r["input_tokens"] for r in rows] == [100, 200, 300, 400]
-    assert [r["max_output_tokens"] for r in rows] == [7000, 5000, 5000, 7000]
-    assert [body["max_completion_tokens"] for body in bodies] == [7000, 5000, 5000, 7000]
+    assert [r["role"] for r in rows] == ["planner", "research", "research", "planner", "reviewer"]
+    assert [r["input_tokens"] for r in rows] == [100, 200, 300, 400, 500]
+    assert [r["max_output_tokens"] for r in rows] == [7000, 5000, 5000, 7000, 6000]
+    assert [body["max_completion_tokens"] for body in bodies] == [7000, 5000, 5000, 7000, 6000]
     assert all(r["reasoning_tokens"] == 3 and r["cache_read_tokens"] == 20 for r in rows)
-    assert [r["cache_miss_tokens"] for r in rows] == [80, 180, 280, 380]
+    assert [r["cache_miss_tokens"] for r in rows] == [80, 180, 280, 380, 480]
     assert all(r["finish_reason"] == "tool_calls" and r["elapsed_ms"] >= 0 for r in rows)
     assert "PRIVATE-REASONING" not in json.dumps(observation)
     assert all(
@@ -125,7 +133,12 @@ async def test_missing_provider_usage_is_unknown_not_zero():
     def provider(request):
         if request.url.host != "api.deepseek.com":
             return map_response(request)
-        data = completion("final_result", itinerary(), 1).json()
+        body = json.loads(request.content)
+        data = (
+            completion("review_report", {"summary": "模拟认可", "suggestions": []}, 2).json()
+            if "review_report" in tool_names(body)
+            else completion("final_result", itinerary(), 1).json()
+        )
         data.pop("usage")
         return httpx2.Response(200, json=data)
 
@@ -134,7 +147,7 @@ async def test_missing_provider_usage_is_unknown_not_zero():
     )
     observation = result["usage_observation"]
     assert result["outcome"] == "ready"
-    assert observation["model_http_attempts"] == 1 and not observation["usage_complete"]
+    assert observation["model_http_attempts"] == 2 and not observation["usage_complete"]
     row = observation["model_calls"][0]
     assert row["input_tokens"] is row["output_tokens"] is row["reasoning_tokens"] is None
 
@@ -225,6 +238,7 @@ def test_active_config_exposes_budget_not_credentials(tmp_path):
         "run_timeout_seconds": 90,
         "planner_max_output_tokens": 6000,
         "research_max_output_tokens": 4000,
+        "reviewer_max_output_tokens": 6000,
         "input_token_limit": None,
     }
     with pytest.raises(ValueError):

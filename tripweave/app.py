@@ -111,6 +111,7 @@ def create_app(database: str | None = None) -> FastAPI:
             "thinking_configuration": {
                 "planner": {"enabled": True, "effort": settings.planner_effort},
                 "research": {"enabled": True, "effort": settings.research_effort},
+                "reviewer": {"enabled": True, "effort": settings.reviewer_effort},
             },
             "provider": "DeepSeek / 兼容接口",
             "base_url": settings.base_url,

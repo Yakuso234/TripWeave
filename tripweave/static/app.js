@@ -67,14 +67,23 @@ function canAccept(plan = shownPlan()) {
     && plan.trip_id === S.trip?.id && plan.base_version === S.trip?.accepted_version;
 }
 function isReadyPlan(plan) {
-  return !!plan && plan.status === 'ready' && (!plan.outcome || plan.outcome === 'ready');
+  return !!plan && plan.status === 'ready' && (!plan.outcome || plan.outcome === 'ready')
+    && (plan.review == null || plan.review.status === 'approved');
+}
+function hasReviewDisagreement(plan) {
+  return plan.review?.status === 'disputed'
+    || (plan.issues || []).some(issue => issue.category === 'review_disagreement');
 }
 function planningOutcomeLabel(plan) {
+  if (hasReviewDisagreement(plan)) return '规划分歧 · 待你协调';
+  if (plan.status === 'ready' && (!plan.outcome || plan.outcome === 'ready') && plan.review && plan.review.status !== 'approved') return '校验协商未完成';
   return ({ready:'可用候选',needs_information:'资料待补充',needs_user_decision:'需要调整要求',
     incomplete:'本次未完成',service_error:'接口异常'})[plan.outcome]
     || (plan.status === 'ready' ? '检查通过' : plan.error ? '规划失败' : '存在冲突');
 }
 function planningOutcomeMessage(plan) {
+  if (hasReviewDisagreement(plan)) return '规划 Agent 与校验 Agent 仍有不同意见，请查看具体分歧和双方理由。这不代表你的需求无法满足。';
+  if (plan.status === 'ready' && (!plan.outcome || plan.outcome === 'ready') && plan.review && plan.review.status !== 'approved') return '这份记录尚未完成校验协商，暂不可接受。';
   return ({ready:'已通过当前已知路线与约束检查，请核对待确认事项。',
     needs_information:'关键资料仍不足，请查看具体缺口，补充可靠信息后再继续规划。',
     needs_user_decision:'已确认的要求无法同时满足，请核对冲突说明并修改相应要求。',
@@ -377,16 +386,16 @@ function usagePanel(plan) {
   const progress = (label, actual, limit, unit) => `<div class="usage-progress"><span>${label} <strong>${number(actual)} / ${number(limit)} ${unit}</strong></span>${valid(actual) && valid(limit) && limit > 0 ? `<progress max="${limit}" value="${Math.min(actual,limit)}" aria-label="${label}"></progress>` : ''}</div>`;
   const reason = {stop:'正常结束',tool_calls:'调用工具 / 结构化结果',function_call:'调用工具',length:'触及长度限制',content_filter:'内容过滤',insufficient_system_resource:'供应商资源不足',other:'其他结束原因'};
   return `<section class="card usage-panel"><div class="section-title"><h2>模型用量与预算</h2>${tag('本轮规划')}</div>
-    <p class="muted small">${esc(plan.model || '模型未记录')} · 仅统计这次规划及内部研究、工具往返与修订；不包含之前的选景推荐。</p>
+    <p class="muted small">${esc(plan.model || '模型未记录')} · 仅统计这次规划及内部研究、校验协商、工具往返与修订；不包含之前的选景推荐。</p>
     <div class="usage-totals">${[['模型请求',requests],['输入 tokens'+(partial?'（已记录）':''),input],['输出 tokens'+(partial?'（已记录）':''),output],['合计 tokens'+(partial?'（已记录）':''),total]].map(([label,value])=>`<div><span>${label}</span><strong>${number(value)}</strong></div>`).join('')}</div>
     ${valid(total) && total > 0 ? `<div class="usage-stack" role="img" aria-label="输入${input}、输出${output} tokens"><span style="width:${input/total*100}%"></span><span style="width:${output/total*100}%"></span></div><p class="small muted">输入占 ${Math.round(input/total*100)}% · 输出占 ${Math.round(output/total*100)}%（这是用量构成，不是预算百分比）</p>` : ''}
     ${costPanel(plan)}
     ${budget ? `<div class="usage-budget">${progress('模型请求',requests,budget.max_model_requests,'次')}${progress('整轮耗时',observation.elapsed_seconds,budget.run_timeout_seconds,'秒')}</div>
-      <p class="small muted">单次输出上限：排程 ${number(budget.planner_max_output_tokens)} / 研究 ${number(budget.research_max_output_tokens)} tokens。输入 ${budget.input_token_limit == null ? '未设硬上限' : '上限 '+number(budget.input_token_limit)+' tokens'}。这些是本轮启动时的预算。</p>` : '<p class="small muted">这条历史记录未保存预算与逐次明细，不使用当前预算替代历史预算。</p>'}
+      <p class="small muted">单次输出上限：排程 ${number(budget.planner_max_output_tokens)} / 研究 ${number(budget.research_max_output_tokens)}${budget.reviewer_max_output_tokens != null ? ' / 校验 '+number(budget.reviewer_max_output_tokens) : ''} tokens。输入 ${budget.input_token_limit == null ? '未设硬上限' : '上限 '+number(budget.input_token_limit)+' tokens'}。这些是本轮启动时的预算。</p>` : '<p class="small muted">这条历史记录未保存预算与逐次明细，不使用当前预算替代历史预算。</p>'}
     ${observation?.usage_complete === false ? '<p class="notice">部分请求未取得完整用量，总量可能不完整；明细中“未返回”不能当作 0。</p>' : ''}
     ${calls.some(call=>call.finish_reason === 'length') ? '<p class="notice">有请求返回 length，输出可能被截断；可能触及输出或上下文长度限制，请结合本轮结果检查。</p>' : ''}
     ${observation ? `<p class="small muted">模型 HTTP 尝试 ${number(observation.model_http_attempts)} 次；SDK 请求数和 HTTP 尝试数在接口错误时可能不同。</p>` : ''}
-    ${calls.length ? `<details><summary>查看每次调用明细（${calls.length}次）</summary><div class="usage-table-wrap"><table class="usage-table"><caption>供应商逐次返回的用量；思考属于输出、缓存命中属于输入，不重复相加。</caption><thead><tr>${['序号 / 角色','输入','输出','思考（输出内）','缓存命中（输入内）','缓存未命中（输入内）','耗时','结束情况','输出上限'].map(label=>`<th scope="col">${label}</th>`).join('')}</tr></thead><tbody>${calls.map(call=>`<tr><th scope="row">${number(call.number)} · ${{planner:'排程',research:'研究'}[call.role] || '未记录'}</th><td>${valid(call.input_tokens)?number(call.input_tokens):'未返回'}</td><td>${valid(call.output_tokens)?number(call.output_tokens):'未返回'}</td><td>${valid(call.reasoning_tokens)?number(call.reasoning_tokens):'未返回'}</td><td>${valid(call.cache_read_tokens)?number(call.cache_read_tokens):'未返回'}</td><td>${valid(call.cache_miss_tokens)?number(call.cache_miss_tokens):'未返回'}</td><td>${valid(call.elapsed_ms)?number(call.elapsed_ms/1000)+'秒':'未记录'}</td><td>${esc(call.status === 'http_error' ? 'HTTP '+number(call.http_status) : call.status === 'no_complete_response' ? '未收到完整响应' : reason[call.finish_reason] || '未返回结束原因')}</td><td>${number(call.max_output_tokens)}</td></tr>`).join('')}</tbody></table></div></details>` : ''}
+    ${calls.length ? `<details><summary>查看每次调用明细（${calls.length}次）</summary><div class="usage-table-wrap"><table class="usage-table"><caption>供应商逐次返回的用量；思考属于输出、缓存命中属于输入，不重复相加。</caption><thead><tr>${['序号 / 角色','输入','输出','思考（输出内）','缓存命中（输入内）','缓存未命中（输入内）','耗时','结束情况','输出上限'].map(label=>`<th scope="col">${label}</th>`).join('')}</tr></thead><tbody>${calls.map(call=>`<tr><th scope="row">${number(call.number)} · ${{planner:'排程',research:'研究',reviewer:'校验'}[call.role] || '未记录'}</th><td>${valid(call.input_tokens)?number(call.input_tokens):'未返回'}</td><td>${valid(call.output_tokens)?number(call.output_tokens):'未返回'}</td><td>${valid(call.reasoning_tokens)?number(call.reasoning_tokens):'未返回'}</td><td>${valid(call.cache_read_tokens)?number(call.cache_read_tokens):'未返回'}</td><td>${valid(call.cache_miss_tokens)?number(call.cache_miss_tokens):'未返回'}</td><td>${valid(call.elapsed_ms)?number(call.elapsed_ms/1000)+'秒':'未记录'}</td><td>${esc(call.status === 'http_error' ? 'HTTP '+number(call.http_status) : call.status === 'no_complete_response' ? '未收到完整响应' : reason[call.finish_reason] || '未返回结束原因')}</td><td>${number(call.max_output_tokens)}</td></tr>`).join('')}</tbody></table></div></details>` : ''}
     <p class="muted small">地图请求 ${number(plan.map_calls)} 次 · 定向网页搜索 ${number(plan.research_search_calls)} 次（本轮计数；工具服务费用另计）。</p>
     <p class="muted small">总量来自模型 API usage，由 SDK 累加，不按字数估算。历史上下文和工具结果每次发送都会计入输入。用量不等于最终账单，失败响应可能未返回统计。</p>
   </section>`;
@@ -394,7 +403,48 @@ function usagePanel(plan) {
 function currentBudgetPanel() {
   const budget = S.config.planning_budget;
   if (!budget) return '';
-  return `<section class="card usage-panel"><h2>当前规划预算</h2><p>两角色共享 ${esc(budget.max_model_requests)} 次模型请求 / ${esc(budget.run_timeout_seconds)} 秒。</p><p>单次输出：排程 ${esc(budget.planner_max_output_tokens)}、研究 ${esc(budget.research_max_output_tokens)} tokens；输入未设硬上限。</p><p class="muted small">每次规划会保存自己的预算和用量，之后修改配置不会改变历史记录。</p></section>`;
+  return `<section class="card usage-panel"><h2>当前规划预算</h2><p>排程、研究、校验三个角色共享 ${esc(budget.max_model_requests)} 次模型请求 / ${esc(budget.run_timeout_seconds)} 秒。</p><p>单次输出：排程 ${esc(budget.planner_max_output_tokens)}、研究 ${esc(budget.research_max_output_tokens)}、校验 ${esc(budget.reviewer_max_output_tokens ?? '未记录')} tokens；输入未设硬上限。</p><p class="muted small">每次规划会保存自己的预算和用量，之后修改配置不会改变历史记录。</p></section>`;
+}
+function reviewPanel(plan) {
+  const review = plan.review;
+  if (!review) return '';
+  const disputed = hasReviewDisagreement(plan);
+  const status = ({pending:'尚未开始校验',awaiting_planner:'等待规划回应',awaiting_adjudication:'等待校验复核',
+    approved:'校验认同',disputed:'规划分歧 · 待你协调',incomplete:'协商未完成'})[review.status] || '校验记录未完成';
+  const places = new Map((plan.places || []).map(place => [place.id,place.name]));
+  const positions = values => (values || []).map(position =>
+    `第 ${esc(position.day)} 天 · 第 ${esc(position.stop_number)} 站 · ${esc(places.get(position.place_id) || position.place_id)}`).join('；');
+  const initial = review.initial?.suggestions || [];
+  const final = review.final?.suggestions || [];
+  const decisions = review.planner_response?.decisions || [];
+  const renderSuggestion = (suggestion, introduced=false) => {
+    const decision = decisions.find(item => item.suggestion_id === suggestion.suggestion_id);
+    const unresolved = final.find(item => item.suggestion_id === suggestion.suggestion_id);
+    return `<article class="review-opinion"><h3>${introduced ? '复核发现的新问题' : '校验建议'} · ${esc(suggestion.suggestion_id)}</h3>
+      <p class="review-position">${introduced ? '复核引用位置' : '原草稿位置'}：${positions(suggestion.positions)}</p>
+      <dl class="review-exchange"><div><dt>校验 Agent</dt><dd><p>${esc(suggestion.concern)}</p><p class="small"><strong>依据：</strong>${esc(suggestion.requirement_basis)}</p><p class="small"><strong>建议：</strong>${esc(suggestion.proposed_change)}</p></dd></div>
+      ${decision ? `<div><dt>规划 Agent</dt><dd><p><strong>${decision.action === 'revise' ? '采纳并修订' : '保留原安排'}</strong></p><p>${esc(decision.reason)}</p></dd></div>` : '<div><dt>规划 Agent</dt><dd class="muted">尚无逐项回应记录。</dd></div>'}
+      ${unresolved ? `<div class="review-unresolved"><dt>仍有分歧</dt><dd><p>${esc(unresolved.concern)}</p><p class="small">引用位置：${positions(unresolved.positions)}。若站点已被移除，请对照原草稿。</p><p class="small"><strong>依据：</strong>${esc(unresolved.requirement_basis)}</p><p class="small"><strong>建议：</strong>${esc(unresolved.proposed_change)}</p></dd></div>`
+        : review.status === 'approved' ? '<div><dt>复核结果</dt><dd>校验 Agent 已认同当前安排及解释。</dd></div>' : ''}</dl></article>`;
+  };
+  const draftDetails = (draft, title) => {
+    if (!draft?.stops?.length) return '';
+    const days = [...new Set(draft.stops.map(stop => stop.day))];
+    return `<details class="review-draft"><summary>${title}</summary><p>${esc(draft.summary)}</p><p class="small muted">以下为未通过完整流程的草稿，仅供核对，不能直接接受。</p>${days.map(day => `<section><h3>第 ${esc(day)} 天</h3><ol>${draft.stops.filter(stop => stop.day === day).map((stop,index) => `<li><strong>第 ${index+1} 站 · ${esc(stop.start_time)}–${esc(stop.end_time)} · ${esc(places.get(stop.place_id) || stop.place_id)}</strong><span class="small">${esc(({activity:'城市体验',booking:'固定预约',meal:'用餐建议',hotel:'住宿安排'})[stop.kind] || stop.kind)}</span><p>${esc(stop.reason)}</p></li>`).join('')}</ol></section>`).join('')}</details>`;
+  };
+  const effort = plan.thinking_configuration?.reviewer?.effort;
+  const stage = ({initial_review:'首次校验',planner_response:'规划回应',final_review:'校验复核'})[review.pending_stage];
+  return `<section class="card review-panel"><div class="section-title"><h2>行程校验与协商</h2>${tag(status,review.status !== 'approved')}</div>
+    ${effort ? `<p class="muted small">本轮校验 Agent · 思考强度 ${esc(effort)}</p>` : ''}
+    ${disputed ? '<div class="notice">双方仍有规划分歧，需要你协调。这是模型意见不一致，不代表需求已被证明无解。当前草稿已保存，尚不可接受；协调后的继续处理方式待讨论。</div>'
+      : review.status !== 'approved' ? `<p class="notice">校验协商尚未完成${stage ? '，停在'+stage : ''}，暂不可接受。预算或接口中断不作为双方冲突。</p>` : '<p class="small">校验 Agent 已认同当前方案，接受仍需通过程序硬约束和版本检查。</p>'}
+    ${review.initial?.summary ? `<p><strong>首次校验：</strong>${esc(review.initial.summary)}</p>` : ''}
+    ${initial.map(suggestion => renderSuggestion(suggestion)).join('')}
+    ${final.filter(suggestion => !initial.some(item => item.suggestion_id === suggestion.suggestion_id)).map(suggestion => renderSuggestion(suggestion,true)).join('')}
+    ${review.final?.summary ? `<p><strong>校验复核：</strong>${esc(review.final.summary)}</p>` : ''}
+    ${!isReadyPlan(plan) ? draftDetails(plan.draft,'查看最新完整草稿（尚不可接受）') : ''}
+    ${disputed && review.planner_response?.revised_itinerary ? draftDetails(review.original_draft,'对照首次校验时的原草稿') : ''}
+  </section>`;
 }
 function pacingSummary(plan) {
   if (!plan.daily_metrics?.length) return '<p class="muted small">此记录未保存每日节奏统计。</p>';
@@ -428,7 +478,7 @@ function itinerarySummary(plan, requirements, issues) {
 function itinerary(){const p=shownPlan(),snapshot=planRequirements(p),d=p?(snapshot||{city:'历史',date:'原日期未保存',days:Math.max(1,...(p.itinerary?.stops||[]).map(s=>s.day||1)),party_size:'未记录'}):S.draft;const busy=S.busy?`<div class="busy-panel"><span class="spinner"></span>正在查询地点与路线、安排住宿和活动，请稍候…</div>`:'';const heading=`<div class="page-heading"><div><p class="eyebrow">DAY BY DAY / 一天一天，慢慢出发</p><h1>${esc(d.city)}，${daysLabel(d)}的旅行安排</h1><p class="muted">${esc(d.date)}出发 · ${d.party_size}人 · ${p?'依据需求 v'+p.requirements_revision:S.trip?'需求 v'+S.trip.requirements_revision:'尚未保存需求'}</p></div><div class="actions">${button('修改旅行偏好','preferences','secondary')}${button(p?'用 DeepSeek 重新规划':'用 DeepSeek 生成行程','generate')}</div></div>`;
 if(!p)return heading+planningRecords()+busy+`<div class="empty"><span class="empty-mark">↗</span><h2>一份属于你的行程，还差一步。</h2><p>${S.config.map_configured&&S.config.model_configured?'DeepSeek 将根据旅行偏好和高德查询结果生成候选，再由程序校验路线和时间。':'请在接入设置保存高德 Web 服务 Key 和 DeepSeek API Key。'}</p><div class="actions" style="justify-content:center">${button('查看旅行偏好','preferences','secondary')}${S.config.map_configured&&S.config.model_configured?'':button('去接入设置','settings')}</div></div>`;
 const day=Math.min(S.day,d.days),stops=isReadyPlan(p)?(p.itinerary?.stops?.filter(s=>(s.day||1)===day)||[]):[];const cost=p.costs||{};const isAccepted=S.trip?.accepted_plan?.id===p.id;const eligible=canAccept(p);const issues=[...(p.error?[p.error]:[]),...(p.issues||[]).map(i=>planningIssueText(i,p))];
-return heading+busy+(stalePlan(p)?'<div class="notice">旅行偏好已修改，下面保留的是原方案及原日期，不能作为新需求的结果接受。请重新规划。</div>':'')+`<div class="actions">${tag(p.data_mode)}${tag(stalePlan(p)?'旧方案 · 待重新规划':isAccepted?'已接受 v'+S.trip.accepted_version:isReadyPlan(p)?'候选 · 待确认':planningOutcomeLabel(p),!isReadyPlan(p))}${isReadyPlan(p) ? button('基于此方案修改','revise','secondary') : ''}${button('导出所示方案','export','tiny secondary')}</div>${itinerarySummary(p,d,issues)}${usagePanel(p)}${planningRecords()}<div class="day-tabs">${Array.from({length:d.days},(_,i)=>`<button class="${day===i+1?'active':''}" aria-pressed="${day===i+1}" data-day="${i+1}">DAY 0${i+1}<small>${dateFor(i+1,snapshot||{})}</small></button>`).join('')}</div><div class="itinerary-layout"><section><div class="timeline">${stops.length?stops.map((s,index)=>{const place=p.places?.find(t=>t.id===s.place_id)||{};const leg=p.routes?.find(r=>r.day===day && (r.stop_index!=null?r.stop_index===index:r.destination_id===s.place_id && r.origin_id===(index?stops[index-1].place_id:r.origin_id)));return `<article class="stop"><div class="stop-time">${esc(s.start_time)}<small>至 ${esc(s.end_time)}</small></div><div>${tag(({activity:'城市体验',booking:'固定预约',meal:'用餐建议',hotel:'住宿安排'})[s.kind]||'活动')}<h3>${esc(stopHeading(s,place))}</h3><p>安排建议：${esc(s.reason)}</p><div class="stop-meta">${esc(place.address||'')} · ${esc(place.source||'来源待确认')}</div>${leg?`<div class="leg">↗ 从上一站${esc(leg.mode)}约${esc(leg.duration_minutes)}分钟${leg.distance_meters?' · '+(leg.distance_meters/1000).toFixed(1)+'公里':''} · ${esc(leg.source)}</div>`:''}</div></article>`;}).join(''):'<p class="muted">当前没有可接受安排，请查看上方处理说明。</p>'}</div><div class="card" style="margin-top:20px"><h3>本次查询与检查</h3><ol class="trace">${(p.trace||[]).filter(t=>t.detail).map(t=>`<li>${esc(t.detail)}</li>`).join('')}</ol></div></section><aside class="card summary-card"><h3>这趟旅行的预留</h3><p class="muted small">全体${d.party_size}人 · ${daysLabel(d)}</p>${[['住宿预算预留',cost.accommodation],['餐饮预算预留',cost.food],['门票实际费用',cost.tickets],['市内交通费用',cost.transport],['住宿＋餐饮预留',cost.subtotal],['你的整趟预算',cost.budget]].map(([a,b])=>`<div class="cost-row"><span>${a}</span><strong>${money(b)}</strong></div>`).join('')}<p class="muted small">${esc(cost.scope||'费用未核实')}</p><div class="divider"></div><h3>住宿方案</h3><p class="small">${esc(p.hotel?.name||'当日往返 / 尚未确定')}</p>${button('查看住宿详情','hotels','secondary tiny')}<div class="divider"></div><h3>出发前再确认</h3><ul>${(p.warnings||[]).map(t=>`<li>${esc(t)}</li>`).join('')}</ul>${!isAccepted?button('接受当前候选行程','accept','',!eligible?'disabled':''):tag('当前已接受方案已保存')}<p class="muted small">接受只保存本应用内的版本，不代表完成酒店或门票预订。</p></aside></div>`;}
+return heading+busy+(stalePlan(p)?'<div class="notice">旅行偏好已修改，下面保留的是原方案及原日期，不能作为新需求的结果接受。请重新规划。</div>':'')+`<div class="actions">${tag(p.data_mode)}${tag(stalePlan(p)?'旧方案 · 待重新规划':isAccepted?'已接受 v'+S.trip.accepted_version:isReadyPlan(p)?'候选 · 待确认':planningOutcomeLabel(p),!isReadyPlan(p))}${isReadyPlan(p) ? button('基于此方案修改','revise','secondary') : ''}${button('导出所示方案','export','tiny secondary')}</div>${itinerarySummary(p,d,issues)}${reviewPanel(p)}${usagePanel(p)}${planningRecords()}<div class="day-tabs">${Array.from({length:d.days},(_,i)=>`<button class="${day===i+1?'active':''}" aria-pressed="${day===i+1}" data-day="${i+1}">DAY 0${i+1}<small>${dateFor(i+1,snapshot||{})}</small></button>`).join('')}</div><div class="itinerary-layout"><section><div class="timeline">${stops.length?stops.map((s,index)=>{const place=p.places?.find(t=>t.id===s.place_id)||{};const leg=p.routes?.find(r=>r.day===day && (r.stop_index!=null?r.stop_index===index:r.destination_id===s.place_id && r.origin_id===(index?stops[index-1].place_id:r.origin_id)));return `<article class="stop"><div class="stop-time">${esc(s.start_time)}<small>至 ${esc(s.end_time)}</small></div><div>${tag(({activity:'城市体验',booking:'固定预约',meal:'用餐建议',hotel:'住宿安排'})[s.kind]||'活动')}<h3>${esc(stopHeading(s,place))}</h3><p>安排建议：${esc(s.reason)}</p><div class="stop-meta">${esc(place.address||'')} · ${esc(place.source||'来源待确认')}</div>${leg?`<div class="leg">↗ 从上一站${esc(leg.mode)}约${esc(leg.duration_minutes)}分钟${leg.distance_meters?' · '+(leg.distance_meters/1000).toFixed(1)+'公里':''} · ${esc(leg.source)}</div>`:''}</div></article>`;}).join(''):'<p class="muted">当前没有可接受安排，请查看上方处理说明。</p>'}</div><div class="card" style="margin-top:20px"><h3>本次查询与检查</h3><ol class="trace">${(p.trace||[]).filter(t=>t.detail).map(t=>`<li>${esc(t.detail)}</li>`).join('')}</ol></div></section><aside class="card summary-card"><h3>这趟旅行的预留</h3><p class="muted small">全体${d.party_size}人 · ${daysLabel(d)}</p>${[['住宿预算预留',cost.accommodation],['餐饮预算预留',cost.food],['门票实际费用',cost.tickets],['市内交通费用',cost.transport],['住宿＋餐饮预留',cost.subtotal],['你的整趟预算',cost.budget]].map(([a,b])=>`<div class="cost-row"><span>${a}</span><strong>${money(b)}</strong></div>`).join('')}<p class="muted small">${esc(cost.scope||'费用未核实')}</p><div class="divider"></div><h3>住宿方案</h3><p class="small">${esc(p.hotel?.name||'当日往返 / 尚未确定')}</p>${button('查看住宿详情','hotels','secondary tiny')}<div class="divider"></div><h3>出发前再确认</h3><ul>${(p.warnings||[]).map(t=>`<li>${esc(t)}</li>`).join('')}</ul>${!isAccepted?button('接受当前候选行程','accept','',!eligible?'disabled':''):tag('当前已接受方案已保存')}<p class="muted small">接受只保存本应用内的版本，不代表完成酒店或门票预订。</p></aside></div>`;}
 function settings(){const c=S.config;return `<div class="page-heading"><div><p class="eyebrow">CONNECTED, WITH CLEAR BOUNDARIES</p><h1>接入真实信息，开始真实规划。</h1><p class="muted">在本机工作台填写 Key，即可开始联调。</p></div>${button('刷新配置状态','refresh','secondary')}</div><div class="settings-grid"><section class="card"><h2>配置 API Key</h2>
 <form id="provider-keys" method="post" autocomplete="off">
   <label class="field">高德 Web 服务 Key<input id="amap-key" type="password" maxlength="512" autocomplete="off"></label>

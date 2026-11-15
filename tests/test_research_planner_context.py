@@ -4,6 +4,7 @@ import json
 
 import httpx2
 import pytest
+from review_mock import with_approved_review
 from test_real_planner import configured, handler
 
 from tripweave.domain import Requirements
@@ -157,11 +158,11 @@ async def test_selected_research_enters_initial_context_once_without_bulk_picker
         }
         if has_previous
         else None,
-        transport=httpx2.MockTransport(provider),
+        transport=httpx2.MockTransport(with_approved_review(provider)),
         research_context=snapshot,
     )
     assert result["status"] == "ready", (result["error"], result["issues"])
-    assert result["usage"]["requests"] == len(calls) == 2
+    assert result["usage"]["requests"] == len(calls) + 1 == 3
     initial = json.loads(calls[0]["messages"][-1]["content"])
     queried = initial["queried_data"]
     packet = queried["selected_attraction_research"]
@@ -213,7 +214,7 @@ async def test_research_for_a_different_selected_identity_or_city_is_not_given_t
         req,
         "deepseek",
         configured(),
-        transport=httpx2.MockTransport(provider),
+        transport=httpx2.MockTransport(with_approved_review(provider)),
         research_context=snapshot,
     )
     assert result["status"] == "ready", result["issues"]
@@ -249,12 +250,12 @@ async def test_local_revision_reuses_research_history_without_searching_again():
         req,
         "deepseek",
         configured(),
-        transport=httpx2.MockTransport(provider),
+        transport=httpx2.MockTransport(with_approved_review(provider)),
         research_context=evidence(),
     )
     assert result["status"] == "ready", (result["error"], result["issues"])
     assert result["itinerary"] == plan
-    assert result["usage"]["requests"] == len(calls) == 3
+    assert result["usage"]["requests"] == len(calls) + 1 == 4
     repair = json.loads(calls[2]["messages"][-1]["content"])
     assert repair["revision_days"] == repair["required_revision_days"] == [1]
     assert {stop["day"] for stop in repair["reference_stops"]} == {2}
@@ -318,7 +319,7 @@ async def persistent_conflict(req, plan, snapshot):
         req,
         "deepseek",
         configured(),
-        transport=httpx2.MockTransport(provider),
+        transport=httpx2.MockTransport(with_approved_review(provider)),
         research_context=snapshot,
     )
     assert result["status"] == "conflict" and result["itinerary"] is None
