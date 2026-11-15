@@ -319,7 +319,7 @@ async def test_fact_return_allows_one_full_revision_then_restores_local_repairs(
 
 
 @pytest.mark.parametrize("search_mode", ["unknown", "no_results", "service_error"])
-async def test_unresolved_or_failed_search_does_not_restart_planning(search_mode):
+async def test_unknown_returns_to_planner_once_but_service_failure_stops(search_mode):
     models, searches = [], []
 
     def provider(request):
@@ -340,7 +340,8 @@ async def test_unresolved_or_failed_search_does_not_restart_planning(search_mode
             return completion("request_information", gap(), 1)
         if len(models) == 2:
             return completion("search_place_information", {"place_id": "p0", "day": 1}, 2)
-        assert len(models) == 3
+        if "lookup_places" in tool_names(body):
+            return completion("final_result", itinerary(), len(models))
         return research_final(
             body, [{"place_id": "p0", "day": 1, "field": "opening_hours", "status": "unknown"}]
         )
@@ -349,8 +350,13 @@ async def test_unresolved_or_failed_search_does_not_restart_planning(search_mode
     expected = "service_error" if search_mode == "service_error" else "needs_information"
     assert result["outcome"] == expected, result
     assert result["status"] == "conflict" and result["itinerary"] is None
-    assert result["usage"]["requests"] == len(models) == 3
-    assert result["research_rounds"] == len(searches) == 1
+    assert (
+        result["usage"]["requests"]
+        == len(models)
+        == {"unknown": 4, "no_results": 5, "service_error": 3}[search_mode]
+    )
+    assert result["research_rounds"] == 1
+    assert len(searches) == (2 if search_mode == "no_results" else 1)
     assert result["research_facts"][0]["status"] == "unknown"
     assert result["issues"][0]["missing_fields"] == ["opening_hours"]
     assert bool(result["error"]) == (search_mode == "service_error")

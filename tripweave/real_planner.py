@@ -594,6 +594,8 @@ class PlanningState(TypedDict, total=False):
     information_request: PlanningInformationRequest | None
     research_rounds: int
     research_facts: list[dict]
+    research_diagnostics: list[dict]
+    research_requests: list[dict]
     research_search_calls: int
     facts_updated: bool
     review: dict
@@ -771,6 +773,8 @@ async def run_planning_graph(
                 "attempts": 0,
                 "research_rounds": 0,
                 "research_facts": [],
+                "research_diagnostics": [],
+                "research_requests": [],
                 "research_search_calls": 0,
                 "facts_updated": False,
                 "review": {"version": 1, "status": "pending"},
@@ -880,7 +884,9 @@ async def run_planning_graph(
                 prompt["instruction"] = "根据问题修订当前草稿，提交完整行程并保留符合要求的安排。"
         elif state.get("messages"):
             prompt = {
-                "instruction": "定向补查已完成，结合原需求与新事实继续生成完整行程，不重做景点推荐。"
+                "instruction": "定向补查结果已返回，可能仍含未知。结合原需求、已采信事实和具体缺口继续规划。"
+                "可以调整非必需的灵活安排以减少对未知资料的依赖，不得删除或替换用户选定、必去或固定预约。"
+                "未知仍阻碍这些硬要求时再次报告具体缺口，不能假设开放或编造时间。"
             }
         else:
             prompt = {
@@ -888,6 +894,13 @@ async def run_planning_graph(
                 "queried_data": model_context(data),
                 "previous_plan": model_context(previous_plan),
             }
+        if state.get("research_diagnostics"):
+            prompt["research_feedback"] = state["research_diagnostics"]
+            prompt["research_instruction"] = (
+                "补查结果可能仍有未知；结合原需求和全程草稿判断影响。"
+                "可以调整非必需灵活安排，不能删除或替换用户选定、必去、固定预约。"
+                "仍阻碍硬要求则报告具体缺口，不把未知当已开放，也不把补查失败当作需求无解。"
+            )
         if not state.get("messages"):
             prompt["requirements"] = {
                 **req.model_dump(mode="json"),
@@ -962,6 +975,8 @@ async def run_planning_graph(
                 {
                     "messages": response.all_messages(),
                     "information_request": output,
+                    "research_requests": state.get("research_requests", [])
+                    + [output.model_dump(mode="json")],
                     "outcome": "needs_information" if state["research_rounds"] >= 1 else None,
                     "issues": state["issues"] + issues
                     if state["research_rounds"] >= 1
@@ -997,15 +1012,24 @@ async def run_planning_graph(
         facts = state["research_facts"] + report.get("facts", [])
         data["planning_facts"] = facts
         outcome = report.get("outcome", "needs_information")
+        # Unknown is feedback, not automatically END: give the planner one
+        # budgeted chance to avoid optional dependencies or preserve a draft.
+        can_return = outcome in {"complete", "needs_information"}
+        if can_return and usage.requests + 2 > settings.max_requests:
+            outcome = "incomplete"
+            can_return = False
+            report["error"] = "资料处理后剩余预算不足以继续排程及首次校验，已保留事实与缺口。"
         return record(
             {
                 "research_rounds": state["research_rounds"] + 1,
                 "research_search_calls": state["research_search_calls"]
                 + report.get("search_calls", 0),
                 "research_facts": facts,
-                "facts_updated": outcome == "complete",
+                "research_diagnostics": state.get("research_diagnostics", [])
+                + report.get("diagnostics", []),
+                "facts_updated": can_return,
                 "information_request": None,
-                "outcome": None if outcome == "complete" else outcome,
+                "outcome": None if can_return else outcome,
                 "issues": state["issues"]
                 if outcome == "complete"
                 else state["issues"] + report.get("issues", information_issues(request)),
@@ -1018,6 +1042,15 @@ async def run_planning_graph(
         critical = unresolved_critical_facts(
             state["candidate"], data.get("critical_needs", []), state.get("research_facts", [])
         )
+        for issue in critical:
+            issue["diagnostics"] = [
+                d
+                for d in state.get("research_diagnostics", [])
+                if d["place_id"] == issue["place_id"]
+                and d["day"] == issue["day"]
+                and d["field"] in issue["missing_fields"]
+                and not d.get("resolved")
+            ]
         issues.extend(critical)
         trace.append(
             {
@@ -1390,6 +1423,9 @@ async def run_plan(
                                 "同一experience_group表示相同游玩内容，避免把主体及其建筑群分别重复安排。"
                                 "关键开放时间、最晚入场或预约事实缺失且阻碍硬要求判定时，"
                                 "输出request_information，列出已知place_id、旅行day、缺少的fields和具体问题，"
+                                "question须说明已有资料、关联用户哪项具体要求或拟安排时段，以及未知会怎样阻碍判断。"
+                                "请求多个字段时逐字段解释必要性，不用「为了合理规划」代替原因，不重查已知信息。"
+                                "仅影响介绍丰富程度的信息不作为必须补查的关键字段。"
                                 "交研究Agent定向补查；无需重做推荐或对所有未知逐一研究。"
                                 "收到planning_facts后结合原需求及全程草稿继续规划，网页报告不等于已预订或官方保证。"
                                 "补查仍未知时如实报告，不假设全天开放。草稿排错应修订草稿；"
@@ -1465,6 +1501,12 @@ async def run_plan(
                                     model_usage,
                                     trace,
                                     transport=transport,
+                                    on_progress=lambda facts, diagnostics: progress.update(
+                                        {
+                                            "research_facts": facts,
+                                            "research_diagnostics": diagnostics,
+                                        }
+                                    ),
                                 )
 
                         state = await run_planning_graph(
@@ -1564,6 +1606,8 @@ async def run_plan(
             if result is None and progress.get("candidate")
             else None,
             "research_facts": progress.get("research_facts", []),
+            "research_diagnostics": progress.get("research_diagnostics", []),
+            "research_requests": progress.get("research_requests", []),
             "review": progress.get("review") if mode == "deepseek" else None,
             "pending_information": progress["information_request"].model_dump(mode="json")
             if progress.get("information_request")

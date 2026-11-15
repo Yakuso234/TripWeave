@@ -88,6 +88,18 @@ class ResearchFact(Contract):
     windows: list[TimeWindow] = Field(default_factory=list, max_length=14)
     closed: bool | None = None
     last_admission: Clock | None = None
+    unknown_reason: (
+        Literal[
+            "field_not_stated",
+            "content_unrelated",
+            "excerpt_insufficient",
+            "sources_conflict",
+            "date_not_applicable",
+            "other",
+        ]
+        | None
+    ) = None
+    unknown_detail: str = Field(default="", max_length=400)
 
     @field_validator("source_ids", mode="before")
     @classmethod
@@ -111,6 +123,8 @@ class ResearchFact(Contract):
             ):
                 raise ValueError("未知事实不能附带推定值、证据引用或已知时间结构")
             return self
+        if self.unknown_reason is not None or self.unknown_detail:
+            raise ValueError("已找到的事实不能同时标记未知原因")
         if not self.value or not self.quote or not self.source_ids:
             raise ValueError("已找到的事实须提供内容、来源编号和原文摘录")
         if self.field != "opening_hours" and (self.windows or self.closed is not None):

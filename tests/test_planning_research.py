@@ -101,7 +101,7 @@ def sources(quote=QUOTE):
     )
 
 
-async def run_research(provider, needs=None, *, settings=None, usage=None):
+async def run_research(provider, needs=None, *, settings=None, usage=None, on_progress=None):
     settings = settings or configured()
     usage = usage or RunUsage()
     trace = []
@@ -128,6 +128,7 @@ async def run_research(provider, needs=None, *, settings=None, usage=None):
             usage,
             trace,
             transport=transport,
+            on_progress=on_progress,
         )
     return result, usage, trace
 
@@ -360,7 +361,7 @@ async def test_empty_search_and_provider_failures_have_distinct_outcomes(kind):
         search["billable"]
         is {"empty": False, "http": False, "format": None, "bad_sources": True}[kind]
     )
-    assert result["search_calls"] == 1
+    assert result["search_calls"] == (2 if kind == "empty" else 1)
     assert result["facts"][0]["status"] == "unknown"
     assert "SENSITIVE-PROVIDER-BODY" not in json.dumps(result)
 

@@ -859,3 +859,31 @@ test('reviewer usage and its saved output cap are visible without replacing hist
   assert.match(settings,/排程、研究、校验三个角色共享 10 次模型请求 \/ 180 秒/);
   assert.match(settings,/校验 9999 tokens/);
 });
+test('research diagnostics distinguish program rejection from model judgment and keep request reasons', () => {
+  const h = harness();
+  const p = h.S.candidate;
+  p.status='conflict'; p.outcome='needs_information'; p.itinerary=null;
+  p.research_requests=[{reason:'固定参观时段需要核对开放',needs:[{place_id:'p',day:1,fields:['opening_hours'],question:'用户要求10点到达，需要明确何时开放。'}]}];
+  p.research_diagnostics=[{place_id:'p',day:1,field:'opening_hours',origin:'program',attempt:1,code:'opening_time_not_in_quote',message:'提取钟点无原文依据',actual:['10:00'],resolved:true},
+    {place_id:'p',day:1,field:'last_admission',origin:'model',attempt:2,code:'excerpt_insufficient',message:'返回摘要没有完整内容'}];
+  p.issues=[{place_id:'p',day:1,message:'资料待补充',missing_fields:['last_admission'],diagnostics:[p.research_diagnostics[1]]}];
+  const html=h.itinerary();
+  assert.match(html,/资料补查记录/);
+  assert.match(html,/用户要求10点到达/);
+  assert.match(html,/程序检测/);
+  assert.match(html,/研究 Agent 判断（待核实）/);
+  assert.match(html,/第 2 次核检/);
+  assert.match(html,/已解决/);
+  assert.match(html,/返回摘要没有完整内容/);
+  assert.equal(h.canAccept(),false);
+});
+
+test('research diagnostics are escaped and absent from untouched legacy records', () => {
+  const h=harness();
+  assert.doesNotMatch(h.itinerary(),/资料补查记录/);
+  h.S.candidate.research_diagnostics=[{place_id:'p',day:1,field:'opening_hours',origin:'model',message:'<img src=x onerror=alert(1)>',actual:'<script>bad</script>'}];
+  const html=h.itinerary();
+  assert.match(html,/&lt;img/);
+  assert.match(html,/&lt;script&gt;/);
+  assert.doesNotMatch(html,/<img src=x|<script>bad/);
+});
