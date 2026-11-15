@@ -234,3 +234,12 @@
 - 未完成草稿、研究事实和错误随候选入SQLite；尚未接图checkpoint、任意步骤续跑或失败草稿跨请求自动重试。
 
 本轮256项Python/27项前端离线测试通过；4项PostgreSQL跳过。图和两个真实SDK角色均通过HTTP模拟验证；浏览器只检查了表单和零外部调用的本地预检分支，没有新真实模型/地图/搜索测试，不能据此声称提示词效果已稳定。架构及剩余边界见[MULTI_AGENT_PLAN](MULTI_AGENT_PLAN.md)。用户决定质量/成本评估后置，本轮未安装评估或提示词优化框架。
+
+
+## 2026-11-15 两角色思考配置更新
+
+用户明确指定两个Agent都启用思考：排程max、研究high。本轮源码已落实，环境变量TRIPWEAVE_PLANNER_EFFORT/TRIPWEAVE_RESEARCH_EFFORT控制强度，thinking固定enabled。SDK显式用reasoning_content字段在各自工具循环内回传，max实际请求值已由HTTP模拟验证，不静默降级；完整思考正文不写候选/轨迹。候选与/api/config记录角色配置，不记录原始思考。
+
+新增5项真SDK HTTP模拟测试覆盖双角色强度、工具/局部修订历史回传、角色隔离及无正文泄露；全套261Python通过/4PG跳过、27前端通过。现有6次/90秒及6000/4000输出上限未增加，尚未验证其对max/high真实运行是否充足。服务本轮检查8776空闲，未启动；下次启动加载新代码，不追加真实模型/地图测试。既有活动计数逻辑尚未修改。
+
+游玩占比的分母已由用户确认为每日出发到结束窗口；指标改造尚未实施。参数依据：[DeepSeek思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)。

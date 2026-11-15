@@ -271,7 +271,8 @@ async def research_missing_information(
                 usage_limits=UsageLimits(request_limit=settings.max_requests),
                 model_settings={
                     "max_tokens": 4000,
-                    "extra_body": {"thinking": {"type": "disabled"}},
+                    "openai_reasoning_effort": settings.research_effort,
+                    "extra_body": {"thinking": {"type": "enabled"}},
                 },
             )
         except UsageLimitExceeded:

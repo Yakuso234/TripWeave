@@ -1,6 +1,7 @@
 """Server-only provider configuration. Never return credentials to the browser."""
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -19,6 +20,12 @@ class Settings(BaseSettings):
     amap_api_key: SecretStr | None = None
     base_url: str = Field(default="https://api.deepseek.com", validation_alias="LLM_BASE_URL")
     model: str = Field(default="deepseek-flash", validation_alias="LLM_MODEL")
+    planner_effort: Literal["low", "high", "max"] = Field(
+        default="max", validation_alias="TRIPWEAVE_PLANNER_EFFORT"
+    )
+    research_effort: Literal["low", "high", "max"] = Field(
+        default="high", validation_alias="TRIPWEAVE_RESEARCH_EFFORT"
+    )
     run_timeout: int = Field(default=90, ge=5, le=180, validation_alias="TRIPWEAVE_RUN_TIMEOUT")
     max_requests: int = Field(default=6, ge=2, le=10, validation_alias="TRIPWEAVE_MAX_REQUESTS")
     database: str = Field(

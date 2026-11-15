@@ -32,6 +32,7 @@ uv --cache-dir .runtime/uv-cache sync --locked
 | `AMAP_API_KEY` | 所有规划必需；高德 **Web 服务** Key，需具有 POI 搜索及路线权限 |
 | `DEEPSEEK_API_KEY` | DeepSeek 模式必需；可在本机接入设置或 `.env` 配置 |
 | `LLM_BASE_URL` / `LLM_MODEL` | 默认 DeepSeek 官方地址与 `deepseek-flash`；模型别名可修改 |
+| `TRIPWEAVE_PLANNER_EFFORT` / `TRIPWEAVE_RESEARCH_EFFORT` | 两角色均开启思考，默认排程 `max`、研究 `high`；可选 `low/high/max` |
 | `TRIPWEAVE_DATABASE` | 默认 `.runtime/tripweave.sqlite3`，本地无需额外数据库服务 |
 | `DATABASE_URL` | 可选 PostgreSQL 连接串，优先于本地路径；详见部署说明 |
 | `TRIPWEAVE_MAX_REQUESTS` / `TRIPWEAVE_RUN_TIMEOUT` | 默认 6 次模型请求 / 整次规划 90 秒 |
@@ -110,3 +111,10 @@ Get-Content tests/frontend_state.cjs -Raw | node
 测试与真实服务验证分开记录，最新结果见 [v0.2 验证报告](docs/evaluations/V02_QA.md)。
 
 高德失败记录会标明接口路径，并区分连接、超时、HTTP 错误、业务错误码和响应格式异常。错误提示仅保留用于排查的类别与路径。
+
+
+## 2026-11-15 思考配置
+
+排程与按需事实研究均使用deepseek-flash思考模式，默认强度分别max/high。配置与历史候选的thinking_configuration可查实际使用强度；SDK工具调用历史按reasoning_content字段回传，不把原始思考内容放入候选或公开轨迹。该配置针对官方DeepSeek，其他兼容服务需另行核对。
+
+请求上限6次、整轮90秒及每次排程6000/研究4000输出token上限暂保留；强度不代表无限计算，思考模式可能更耗时/更易触及现有长度或时限。效果与费用尚未真实比较。本轮261项Python/27项前端离线检查通过，4项PostgreSQL跳过，无新增真实调用。官方参数依据见[思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)。

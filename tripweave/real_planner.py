@@ -897,7 +897,8 @@ async def run_planning_graph(
                 usage_limits=UsageLimits(request_limit=settings.max_requests),
                 model_settings={
                     "max_tokens": 6000,
-                    "extra_body": {"thinking": {"type": "disabled"}},
+                    "openai_reasoning_effort": settings.planner_effort,
+                    "extra_body": {"thinking": {"type": "enabled"}},
                 },
             )
         except UsageLimitExceeded:
@@ -1101,6 +1102,10 @@ async def run_plan(
                             profile=OpenAIModelProfile(
                                 openai_supports_strict_tool_definition=False,
                                 supports_forced_tool_choice=False,
+                                openai_chat_thinking_field="reasoning_content",
+                                openai_chat_send_back_thinking_parts="field",
+                                openai_chat_thinking_requires_field_on_tool_calls=True,
+                                openai_chat_supports_max_reasoning_effort=True,
                             ),
                         )
                         agent = Agent(
@@ -1343,6 +1348,12 @@ async def run_plan(
             else None,
             "error": error,
             "model": settings.model if mode == "deepseek" else "基于真实地图的约束排程",
+            "thinking_configuration": {
+                "planner": {"enabled": True, "effort": settings.planner_effort},
+                "research": {"enabled": True, "effort": settings.research_effort},
+            }
+            if mode == "deepseek"
+            else None,
             "data_mode": (
                 "本地硬要求预检 · 未调用外部服务"
                 if not maps.calls and not model_usage.requests

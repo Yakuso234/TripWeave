@@ -105,6 +105,10 @@ def create_app(database: str | None = None) -> FastAPI:
             if map_configured(settings)
             else [],
             "model": settings.model,
+            "thinking_configuration": {
+                "planner": {"enabled": True, "effort": settings.planner_effort},
+                "research": {"enabled": True, "effort": settings.research_effort},
+            },
             "provider": "DeepSeek / 兼容接口",
             "base_url": settings.base_url,
             "default_date": tomorrow.isoformat(),

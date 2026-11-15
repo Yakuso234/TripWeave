@@ -196,3 +196,9 @@ Python **81 passed、4 skipped**，前端 **19 passed**；Ruff、格式、JS语�
 证据：.runtime/live-agents-20261114-{setup,dispatched,result,review}.json为首次；.runtime/live-agents-20261114-retry-{dispatched,result,review}.json为用户授权重试；对应result.jpg与retry-result.jpg为实际页面截图。均为助手制定的合成测试行程，不含凭据。
 
 下一步基础问题：排程不要把起点当零时长活动，避免用同一景点的分段安排/休息违反既定计数与去重规则，补查后仍须保留用户窗口；共享上限在首份草稿后已耗尽，修订进入节点但无法产生结果。后续应先明确预算内的基本修订机会，不自动上调限额或再发真实请求。质量/成本批量评估仍后置。
+
+### 2026-11-15 排程max／研究high思考兼容检查（仅离线）
+
+用户确认两角色都思考，分别max/high。新增settings角色effort、两处thinking enabled与原样effort请求；SDK profile显式reasoning_content字段回传。5项新增真SDK HTTP模拟验证max不降级、不同角色独立effort/独立历史、普通工具与跨业务修订的思考字段完整回传、原始思考不进入公开结果及无效effort拒绝。
+
+全套261 passed/4 PostgreSQL skipped，前端27 passed，Ruff/格式通过。未改活动计数，未提升原请求/时限/token上限，未真实调用；max/high不代表修复已有真实失败。8776本轮为空闲，未启动，新配置下次服务启动生效。
