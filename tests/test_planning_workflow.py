@@ -177,6 +177,39 @@ async def test_known_draft_error_revises_only_affected_day_and_checks_whole_plan
     assert result["research_rounds"] == result["research_search_calls"] == 0
 
 
+async def test_pacing_violation_returns_actual_limit_and_segments_for_local_revision():
+    original = itinerary(days=2)
+    broken = deepcopy(original)
+    broken["stops"][0]["end_time"] = "12:00"
+    calls = []
+
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            return map_response(request)
+        calls.append(json.loads(request.content))
+        if len(calls) == 1:
+            return completion("final_result", broken, 1)
+        return completion("revise_days", {"stops": [original["stops"][0]]}, 2)
+
+    result = await run(requirements(days=2, max_sightseeing_minutes=90), provider)
+    assert result["status"] == result["outcome"] == "ready", result
+    revision = json.loads(calls[1]["messages"][-1]["content"])
+    assert revision["revision_days"] == [1]
+    assert revision["reference_stops"] == [
+        {
+            key: original["stops"][1][key]
+            for key in ("day", "place_id", "start_time", "end_time", "kind")
+        }
+    ]
+    issue = revision["validation_issues"][0]
+    assert (issue["code"], issue["actual"], issue["limit"]) == ("max_sightseeing_minutes", 120, 90)
+    assert issue["occurrences"][0]["stop_number"] == 1
+    assert issue["occurrences"][0]["end_time"] == "12:00"
+    assert result["itinerary"] == original
+    assert [row["sightseeing_minutes"] for row in result["daily_metrics"]] == [60, 60]
+    assert result["usage"]["requests"] == 2
+
+
 async def test_planner_research_return_uses_independent_context_and_shared_usage():
     events, models, searches = [], [], []
 

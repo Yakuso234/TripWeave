@@ -29,7 +29,26 @@ const tag=(text,warn=false)=>`<span class="tag ${warn?'warn':''}">${esc(text)}</
 function field(label,key,type='text',help='',attrs=''){if(['city','date','origin_query','start_time','end_time'].includes(key))attrs+=' required';return `<label class="field">${label}<input data-field="${key}" type="${type}" value="${esc(S.draft[key])}" ${attrs}>${help?`<small>${help}</small>`:''}</label>`;}
 function choices(key,items){return `<div class="choice-group">${items.map(([value,label,sub])=>`<button class="choice ${sub?'wide':''} ${String(S.draft[key])===String(value)?'active':''}" aria-pressed="${String(S.draft[key])===String(value)}" data-field-choice="${key}" data-value="${esc(value)}">${label}${sub?`<small>${sub}</small>`:''}</button>`).join('')}</div>`;}
 function shownPlan(){const p=S.candidate||S.trip?.accepted_plan;return p&&['basic','deepseek'].includes(p.mode)?p:null;}
-function dirty(){return S.trip && (Object.entries(S.draft).some(([k,v])=>JSON.stringify(S.trip.requirements[k]??S.config.defaults[k])!==JSON.stringify(v))
+const pacingKeys = ['max_attractions','max_sightseeing_minutes','max_sightseeing_ratio','max_transport_minutes'];
+function normalizePacing(values) {
+  const normalized = {...values};
+  if (!Object.hasOwn(normalized, 'max_attractions') && Object.hasOwn(normalized, 'max_activities')) {
+    normalized.max_attractions = normalized.max_activities;
+  }
+  delete normalized.max_activities;
+  return normalized;
+}
+function draftFrom(values) {return {...normalizePacing(S.config.defaults), ...normalizePacing(values)};}
+function pacingFields(values, profileMode=false) {
+  const definitions = [
+    ['每日景点数量上限','max_attractions',20,1,'同一地点当天分段参观计一个；固定预约地点也计入。'],
+    ['每日游玩时长上限（分钟）','max_sightseeing_minutes',1440,1,'累计参观、体验时间；用餐、住宿、纯休息与交通除外。'],
+    ['游玩时间占比上限（%）','max_sightseeing_ratio',100,'any','游玩分钟 ÷ 每日出发至结束的固定窗口。与游玩时长同时填写时，两项都须满足。'],
+    ['每日交通时长上限（分钟）','max_transport_minutes',1440,1,'累计地图路段耗时，含首段和回酒店；不含额外交通缓冲。'],
+  ];
+  return `<div class="field-grid">${definitions.map(([label,key,max,step,help])=>`<label class="field">${label}<input ${profileMode?'name':'data-field'}="${key}" type="number" min="0" max="${max}" step="${step}" placeholder="留空不限" value="${esc(values[key])}"><small>${help}</small></label>`).join('')}</div><p class="muted small">四项独立设置，留空表示不限，填写 0 表示上限为 0。具体景点取舍由 AI 根据你的需求安排；程序只检查，不自动搬动行程。</p>`;
+}
+function dirty(){const original=S.trip?draftFrom(S.trip.requirements):{};return S.trip && (Object.entries(S.draft).some(([k,v])=>JSON.stringify(original[k])!==JSON.stringify(v))
   || (S.draft.visit_constraints || []).some(item => Object.hasOwn(S.visitDayInputs,item.constraint_id)
     && S.visitDayInputs[item.constraint_id] !== item.windows.map(window=>window.day).join(',')));}
 // A plan keeps its own input snapshot; the editable draft is never its source of truth.
@@ -177,7 +196,7 @@ function missingNotice(){return !S.config.map_configured?`<div class="notice">�
 function heroArt(){return `<div class="hero-art" aria-hidden="true"><svg viewBox="0 0 400 230" fill="none"><circle cx="310" cy="48" r="28" fill="#f5e4b8"/><path d="M10 204H390" stroke="#72927b"/><path d="M44 204V130H88V204M105 204V94H147V204M172 204V116H218V204M244 204V70H279V204M302 204V119H345V204" fill="#78967f"/><path d="M259 70V26M251 41H267M191 116V66M181 81H201" stroke="#50785f" stroke-width="3"/><path d="M14 219C80 170 120 236 180 213S300 193 389 216" stroke="#e3ede1" stroke-width="6"/><path d="M33 128C95 34 206 77 330 164" stroke="#f9f9ef" stroke-dasharray="5 7" stroke-width="2"/><circle cx="33" cy="128" r="6" fill="#f7f7ee"/><circle cx="330" cy="164" r="6" fill="#f7f7ee"/></svg><span class="hero-note">A LITTLE PLAN. A BETTER JOURNEY.</span></div>`;}
 function overview(){const d=S.draft,p=shownPlan();return `<section class="hero"><div class="hero-copy"><p class="eyebrow">YOUR NEXT CHAPTER / 下一次出发</p><h1>把${esc(d.city)}的${d.days}天，<br>安排成喜欢的样子。</h1><p class="subtle">从住宿片区到每日路线，把人文、风味和留白织进行程。你可以随时改变想法，让计划跟上变化。</p><div class="actions">${button('开始完善旅行偏好 ↗','preferences')}${button(p?'查看当前行程':'查看规划工作台','itinerary','ghost')}</div></div>${heroArt()}</section><div class="metrics"><div class="metric"><span>旅行时长</span><strong>${daysLabel()}</strong><small>${esc(d.date)}</small></div><div class="metric"><span>同行人数</span><strong>${d.party_size}</strong><small>位旅行者</small></div><div class="metric"><span>整趟预算</span><strong>${money(d.budget_total)}</strong><small>全体人数</small></div><div class="metric"><span>当前规划方式</span><strong style="font-size:18px">DeepSeek</strong><small>${S.config.map_configured?'真实高德地图':'等待地图接入'}</small></div></div>${missingNotice()}<div class="section-title"><h2>一趟旅行，慢慢成形</h2><span class="muted small">三步，把想法变成可检查的安排</span></div><div class="grid3">${[['01','先说说你想怎么旅行','日期、节奏、预算和不能错过的预约，都从这里开始。','preferences','填写旅行偏好'],['02','找到合适的落脚点','依据真实酒店位置推荐片区与备选，房价与房量保持待确认。','hotels','查看住宿方案'],['03','让每天都有自己的节奏','真实路线核对交通，按天查看景点、餐饮、住宿与待办事项。','itinerary','进入每日安排']].map(([n,title,text,target,label])=>`<article class="card"><span class="step-num">${n}</span><h3>${title}</h3><p class="muted small">${text}</p>${button(label+' →',target,'secondary')}</article>`).join('')}</div><div class="section-title"><h2>最近的行程</h2>${button('＋ 新建旅行','new','secondary tiny')}</div><section class="card">${S.history.length?S.history.slice(0,5).map(t=>`<div class="history-row"><div><strong>${esc(t.requirements.city)} · ${t.requirements.days||1}日旅行</strong><p>${esc(t.requirements.date)} · 已接受版本 ${t.accepted_version}</p></div>${button('继续查看 →','load','secondary tiny',`data-id="${esc(t.id)}"`)}</div>`).join(''):'<p class="muted small">这里会保存你创建过的旅行。先从一份偏好开始吧。</p>'}</section>`;}
 function preferences(){const d=S.draft;let content='';if(S.step===1){content=`<p class="eyebrow">01 / 出发的轮廓</p><h2>先决定，去哪里待多久。</h2><p class="muted small">支持国内城市地点查询；请填写明确的出发地点或酒店名称。</p><div class="choice-group">${['上海','杭州','苏州','南京','成都','北京'].map(city=>`<button class="choice ${d.city===city?'active':''}" aria-pressed="${d.city===city}" data-city="${city}">${city}</button>`).join('')}</div><div class="field-grid">${field('目的地城市','city')}${field('出行日期','date','date')}</div><label class="field">旅行天数</label>${choices('days',[[1,'1天','当日往返'],[2,'2天1晚','周末短途'],[3,'3天2晚','多留一点时间']])}<div class="field-grid">${field('自定义天数','days','number','支持 1–7 天。','min="1" max="7" required')}<label class="field">自定义住宿晚数<input data-field="nights" type="number" min="0" max="6" placeholder="${nightsFor(d)}" value="${d.nights ?? ''}"><small>留空按天数减一计算。指定较少晚数时，住宿从第一天起连续安排。</small></label></div><div class="field-grid">${field('同行人数','party_size','number','房间暂按每间2人预留，实际入住政策待核实。','min="1" max="6"')}${field('整趟预算（全体人数 / 元）','budget_total','number','不含往返大交通和购物。','min="100" max="100000"')}</div>${field('第一天从哪里出发','origin_query','text','例如：上海站、人民广场，或你已知的酒店名称。')}`;}
-if(S.step===2){const tags=['城市漫步','历史人文','自然公园','室内展览','美食探索','江景夜色'];content=`<p class="eyebrow">02 / 旅行的温度</p><h2>把节奏留给自己。</h2><label class="field">你更在意什么？</label><div class="choice-group">${tags.map(t=>`<button class="choice ${d.interests.includes(t)?'active':''}" aria-pressed="${d.interests.includes(t)}" data-interest="${t}">${t}</button>`).join('')}</div>${field('自定义兴趣','custom_interests','text','例如：独立书店、建筑摄影。','maxlength="300"')}<label class="field">一天的节奏</label>${choices('pace',[['relaxed','悠闲慢游','单站停留更久'],['balanced','刚刚好','体验与留白兼顾'],['full','充实探索','增加城市体验']])}${field('自定义节奏','custom_pace','text','例如：午饭后休息一小时，每站至少留 90 分钟。','maxlength="300"')}<label class="field">市内交通</label>${choices('transport',[['mixed','步行 + 公共交通','较远路段查询公共交通'],['walking','尽量步行','用步行路线核对时间']])}${field('自定义交通需求','custom_transport','text','例如：尽量少换乘。路线耗时按上方选中的方式核对。','maxlength="300"')}<div class="field-grid">${field('每天最早出发','start_time','time')}${field('每天最晚结束','end_time','time')}</div><label class="field">每日最多景点 / 固定活动</label>${choices('max_activities',[[2,'2项'],[3,'3项'],[4,'4项'],[5,'5项']])}${field('自定义每日活动上限','max_activities','number','','min="1" max="5" required')}`;}
+if(S.step===2){const tags=['城市漫步','历史人文','自然公园','室内展览','美食探索','江景夜色'];content=`<p class="eyebrow">02 / 旅行的温度</p><h2>把节奏留给自己。</h2><label class="field">你更在意什么？</label><div class="choice-group">${tags.map(t=>`<button class="choice ${d.interests.includes(t)?'active':''}" aria-pressed="${d.interests.includes(t)}" data-interest="${t}">${t}</button>`).join('')}</div>${field('自定义兴趣','custom_interests','text','例如：独立书店、建筑摄影。','maxlength="300"')}<label class="field">一天的节奏</label>${choices('pace',[['relaxed','悠闲慢游','单站停留更久'],['balanced','刚刚好','体验与留白兼顾'],['full','充实探索','增加城市体验']])}${field('自定义节奏','custom_pace','text','例如：午饭后休息一小时，每站至少留 90 分钟。','maxlength="300"')}<label class="field">市内交通</label>${choices('transport',[['mixed','步行 + 公共交通','较远路段查询公共交通'],['walking','尽量步行','用步行路线核对时间']])}${field('自定义交通需求','custom_transport','text','例如：尽量少换乘。路线耗时按上方选中的方式核对。','maxlength="300"')}<div class="field-grid">${field('每天最早出发','start_time','time')}${field('每天最晚结束','end_time','time')}</div>${pacingFields(d)}`;}
 if(S.step===3){content=`<p class="eyebrow">03 / 安心的边界</p><h2>保留那些已经确定的事。</h2><div class="field-grid">${field('住宿上限（每间每晚 / 元）','hotel_budget','number','仅为预算预留，不当作真实报价。','min="100" max="5000"')}${field('预约在第几天','booking_day','number','','min="1" max="'+d.days+'"')}</div><label class="field">住宿取向</label>${choices('hotel_preference',[['balanced','衔接便利','靠近出发或预约片区'],['value','预算优先','房价需订房平台核实'],['riverside','体验优先','具体景观房需另行确认']])}${field('自定义住宿取向','custom_hotel','text','例如：靠近地铁站、希望有家庭房。房型与设施待确认。','maxlength="300"')}<label class="field">必去景点<textarea data-field="must_visit" maxlength="404" placeholder="每行一个，最多 5 个">${esc((d.must_visit || []).join('\n'))}</textarea><small>请填写明确的景点名称，规划会核对是否安排了这些地点。</small></label>${visitConstraintsForm()}${field('固定活动 / 预约地点','booking_query','text','没有固定预约可留空。这里只保留你的计划，不会代你预约。')}<div class="field-grid">${field('预约开始','booking_start','time')}${field('预约结束','booking_end','time')}</div><label class="field">额外需求<textarea data-field="notes" maxlength="1500" placeholder="例如：带父母出行，尽量减少长距离步行；希望第二天下午保留自由时间。">${esc(d.notes)}</textarea><small>DeepSeek 会结合这段说明和已填的日期、节奏及约束生成候选。</small></label>`;}
 return `<div class="page-heading"><div><p class="eyebrow">TRAVEL BRIEF</p><h1>旅行偏好</h1><p class="muted">一次说清楚，后面的修改不必从头开始。</p></div><div class="actions">${tag('第 '+S.step+' / 3 步')}${button('长期偏好','profile','secondary')}</div></div><div class="layout"><aside class="sidebar">${[['目的地与日期','先画出旅途轮廓'],['兴趣与节奏','决定一天怎样度过'],['预算与固定安排','把重要的事留住']].map(([a,b],i)=>`<button class="step-link ${S.step===i+1?'active':''}" aria-current="${S.step===i+1?'step':'false'}" data-step="${i+1}"><span>0${i+1}</span><div><strong>${a}</strong><small>${b}</small></div></button>`).join('')}</aside><section class="card form-card">${content}<div class="form-bottom">${S.step>1?button('← 上一步','prev','secondary'):button('返回概览','overview','secondary')}${S.step<3?button('下一步 →','next'):preferenceNextActions(d)}</div></section></div>`;}
 function preferenceNextActions(draft) {
@@ -207,8 +226,8 @@ function profile() {
         ${select('默认交通', 'transport', [['mixed','步行 + 公共交通'],['walking','尽量步行']])}
         ${select('默认住宿取向', 'hotel_preference', [['balanced','衔接便利'],['value','预算优先'],['riverside','体验优先']])}
         <label class="field">每间每晚住宿预算（元）<input type="number" name="hotel_budget" min="100" max="5000" value="${esc(values.hotel_budget)}" required></label>
-        <label class="field">每日活动上限<input type="number" name="max_activities" min="1" max="5" value="${esc(values.max_activities)}" required></label>
       </div>
+      ${pacingFields(normalizePacing(values), true)}
       ${input('常去的景点类型', 'interests', 500)}
       ${input('自定义兴趣', 'custom_interests', 300)}
       ${input('习惯的旅行节奏', 'custom_pace', 300)}
@@ -323,6 +342,16 @@ document.addEventListener('error', event => {
 }, true);
 function hotelCard(h,index){return `<article class="card hotel-card ${S.draft.hotel_id===h.id?'selected':''}"><div class="hotel-art" aria-hidden="true">0${index+1}</div><div class="section-title">${tag(index===0?'位置推荐':'备选住宿')}${S.draft.hotel_id===h.id?tag('已手选'):''}</div><h3>${esc(h.name)}</h3><p class="muted small">${esc(h.area||'')} · ${esc(h.address)}</p><p class="small subtle">${esc(h.selection_reason||'按真实地点的位置衔接推荐；房价与空房待确认。')}</p><div class="price">房价待查询 <small>/ 非实时预订系统</small></div><p class="muted small">${Math.ceil(S.draft.party_size/2)}间 × ${nightsFor()}晚，按上限预留 ${money(S.draft.hotel_budget*Math.ceil(S.draft.party_size/2)*nightsFor())}</p><ul>${(h.benefits||['来自高德地点查询','需核实房型、空房和取消规则']).map(t=>`<li>${esc(t)}</li>`).join('')}</ul>${button(S.draft.hotel_id===h.id?'已选择此住宿':'选择这家住宿','hotel','secondary',`data-id="${esc(h.id)}"`)}</article>`;}
 function hotels(){const hotels=currentHotels();return `<div class="page-heading"><div><p class="eyebrow">A PLACE TO RETURN TO</p><h1>给旅途，选一个落脚点。</h1><p class="muted">${esc(S.draft.city)} · ${daysLabel()} · ${S.draft.party_size}人 · 每间每晚预算 ${money(S.draft.hotel_budget)}</p></div><div class="actions">${button('调整住宿预算','constraints','secondary')}${button('查询真实住宿 ↗','query-hotels', '',!S.config.map_configured||!nightsFor()?'disabled':'')}</div></div><div class="notice">自动推荐主要核对酒店位置与路线衔接。高德地点搜索不保证实时房价、空房、早餐或房型，预算上限仅作为预留。</div>${!nightsFor()?`<div class="empty"><span class="empty-mark">↗</span><h2>这趟行程无需住宿</h2><p>可以直接进入每日安排。</p>${button('进入每日安排','itinerary')}</div>`:hotels.length?`<div class="actions">${button('让系统自动推荐','auto-hotel','ghost')}${S.draft.hotel_id?tag('手选住宿将在重新规划时保留'):tag('自动推荐已开启')}</div><div class="grid3" style="margin-top:20px">${hotels.slice(0,6).map(hotelCard).join('')}</div><div class="actions">${button('按当前住宿生成行程 →','generate')}</div>`:`<div class="empty"><span class="empty-mark">⌂</span><h2>${S.config.map_configured?'从真实酒店候选开始':'接入地图后，查询真实酒店'}</h2><p>系统会查询目的地酒店，比较与你出发地点、固定预约的距离。这里不会放置虚构酒店或占位房价。</p>${button(S.config.map_configured?'开始查询住宿':'查看接入设置',S.config.map_configured?'query-hotels':'settings')}</div>`}`;}
+function pacingSummary(plan) {
+  if (!plan.daily_metrics?.length) return '<p class="muted small">此记录未保存每日节奏统计。</p>';
+  const cell = (value, limit, unit) => `${value == null ? '未核实' : esc(Number(value.toFixed(2))) + unit} / ${limit == null ? '不限' : esc(limit) + unit}`;
+  return `<h3>每日节奏 · 实际 / 上限</h3><div class="pacing-metrics">${plan.daily_metrics.map(row=>`<section class="pacing-day"><strong>第 ${esc(row.day)} 天${isReadyPlan(plan)?'':' · 草稿'}</strong><dl>
+    <div><dt>景点数</dt><dd>${cell(row.attraction_count,row.limits.max_attractions,'个')}</dd></div>
+    <div><dt>游玩时长</dt><dd>${cell(row.sightseeing_minutes,row.limits.max_sightseeing_minutes,'分钟')}</dd></div>
+    <div><dt>游玩占比</dt><dd>${cell(row.sightseeing_ratio,row.limits.max_sightseeing_ratio,'%')}</dd></div>
+    <div><dt>地图交通</dt><dd>${cell(row.transport_minutes,row.limits.max_transport_minutes,'分钟')}</dd></div>
+    </dl><small class="muted">出发至结束窗口 ${esc(row.available_minutes)} 分钟；交通缓冲另留。</small></section>`).join('')}</div>`;
+}
 function itinerarySummary(plan, requirements, issues) {
   const stops = isReadyPlan(plan) ? plan.itinerary?.stops || [] : [];
   const places = new Map((plan.places || []).map(place => [place.id, place.name]));
@@ -338,6 +367,7 @@ function itinerarySummary(plan, requirements, issues) {
     ${required || pending ? `<h3>必去景点</h3><ul>${required || pending}</ul>` : ''}
     ${planningOutcomeMessage(plan) ? `<p class="small">${esc(planningOutcomeMessage(plan))}</p>` : ''}
     ${issues.length ? `<div class="notice danger">${issues.map(esc).join('<br>')}</div>` : ''}
+    ${pacingSummary(plan)}
     ${!isReadyPlan(plan) && plan.draft ? '<p class="muted small">草稿已保存，尚不可接受。你可以导出当前记录查看未完成草稿。</p>' : ''}
   </section>`;
 }
@@ -418,7 +448,7 @@ function resetHotels() {
 function adoptTrip(trip) {
   attractionPreview = null;
   S.trip = trip;
-  S.draft = {...S.config.defaults, ...trip.requirements, days:trip.requirements.days || 1};
+  S.draft = {...draftFrom(trip.requirements), days:trip.requirements.days || 1};
   S.candidate = null;
   S.planHistory = [];
   S.historyOpen = false;
@@ -580,7 +610,7 @@ const actions = {
     S.travelProfile = await api('/preferences');
     attractionPreview = null;
     S.trip = null; S.candidate = null; S.error = null; S.planHistory = []; S.historyOpen = false; resetHotels();
-    S.draft = {...S.config.defaults, ...S.travelProfile.values}; S.step = 1; S.day = 1; S.visitDayInputs = Object.create(null);
+    S.draft = draftFrom(S.travelProfile.values); S.step = 1; S.day = 1; S.visitDayInputs = Object.create(null);
     localStorage.removeItem('tripweave-v2-id'); go('preferences');
   }),
   generate:() => generate(),
@@ -674,7 +704,7 @@ document.addEventListener('click', event => {
   if (el.dataset.fieldChoice) {
     const key = el.dataset.fieldChoice;
     if (key === 'days') { S.draft.nights = null; resetHotels(); }
-    changeDraft(key, ['days', 'max_activities'].includes(key) ? Number(el.dataset.value) : el.dataset.value);
+    changeDraft(key, ['days', ...pacingKeys].includes(key) ? Number(el.dataset.value) : el.dataset.value);
     render();
   } else if (el.dataset.city) {
     changeDraft('city', el.dataset.city);
@@ -696,7 +726,7 @@ document.addEventListener('submit', event => {
     if (S.busy) return;
     const values = Object.fromEntries(new FormData(event.target));
     values.hotel_budget = Number(values.hotel_budget);
-    values.max_activities = Number(values.max_activities);
+    for (const key of pacingKeys) values[key] = values[key] === '' ? null : Number(values[key]);
     S.profileDraft = values;
     return busy(async () => {
       S.travelProfile = await api('/preferences', 'PUT', {expected_revision:S.travelProfile.revision, values});
@@ -749,7 +779,7 @@ window.addEventListener('hashchange', () => {
     [S.config, S.travelProfile, S.history] = await Promise.all([
       api('/config'), api('/preferences'), api('/trips'),
     ]);
-    S.draft = {...S.config.defaults, ...S.travelProfile.values};
+    S.draft = draftFrom(S.travelProfile.values);
     const id = localStorage.getItem('tripweave-v2-id');
     if (id) {
       try { adoptTrip(await api('/trips/' + id)); await loadPlanHistory(true); }

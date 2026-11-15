@@ -202,3 +202,10 @@ Python **81 passed、4 skipped**，前端 **19 passed**；Ruff、格式、JS语�
 用户确认两角色都思考，分别max/high。新增settings角色effort、两处thinking enabled与原样effort请求；SDK profile显式reasoning_content字段回传。5项新增真SDK HTTP模拟验证max不降级、不同角色独立effort/独立历史、普通工具与跨业务修订的思考字段完整回传、原始思考不进入公开结果及无效effort拒绝。
 
 全套261 passed/4 PostgreSQL skipped，前端27 passed，Ruff/格式通过。未改活动计数，未提升原请求/时限/token上限，未真实调用；max/high不代表修复已有真实失败。8776本轮为空闲，未启动，新配置下次服务启动生效。
+
+
+### 2026-11-15 四项节奏指标回归（无真实供应商请求）
+
+用景点数、游玩分钟、固定每日窗口百分比和独立交通分钟上限替代旧activity数量。合成样本09–21窗口720分钟，同POI10–11/14–15/19–20计1个、180分钟、25%；用餐/住宿不计游玩。检查四项恰好上限、超限定位、0/null、首段/用餐段/回酒店/次日起点、分组别名、重叠、跨天重复、旧字段兼容、SQLite重启与候选统计。SDK HTTP模拟确认第一天超时长只修订当天，保留其他天并全量重检。
+
+新增17 Python与3 Node，全套278 passed、4 PostgreSQL skipped、前端30 passed；Ruff/格式、JS语法、diff通过。AST导出的排程instructions和Itinerary输出schema同步。浏览器查看四项表单/长期偏好，输入示例180/25/60后清空，不保存旅行/长期偏好、不生成/接受方案。截图本地.runtime/pacing-form-20261115.jpg。无新增模型、地图或搜索调用；不能据此声称已消除真实模型标签误用、取得新版可接受规划或降低费用。

@@ -34,7 +34,42 @@ class TravelPreferences(BaseModel):
     custom_pace: str = Field(default="", max_length=300)
     custom_transport: str = Field(default="", max_length=300)
     custom_hotel: str = Field(default="", max_length=300)
-    max_activities: int = Field(default=3, ge=1, le=5)
+    max_attractions: int | None = Field(
+        default=3,
+        ge=0,
+        le=20,
+        description="每日不同景点/体验地点数量上限；同地点分段只计一个，空值不限",
+    )
+    max_sightseeing_minutes: int | None = Field(
+        default=None,
+        ge=0,
+        le=1440,
+        description="每日activity和booking实际游玩时段累计分钟上限；空值不限",
+    )
+    max_sightseeing_ratio: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+        allow_inf_nan=False,
+        description="每日游玩分钟占用户start_time到end_time固定窗口的百分比上限，0至100；空值不限",
+    )
+    max_transport_minutes: int | None = Field(
+        default=None,
+        ge=0,
+        le=1440,
+        description="每日全部地图路段耗时累计分钟上限，含首段和回酒店，不含额外缓冲；空值不限",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_activity_limit(cls, values):
+        # Read old SQLite records/clients without rewriting historical snapshots.
+        if isinstance(values, dict) and "max_activities" in values:
+            values = dict(values)
+            if "max_attractions" not in values:
+                values["max_attractions"] = values["max_activities"]
+            values.pop("max_activities")
+        return values
 
 
 class Requirements(TravelPreferences):
@@ -96,7 +131,10 @@ class Stop(BaseModel):
     end_time: Clock = Field(
         description="结束本站的时刻，也是前往下一站的最早出发时刻，目的地当地时间"
     )
-    kind: Literal["activity", "booking", "meal", "hotel"] = "activity"
+    kind: Literal["activity", "booking", "meal", "hotel"] = Field(
+        default="activity",
+        description="activity为实际参观体验，booking为用户固定预约，meal为用餐，hotel为住宿；出发和纯休息不建站",
+    )
     reason: str = Field(max_length=1000)
     title: str = Field(default="", max_length=100)
 

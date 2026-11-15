@@ -12,7 +12,8 @@ const requirements = {
   pace:'balanced', transport:'mixed', origin_query:'人民广场',
   start_time:'09:00', end_time:'20:30', interests:'历史人文', notes:'',
   booking_query:'上海博物馆', booking_day:1, booking_start:'14:00',
-  booking_end:'15:00', max_activities:3,
+  booking_end:'15:00', max_attractions:3, max_sightseeing_minutes:null,
+  max_sightseeing_ratio:null, max_transport_minutes:null,
   visit_constraints:[],
 };
 
@@ -41,7 +42,7 @@ function harness() {
     Blob, URL:{createObjectURL:() => 'blob:test', revokeObjectURL() {}},
   });
   vm.runInContext(source, context);
-  const app = vm.runInContext('({S,actions,dirty,stalePlan,canAccept,planRequirements,currentHotels,hotelQueryContext,exportPayload,changeDraft,itinerary,hotels,dateFor,stopHeading,loadPlanHistory,planningRecords,adoptTrip,restoreAttractionDraft,render,preferences,visibleFieldsValid})', context);
+  const app = vm.runInContext('({S,actions,dirty,stalePlan,canAccept,planRequirements,currentHotels,hotelQueryContext,exportPayload,changeDraft,itinerary,hotels,dateFor,stopHeading,loadPlanHistory,planningRecords,adoptTrip,restoreAttractionDraft,render,preferences,visibleFieldsValid,profile})', context);
   app.S.config = {defaults:copy(requirements), map_configured:true, model_configured:true, model:'test-model'};
   app.S.draft = copy(requirements);
   app.S.trip = {id:'trip-1', requirements:copy(requirements), requirements_revision:1,
@@ -561,4 +562,62 @@ test('history reports the outcome reason and guards inconsistent ready records',
   const html = h.planningRecords();
   for(const label of ['资料待补充','需要调整要求','本次未完成','接口异常']) assert.match(html,new RegExp(label));
   assert.doesNotMatch(html,/存在冲突/);
+});
+
+test('four pacing controls are optional and distinguish cleared values from explicit zero', () => {
+  const h = harness();
+  h.S.step = 2;
+  const html = h.preferences();
+  for (const key of ['max_attractions','max_sightseeing_minutes','max_sightseeing_ratio','max_transport_minutes']) {
+    assert.match(html,new RegExp(`data-field="${key}"[^>]*placeholder="留空不限"`));
+    h.listeners.input({target:{dataset:{field:key},type:'number',value:'0'}});
+    assert.equal(h.S.draft[key],0);
+    h.listeners.input({target:{dataset:{field:key},type:'number',value:''}});
+    assert.equal(h.S.draft[key],null);
+  }
+  assert.doesNotMatch(html,/data-field="max_activities"|每日活动上限/);
+  assert.match(html,/固定窗口/);
+  h.S.travelProfile = {values:copy(h.S.draft)};
+  assert.match(h.profile(),/name="max_transport_minutes"/);
+  assert.match(h.profile(),/name="max_sightseeing_ratio"/);
+});
+
+test('legacy trip limit is mapped before defaults without dirtying or rewriting history', () => {
+  const h = harness();
+  const old = copy(h.S.trip);
+  delete old.requirements.max_attractions;
+  old.requirements.max_activities = 1;
+  h.adoptTrip(old);
+  assert.equal(h.S.draft.max_attractions,1);
+  assert.equal(Object.hasOwn(h.S.draft,'max_activities'),false);
+  assert.equal(h.S.trip.requirements.max_activities,1);
+  assert.equal(h.dirty(),false);
+  h.changeDraft('max_sightseeing_minutes',180);
+  assert.equal(h.dirty(),true);
+  const modern = copy(old);
+  modern.requirements.max_attractions = null;
+  h.adoptTrip(modern);
+  assert.equal(h.S.draft.max_attractions,null);
+  assert.equal(h.dirty(),false);
+});
+
+test('displayed pacing statistics belong to the saved candidate, including incomplete drafts', () => {
+  const h = harness();
+  h.S.candidate.daily_metrics = [{day:1,attraction_count:1,sightseeing_minutes:180,
+    available_minutes:720,sightseeing_ratio:25,transport_minutes:30,
+    limits:{max_attractions:1,max_sightseeing_minutes:180,max_sightseeing_ratio:25,max_transport_minutes:30}}];
+  h.changeDraft('max_attractions',5);
+  h.changeDraft('end_time','23:00');
+  let html = h.itinerary();
+  assert.match(html,/1个 \/ 1个/);
+  assert.match(html,/180分钟 \/ 180分钟/);
+  assert.match(html,/25% \/ 25%/);
+  assert.match(html,/窗口 720 分钟/);
+  h.S.candidate.outcome='incomplete';
+  h.S.candidate.status='conflict';
+  h.S.candidate.daily_metrics[0].transport_minutes=null;
+  html=h.itinerary();
+  assert.match(html,/第 1 天 · 草稿/);
+  assert.match(html,/未核实 \/ 30分钟/);
+  assert.equal(h.canAccept(),false);
 });

@@ -25,6 +25,7 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 from .domain import Itinerary, Requirements, Stop, clock, minutes
 from .evidence import load_evidence
 from .maps import MapClient, MapError, distance
+from .pacing import daily_metrics, pacing_issues
 from .planning_contracts import (
     PlanningInformationRequest,
     TimeWindow,
@@ -214,6 +215,7 @@ def costs(req: Requirements, itinerary: Itinerary) -> dict:
 
 async def validate(req: Requirements, output: Itinerary, data: dict, maps: MapClient) -> list[dict]:
     errors = []
+    travel_by_day: dict[int, int | None] = {}
 
     def fail(code, message, **details):
         errors.append({"category": "draft_error", "code": code, "message": message, **details})
@@ -267,12 +269,11 @@ async def validate(req: Requirements, output: Itinerary, data: dict, maps: MapCl
             or day_stops[-1].place_id != output.hotel_id
         ):
             fail("hotel_return", f"第{day}天最后一站必须返回所选酒店，类型须为 hotel", day=day)
-        n = sum(s.kind in ("activity", "booking") for s in day_stops)
-        if not 1 <= n <= req.max_activities:
-            fail("activities", f"第{day}天安排了{n}项活动，需要1至{req.max_activities}项", day=day)
+        travel_by_day[day] = 0
         for stop_number, stop in enumerate(day_stops, start=1):
             target = maps.places.get(stop.place_id)
             if not target:
+                travel_by_day[day] = None
                 fail("identity", "模型使用了未经查询的地点", day=day, stop_number=stop_number)
                 continue
             if stop.kind == "hotel" and stop.place_id != output.hotel_id:
@@ -289,6 +290,8 @@ async def validate(req: Requirements, output: Itinerary, data: dict, maps: MapCl
                 )
             leg = await maps.route(previous, target, req.city, req.transport)
             travel_minutes = leg["duration_minutes"]
+            if travel_by_day[day] is not None:
+                travel_by_day[day] += travel_minutes
             earliest = end + travel_minutes
             if minutes(stop.start_time) < earliest:
                 day_offset, minute_of_day = divmod(earliest, 24 * 60)
@@ -328,6 +331,9 @@ async def validate(req: Requirements, output: Itinerary, data: dict, maps: MapCl
             if stop.kind in ("activity", "booking"):
                 visits.setdefault(stop.place_id, []).append((stop, stop_number))
             previous, end = target, minutes(stop.end_time)
+    errors.extend(
+        pacing_issues(daily_metrics(req, output, data.get("experience_groups", []), travel_by_day))
+    )
     group_by_id = {
         member: group["group_id"]
         for group in data.get("experience_groups", [])
@@ -337,6 +343,15 @@ async def validate(req: Requirements, output: Itinerary, data: dict, maps: MapCl
     for place_id, occurrences in visits.items():
         grouped_visits.setdefault(group_by_id.get(place_id, place_id), []).extend(occurrences)
     for group_id, occurrences in grouped_visits.items():
+        # A real visit may resume after lunch on the same day. Count one place,
+        # retain both time segments, and still check each connection/window.
+        # Different POI aliases and repeated visits on other days remain checked.
+        representatives = {}
+        for stop, number in occurrences:
+            key = (stop.day, stop.place_id)
+            if key not in representatives or is_fixed_booking(stop):
+                representatives[key] = (stop, number)
+        occurrences = list(representatives.values())
         # Distinct user-confirmed appointments may legitimately repeat a venue.
         fixed = [occurrence for occurrence in occurrences if is_fixed_booking(occurrence[0])]
         if fixed:
@@ -477,7 +492,8 @@ async def schedule_day(req, data, maps, day, stops, used):
                     f"预计停留{duration}分钟，预留10分钟找入口与缓冲；开放与门票需确认。",
                 )
 
-    await fill(min(12 * 60, end_limit), min(2, req.max_activities - bool(fixed)))
+    cap = req.max_attractions if req.max_attractions is not None else 20
+    await fill(min(12 * 60, end_limit), min(2, cap - bool(fixed)))
 
     async def add_lunch(before_booking: bool) -> bool:
         lunch = max(now, 12 * 60)
@@ -517,7 +533,7 @@ async def schedule_day(req, data, maps, day, stops, used):
         )
         if not lunch_added:
             await add_lunch(before_booking=False)
-    await fill(min(18 * 60, end_limit), req.max_activities)
+    await fill(min(18 * 60, end_limit), cap)
     dinner = max(now, 18 * 60)
     if dinner + 70 <= end_limit:
         restaurants = await maps.nearby(previous)
@@ -1124,10 +1140,23 @@ async def run_plan(
                                 "首次生成输出完整Itinerary，收到revision_days时仅提交需要修订日期的完整站点。"
                                 "仅使用本次查询或原方案已核实的地点ID。"
                                 "每一站都必须填写day，取值从1到旅行总天数。"
-                                "\n按day分别安排活动，每天的activity与booking合计至少1项、"
-                                "最多为本次用户需求的max_activities。meal与hotel不计入活动数。"
-                                "固定预约占当天1项。例如当天上限为2项且有1项固定预约，"
-                                "当天最多再排1个activity。同一景点不重复。"
+                                "\n按day分别核对四项用户节奏上限，null表示不限制，0表示上限为0。"
+                                "max_attractions为每日不同景点/体验地点数，不是站点数；"
+                                "activity与booking都计入，同一地点当天分段参观只计一个景点，"
+                                "已知experience_groups中同一游玩内容的不同ID也只计一个，"
+                                "但不要用不同ID重复推荐同一内容，也不要跨天重复，用户固定预约例外。"
+                                "同一景点当天上午、下午、晚上参观可保留多个真实时段，景点数仍为1，不能隐去午餐或休息来凑数。"
+                                "max_sightseeing_minutes为每日activity与booking的实际参观/体验时长分钟累计上限，"
+                                "每段end_time减start_time，同地点多段的时间均须累计。"
+                                "max_sightseeing_ratio是0至100的百分比上限，"
+                                "分母固定为requirements.end_time减requirements.start_time的分钟数，"
+                                "分子是上述实际游玩分钟，不能靠增加留白或提前结束改变分母。"
+                                "游玩时长与占比同时填写时都必须满足。meal、hotel、纯休息和交通不计游玩时长或景点数。"
+                                "max_transport_minutes是每天全部route.duration_minutes之和上限，"
+                                "包括起点到第一站、所有中间段及过夜当天回酒店的路段，额外缓冲和休息不计入该数字。"
+                                "交通缓冲仍必须另外预留，所有路段照常核对能否赶到。"
+                                "每日没有统一至少一个景点的程序下限，但不能遗漏用户必去和固定预约。"
+                                "出发、离开酒店、纯赶路只是上下文，不要虚构为activity站点。"
                                 "\n如果booking存在，必须按用户指定的booking_day、booking_start和booking_end"
                                 "保留该预约，使用booking.id作为place_id，kind设为booking。不要新增预约。"
                                 "must_visit中的每个地点必须作为activity或booking安排，"
@@ -1156,14 +1185,14 @@ async def run_plan(
                                 "根据交通方式、换乘、找入口和用户节奏调整缓冲，固定预约前优先留足。"
                                 "reason中的时刻、耗时和缓冲必须与结构化字段一致，不确定的数字省略。"
                                 "每站end_time必须晚于该站start_time，且不得晚于requirements.end_time。"
-                                "交通赶不上或当天活动超限时，结合用户偏好调整灵活站点的时段、顺序或取舍，"
+                                "交通赶不上或当天任一节奏上限超出时，结合用户偏好调整灵活站点的时段、顺序或取舍，"
                                 "优先保住固定预约和必去景点，并遵守本轮可修订的日期范围。"
-                                "提交首次方案或修订前，逐天核对活动数量、预约与交通衔接。"
+                                "提交首次方案或修订前，逐天核对景点数、游玩分钟、固定分母占比、交通总分钟、预约与衔接。"
                                 "\n当前站点类型只有activity、booking、meal、hotel。"
                                 "纯午休、自由时间用站点之间的留白表示，在summary或相关站点reason中说明起止时刻，"
                                 "并与交通衔接核对，不能把同一段时间同时算作休息和赶路。"
                                 "不要将纯休息列为activity或booking，也不要虚构rest类型，"
-                                "纯休息不占正式活动名额，实际游玩项目仍按activity计数。"
+                                "纯休息不计景点数和游玩时间，实际游玩仍须标为activity，不能标作meal或hotel逃避上限。"
                                 "\n行程跨午餐、晚餐时段或用户要求用餐时，预留合理用餐时间。"
                                 "需要餐厅时调用nearby_restaurants查询，午餐、晚餐优先选择有正餐依据的餐厅。"
                                 "不能仅凭餐饮类POI就认定茶饮、甜品或咖啡店可提供完整正餐。"
@@ -1314,6 +1343,24 @@ async def run_plan(
                     if leg:
                         routes.append({**leg, "day": day, "stop_index": stop_index})
                     previous = maps.places[stop.place_id]
+        measured = result or progress.get("candidate")
+        metrics = []
+        if measured and data.get("origin"):
+            travel = {}
+            for day in range(1, req.days + 1):
+                previous_id = data["origin"]["id"]
+                if 2 <= day <= req.hotel_nights + 1:
+                    previous_id = measured.hotel_id
+                duration, complete = 0, True
+                for stop in (s for s in measured.stops if s.day == day):
+                    leg = maps.cache.get((previous_id, stop.place_id, req.transport))
+                    if leg is None:
+                        complete = False
+                    else:
+                        duration += leg["duration_minutes"]
+                    previous_id = stop.place_id
+                travel[day] = duration if complete else None
+            metrics = daily_metrics(req, measured, data.get("experience_groups", []), travel)
         hotel = next((h for h in data["hotels"] if result and h["id"] == result.hotel_id), None)
         return {
             "status": "ready" if result and not issues and not error else "conflict",
@@ -1336,6 +1383,7 @@ async def run_plan(
             "places": list(maps.places.values()),
             "must_visit_ids": [place["id"] for place in data.get("must_visit", [])],
             "routes": routes,
+            "daily_metrics": metrics,
             "costs": costs(req, result) if result else None,
             "issues": issues,
             "trace": trace,
