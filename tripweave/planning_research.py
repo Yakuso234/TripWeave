@@ -198,6 +198,8 @@ async def research_missing_information(
             queried_at = datetime.now(UTC).isoformat()
             sources = []
             error = None
+            billable = None
+            http_status = None
             trace.append({"event": "research_search_attempt", "place_id": place_id, "day": day})
             try:
                 response = await client.post(
@@ -205,12 +207,16 @@ async def research_missing_information(
                     headers=headers,
                     json={"query": query[:128], "count": 3, "need_content": False},
                 )
+                http_status = response.status_code
+                if http_status != 200:
+                    billable = False
                 response.raise_for_status()
                 payload = response.json()
                 raw = payload.get("results") if isinstance(payload, dict) else None
                 if not isinstance(raw, list):
                     error = "search_response_format"
                 else:
+                    billable = bool(raw) if http_status == 200 else False
                     sources = read_sources(raw)
                     if raw and not sources:
                         error = "search_sources_format"
@@ -233,6 +239,8 @@ async def research_missing_information(
             trace.append(
                 {
                     "event": "research_search",
+                    "billable": billable,
+                    "http_status": http_status,
                     "detail": "定向网页检索异常。"
                     if error
                     else "定向网页资料已返回；不代表已核实营业或预约。",
@@ -270,7 +278,7 @@ async def research_missing_information(
                 usage=usage,
                 usage_limits=UsageLimits(request_limit=settings.max_requests),
                 model_settings={
-                    "max_tokens": 4000,
+                    "max_tokens": settings.research_max_tokens,
                     "openai_reasoning_effort": settings.research_effort,
                     "extra_body": {"thinking": {"type": "enabled"}},
                 },

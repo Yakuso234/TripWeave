@@ -22,9 +22,11 @@ from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import RunUsage, UsageLimits
 
+from .api_cost import estimate_cost
 from .domain import Itinerary, Requirements, Stop, clock, minutes
 from .evidence import load_evidence
 from .maps import MapClient, MapError, distance
+from .model_usage import ModelUsageRecorder
 from .pacing import daily_metrics, pacing_issues
 from .planning_contracts import (
     PlanningInformationRequest,
@@ -912,7 +914,7 @@ async def run_planning_graph(
                 usage=usage,
                 usage_limits=UsageLimits(request_limit=settings.max_requests),
                 model_settings={
-                    "max_tokens": 6000,
+                    "max_tokens": settings.planner_max_tokens,
                     "openai_reasoning_effort": settings.planner_effort,
                     "extra_body": {"thinking": {"type": "enabled"}},
                 },
@@ -1065,6 +1067,7 @@ async def run_plan(
     trace, issues, result, error = [], [], None, None
     outcome, progress = "incomplete", {}
     model_usage = RunUsage()
+    recorder = ModelUsageRecorder()
     data = {"hotel": None, "hotels": []}
     research_context = load_evidence(
         research_context,
@@ -1109,6 +1112,10 @@ async def run_plan(
                             timeout=settings.run_timeout,
                             transport=transport,
                             follow_redirects=False,
+                            event_hooks={
+                                "request": [recorder.request],
+                                "response": [recorder.response],
+                            },
                         ),
                         max_retries=0,
                     ) as sdk:
@@ -1276,16 +1283,17 @@ async def run_plan(
                                 return place
 
                         async def research(needs):
-                            return await research_missing_information(
-                                model,
-                                needs,
-                                req,
-                                maps.places,
-                                settings,
-                                model_usage,
-                                trace,
-                                transport=transport,
-                            )
+                            with recorder.role("research"):
+                                return await research_missing_information(
+                                    model,
+                                    needs,
+                                    req,
+                                    maps.places,
+                                    settings,
+                                    model_usage,
+                                    trace,
+                                    transport=transport,
+                                )
 
                         state = await run_planning_graph(
                             agent,
@@ -1362,6 +1370,17 @@ async def run_plan(
                 travel[day] = duration if complete else None
             metrics = daily_metrics(req, measured, data.get("experience_groups", []), travel)
         hotel = next((h for h in data["hotels"] if result and h["id"] == result.hotel_id), None)
+        observation = recorder.snapshot(settings)
+        search_audits = [
+            event.get("billable") for event in trace if event["event"] == "research_search"
+        ]
+        search_attempts = sum(event["event"] == "research_search_attempt" for event in trace)
+        api_cost = estimate_cost(
+            observation["model_calls"],
+            search_audits + [None] * max(0, search_attempts - len(search_audits)),
+            official=settings.base_url.rstrip("/")
+            in ("https://api.deepseek.com", "https://api.deepseek.com/v1"),
+        )
         return {
             "status": "ready" if result and not issues and not error else "conflict",
             "outcome": outcome,
@@ -1394,6 +1413,8 @@ async def run_plan(
             }
             if model_usage.requests
             else None,
+            "usage_observation": observation,
+            "api_cost_estimate": api_cost,
             "error": error,
             "model": settings.model if mode == "deepseek" else "基于真实地图的约束排程",
             "thinking_configuration": {

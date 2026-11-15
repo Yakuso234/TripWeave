@@ -114,6 +114,12 @@ async def test_planner_tool_and_local_repair_replay_all_thinking_fields():
     )
     assert result["outcome"] == "ready", result
     assert len(calls) == 3 and result["usage"]["requests"] == 3
+    assert result["usage_observation"]["model_http_attempts"] == 3
+    assert [row["role"] for row in result["usage_observation"]["model_calls"]] == [
+        "planner",
+        "planner",
+        "planner",
+    ]
     assert "PRIVATE-THINKING" not in json.dumps(result)
 
 

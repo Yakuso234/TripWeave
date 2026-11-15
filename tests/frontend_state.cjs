@@ -621,3 +621,84 @@ test('displayed pacing statistics belong to the saved candidate, including incom
   assert.match(html,/未核实 \/ 30分钟/);
   assert.equal(h.canAccept(),false);
 });
+
+test('historical token totals display without inventing per-call records or current budgets', () => {
+  const h=harness();
+  h.S.config.planning_budget={max_model_requests:10};
+  h.S.candidate.usage={requests:3,input_tokens:13228,output_tokens:3965};
+  h.S.candidate.outcome='needs_information';
+  h.S.candidate.status='conflict';
+  const html=h.itinerary();
+  assert.match(html,/模型用量与预算/);
+  for(const total of ['13,228','3,965','17,193']) assert.ok(html.includes(total));
+  assert.match(html,/历史记录未保存预算与逐次明细/);
+  assert.doesNotMatch(html,/aria-label="模型请求"|查看每次调用明细/);
+  assert.match(html,/不包含之前的选景推荐/);
+});
+
+function observedCalls(h) {
+  h.S.candidate.usage={requests:2,input_tokens:1000,output_tokens:100};
+  h.S.candidate.usage_observation={model_http_attempts:2,elapsed_seconds:12,usage_complete:true,
+    budget:{max_model_requests:6,run_timeout_seconds:90,planner_max_output_tokens:6000,research_max_output_tokens:4000,input_token_limit:null},
+    model_calls:[{number:1,role:'planner',status:'response',input_tokens:600,output_tokens:60,
+      reasoning_tokens:30,cache_read_tokens:200,elapsed_ms:5000,max_output_tokens:6000,finish_reason:'tool_calls'},
+      {number:2,role:'research',status:'response',input_tokens:400,output_tokens:40,
+      reasoning_tokens:20,cache_read_tokens:0,elapsed_ms:4000,max_output_tokens:4000,finish_reason:'length'}]};
+}
+
+test('budget and call table show original snapshot and subset counts without double-counting', () => {
+  const h=harness();observedCalls(h);
+  h.S.config.planning_budget={max_model_requests:10,planner_max_output_tokens:9999};
+  const html=h.itinerary();
+  assert.match(html,/1,100/);
+  assert.doesNotMatch(html,/1,350|9,999/);
+  assert.match(html,/progress max="6" value="2"/);
+  assert.match(html,/progress max="90" value="12"/);
+  assert.match(html,/1 · 排程/);
+  assert.match(html,/2 · 研究/);
+  assert.match(html,/输出可能被截断/);
+  assert.match(html,/输入 未设硬上限/);
+});
+
+test('missing response usage is unknown while confirmed zero and no-call preflight stay distinct', () => {
+  const h=harness();observedCalls(h);
+  h.S.candidate.usage_observation.usage_complete=false;
+  for(const call of h.S.candidate.usage_observation.model_calls) {
+    call.input_tokens=null;call.output_tokens=null;call.reasoning_tokens=null;call.cache_read_tokens=null;
+  }
+  let html=h.itinerary();
+  assert.match(html,/输入 tokens（已记录）<\/span><strong>未记录/);
+  assert.match(html,/未返回/);
+  assert.match(html,/总量可能不完整/);
+  h.S.candidate.usage_observation.model_calls[0].input_tokens=0;
+  html=h.itinerary();
+  assert.match(html,/输入 tokens（已记录）<\/span><strong>0/);
+  h.S.candidate.usage=null;
+  h.S.candidate.usage_observation={...h.S.candidate.usage_observation,model_http_attempts:0,model_calls:[],usage_complete:true};
+  html=h.itinerary();
+  assert.match(html,/模型请求<\/span><strong>0/);
+  assert.match(html,/合计 tokens<\/span><strong>0/);
+  delete h.S.candidate.usage_observation;
+  html=h.itinerary();
+  assert.match(html,/合计 tokens<\/span><strong>未记录/);
+});
+
+test('fee panel separates conditional legacy ranges, saved estimates and unknown amounts', () => {
+  const h=harness();
+  const part={status:'estimated',min_cny:'0.00100800',max_cny:'0.00100800'};
+  h.S.candidate.api_cost_preview={basis:'current_tariff_legacy_assumption',models:part,
+    search:{status:'range',min_cny:'0.00000000',max_cny:'0.00500000'},
+    subtotal:{status:'range',min_cny:'0.00100800',max_cny:'0.00600800'},
+    tariff:{version:'test-price',verified_date:'2026-11-15'}};
+  let html=h.itinerary();
+  assert.match(html,/API 费用估算 · 人民币/);
+  assert.match(html,/并非历史扣费/);
+  assert.match(html,/¥0.001008 – ¥0.006008/);
+  assert.match(html,/不含地图服务/);
+  h.S.candidate.api_cost_estimate={...h.S.candidate.api_cost_preview,basis:'recorded_run',
+    subtotal:{status:'unavailable'}};
+  html=h.itinerary();
+  assert.doesNotMatch(html,/并非历史扣费/);
+  assert.match(html,/模型＋搜索小计<\/span><strong>暂不可算/);
+  assert.match(html,/思考已包含在输出中，不再加一次/);
+});

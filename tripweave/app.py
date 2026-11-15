@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, SecretStr, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
+from .api_cost import candidate_cost_view
 from .attraction_picker import (
     PICKER_VERSION,
     AttractionRankingError,
@@ -24,6 +25,7 @@ from .domain import Requirements, TravelPreferences
 from .evidence import load_evidence
 from .identity import WORKSPACE_ID
 from .maps import MapClient, MapError
+from .model_usage import planning_budget
 from .real_planner import map_configured, prepare, run_plan
 from .settings import Settings
 from .storage import Store, StoreError
@@ -105,6 +107,7 @@ def create_app(database: str | None = None) -> FastAPI:
             if map_configured(settings)
             else [],
             "model": settings.model,
+            "planning_budget": planning_budget(settings),
             "thinking_configuration": {
                 "planner": {"enabled": True, "effort": settings.planner_effort},
                 "research": {"enabled": True, "effort": settings.research_effort},
@@ -349,11 +352,15 @@ def create_app(database: str | None = None) -> FastAPI:
 
     @app.get("/api/trips/{trip_id}")
     def get(trip_id: str):
-        return store.get_trip(trip_id)
+        trip = store.get_trip(trip_id)
+        if trip.get("accepted_plan"):
+            trip = {**trip, "accepted_plan": candidate_cost_view(trip["accepted_plan"])}
+        return trip
 
     @app.get("/api/trips/{trip_id}/history")
     def history(trip_id: str):
-        return store.history(trip_id)
+        history = store.history(trip_id)
+        return {**history, "candidates": [candidate_cost_view(p) for p in history["candidates"]]}
 
     class Revision(Requirements):
         expected_revision: int

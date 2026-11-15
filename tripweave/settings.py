@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     )
     run_timeout: int = Field(default=90, ge=5, le=180, validation_alias="TRIPWEAVE_RUN_TIMEOUT")
     max_requests: int = Field(default=6, ge=2, le=10, validation_alias="TRIPWEAVE_MAX_REQUESTS")
+    planner_max_tokens: int = Field(
+        default=6000, ge=1, le=393216, validation_alias="TRIPWEAVE_PLANNER_MAX_TOKENS"
+    )
+    research_max_tokens: int = Field(
+        default=4000, ge=1, le=393216, validation_alias="TRIPWEAVE_RESEARCH_MAX_TOKENS"
+    )
     database: str = Field(
         default=".runtime/tripweave.sqlite3", validation_alias="TRIPWEAVE_DATABASE"
     )

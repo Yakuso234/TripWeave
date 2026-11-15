@@ -353,8 +353,13 @@ async def test_empty_search_and_provider_failures_have_distinct_outcomes(kind):
             return completion([("search_place_information", {"place_id": "p0", "day": 1})])
         return final(body, [])
 
-    result, _, _ = await run_research(provider)
+    result, _, trace = await run_research(provider)
     assert result["outcome"] == ("needs_information" if kind == "empty" else "service_error")
+    search = next(event for event in trace if event["event"] == "research_search")
+    assert (
+        search["billable"]
+        is {"empty": False, "http": False, "format": None, "bad_sources": True}[kind]
+    )
     assert result["search_calls"] == 1
     assert result["facts"][0]["status"] == "unknown"
     assert "SENSITIVE-PROVIDER-BODY" not in json.dumps(result)
