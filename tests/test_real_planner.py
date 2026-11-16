@@ -47,8 +47,13 @@ def handler(request):
 
 
 def configured():
+    # Keep constrained regression fixtures at six rounds; /api/config tests the new default.
     return Settings(
-        _env_file=None, api_key="test-key-not-real", amap_api_key="test-map-key", run_timeout=30
+        _env_file=None,
+        api_key="test-key-not-real",
+        amap_api_key="test-map-key",
+        run_timeout=30,
+        max_requests=6,
     )
 
 

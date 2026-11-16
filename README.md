@@ -35,7 +35,7 @@ uv --cache-dir .runtime/uv-cache sync --locked
 | `TRIPWEAVE_PLANNER_EFFORT` / `TRIPWEAVE_RESEARCH_EFFORT` / `TRIPWEAVE_REVIEWER_EFFORT` | 三角色均开启思考，默认排程 `max`、研究 `high`、校验 `max`；可选 `low/high/max` |
 | `TRIPWEAVE_DATABASE` | 默认 `.runtime/tripweave.sqlite3`，本地无需额外数据库服务 |
 | `DATABASE_URL` | 可选 PostgreSQL 连接串，优先于本地路径；详见部署说明 |
-| `TRIPWEAVE_MAX_REQUESTS` / `TRIPWEAVE_RUN_TIMEOUT` | 默认 6 次模型请求 / 整次规划 90 秒 |
+| `TRIPWEAVE_MAX_REQUESTS` / `TRIPWEAVE_RUN_TIMEOUT` | 默认 8 轮模型调用 / 整次规划 180 秒 |
 | `TRIPWEAVE_PLANNER_MAX_TOKENS` / `TRIPWEAVE_RESEARCH_MAX_TOKENS` / `TRIPWEAVE_REVIEWER_MAX_TOKENS` | 单次输出上限默认6000 / 4000 / 6000；共用上述请求数与时限 |
 
 页面设置中的“已配置”只代表存在 Key，不代表权限、额度或连通性已验证。修改 API 配置后刷新页面配置状态；修改数据库连接后重启服务。
@@ -87,7 +87,7 @@ uv --cache-dir .runtime/uv-cache sync --locked
 
 校招版目标与开源参考见 [Agent 架构与技术栈](docs/AGENT_ARCHITECTURE.md)。历史选型依据见 [Agent 运行时](docs/adr/ADR-001-prototype-stack.md)、[真实接口与数据库](docs/adr/ADR-002-real-planning-storage.md)。[后续部署要求](docs/DEPLOYMENT.md)。
 
-当前代码的带备注说明见[核心链路](docs/CORE_FLOW.md)：选景函数流水线、可信交接、排程/按需研究/校验三个Agent、分类结果与SQLite记录。单次规划三角色共享原6次模型请求/90秒/最多检查3份草稿；定向研究仅进入一个阶段，含最多一次恢复、合计最多5次搜索，校验协商最多一轮；初始选景请求不包含在这个跨角色预算内。预算耗尽时保留未完成结果，不把未复核方案当可接受。尚无图checkpoint或任意步骤续跑，失败记录持久化不等于自动恢复。质量/成本评估工具暂缓接入。
+当前代码的带备注说明见[核心链路](docs/CORE_FLOW.md)：选景函数流水线、可信交接、排程/按需研究/校验三个Agent、分类结果与SQLite记录。单次规划三角色共享8轮模型调用/180秒/最多检查3份草稿；定向研究仅进入一个阶段，含最多一次恢复、合计最多5次搜索，校验协商最多一轮；初始选景请求不包含在这个跨角色预算内。预算耗尽时保留未完成结果，不把未复核方案当可接受。尚无图checkpoint或任意步骤续跑，失败记录持久化不等于自动恢复。质量/成本评估工具暂缓接入。
 
 每日节奏改用四个独立上限：景点数量、累计游玩分钟、游玩占每日出发至结束固定窗口的百分比、累计地图交通分钟。偏好页和长期偏好均可自定义或清空；同景点当天多段计1个景点，时间全部累计。结果展示实际/上限，超限由模型局部修订，程序不自动搬动景点。详细合同见[当前提示词与指标](docs/PROMPTS_CURRENT.md)。
 
@@ -126,7 +126,10 @@ Get-Content tests/frontend_state.cjs -Raw | node
 
 排程、按需事实研究和独立校验均使用同一deepseek-flash配置，默认思考强度分别max/high/max。配置与候选的thinking_configuration可查实际设置；SDK工具调用历史按reasoning_content字段回传，不把原始思考内容放入候选或公开轨迹。角色间只传结构化结果与必要上下文。该配置针对官方DeepSeek，其他兼容服务需另行核对。
 
-请求上限6次、整轮90秒及排程6000/研究4000输出token上限保留，校验每次6000；强度不代表无限计算，协商会占用原本的修订和研究额度。效果与产出一份可用方案的实际费用尚未对照比较。本单元只使用离线HTTP模拟，不新增真实调用；最终检查结果见[验证记录](docs/evaluations/V02_QA.md)。官方参数依据见[思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)。
+模型轮次上限8轮、整轮180秒及排程6000/研究4000输出token上限保留，校验每次6000；强度不代表无限计算，协商会占用原本的修订和研究额度。效果与产出一份可用方案的实际费用尚未对照比较。本单元只使用离线HTTP模拟，不新增真实调用；最终检查结果见[验证记录](docs/evaluations/V02_QA.md)。官方参数依据见[思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)。
 
 
 当前资料不足的逐字段诊断、宽容引用匹配、一次按因恢复与排程回流，以[资料核检与恢复](docs/RESEARCH_RECOVERY.md)为准；旧真实测试结论不作为新版效果证据。
+
+
+2026-11-16经用户确认：默认实验预算调整为180秒、8轮，思考强度和单次输出上限不变。轮次按SDK已进入历史的模型响应计数，工具执行本身不占模型轮次；读取工具结果继续推理会产生下一轮。HTTP尝试另行记录，不能把轮次限额当绝对费用上限。旧候选保留当时6轮/90秒快照。
