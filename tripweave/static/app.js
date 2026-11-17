@@ -470,7 +470,7 @@ function transferSummary(stop) {
   const t=stop.transfer;
   if(!t)return '';
   const rests=(items,label)=>(items || []).map(r=>`<span>${label} ${esc(r.start_time)}–${esc(r.end_time)}</span>`).join(' · ');
-  return `<div class="leg">结构化衔接：${esc(t.departure_time)} 出发 → ${esc(t.arrival_time)} 到达 · 另留缓冲 ${esc(t.buffer_minutes ?? 0)} 分钟${t.rest_before?.length?'<br>'+rests(t.rest_before,'出发前休息'):''}${t.rest_after?.length?'<br>'+rests(t.rest_after,'到达后休息'):''}</div>`;
+  return `<div class="leg">结构化衔接：${esc(t.departure_time)} 出发 → ${esc(t.arrival_time)} 到达 · 建议缓冲 ${esc(t.buffer_minutes ?? 0)} 分钟${t.rest_before?.length?'<br>'+rests(t.rest_before,'出发前休息'):''}${t.rest_after?.length?'<br>'+rests(t.rest_after,'到达后休息'):''}</div>`;
 }
 function savedDraftDetails(draft, places, title='查看未核实草稿') {
   if (!draft?.stops?.length) return '<p class="muted small">尚未保存行程草稿。</p>';
@@ -517,8 +517,9 @@ function planningRunsPanel() {
     : ''}</section>`;
 }
 function preferenceDeviationPanel(plan) {
-  if (!plan.preference_deviations?.length) return '';
-  return `<section class="card preference-deviations"><h3>与期望目标的差异</h3><p class="muted small">以下是需要了解的取舍，不等同于硬性冲突。请结合方案摘要中的安排理由判断是否接受。</p><ul>${plan.preference_deviations.map(item=>`<li>${esc(item.message)}</li>`).join('')}</ul></section>`;
+  const notices=[...(plan.preference_deviations || []),...(plan.buffer_advisories || [])];
+  if (!notices.length) return '';
+  return `<section class="card preference-deviations"><h3>与期望目标的差异</h3><p class="muted small">以下是需要了解的取舍，不等同于硬性冲突。请结合方案摘要中的安排理由判断是否接受。</p><ul>${notices.map(item=>`<li>${esc(item.message)}</li>`).join('')}</ul></section>`;
 }
 function pacingSummary(plan) {
   if (!plan.daily_metrics?.length) return '<p class="muted small">此记录未保存每日节奏统计。</p>';

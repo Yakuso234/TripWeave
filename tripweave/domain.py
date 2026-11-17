@@ -167,8 +167,7 @@ class TransferTiming(BaseModel):
     buffer_minutes: int = Field(
         default=0,
         ge=0,
-        le=180,
-        description="额外交通缓冲分钟，不含地图路程或休息；预留在到达及休息后至本站开始前",
+        description="模型建议额外缓冲，不含路程或休息；仅供参考，不作硬性最短或最长限制",
     )
 
 

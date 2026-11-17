@@ -45,8 +45,8 @@ async def test_large_gap_cannot_hide_late_departure_after_rest():
     error = next(i for i in errors if i["code"] == "connection")
     assert (error["day"], error["stop_number"]) == (1, 2)
     assert error["departure_time"] == "17:40" and error["travel_minutes"] == 36
-    assert error["buffer_minutes"] == 10 and error["earliest_start_time"] == "18:26"
-    assert error["shortfall_minutes"] == 26
+    assert error["buffer_minutes"] == 10 and error["earliest_start_time"] == "18:16"
+    assert error["shortfall_minutes"] == 16
 
 
 async def test_declared_travel_end_cannot_understate_map_duration():
@@ -82,10 +82,10 @@ async def test_destination_rest_cannot_overlap_travel_or_activity(rests):
     assert any(i["code"] == "rest_timing" for i in errors)
 
 
-async def test_destination_rest_and_buffer_are_separate_time():
+async def test_destination_rest_remains_hard_but_suggested_buffer_does_not_block():
     t = timing(rest_after=[{"start_time": "18:16", "end_time": "18:25"}])
     errors = await issues(plan(t, next_start="18:30"))
-    assert next(i for i in errors if i["code"] == "connection")["earliest_start_time"] == "18:35"
+    assert errors == []
     assert await issues(plan(t, next_start="18:40")) == []
 
 
@@ -220,3 +220,75 @@ async def test_real_graph_returns_precise_transfer_error_for_model_revision():
     error = next(i for i in feedback if i["code"] == "connection")
     assert error["departure_time"] == "09:58" and error["earliest_start_time"] == "10:03"
     assert result["timing_coverage"] == {"stop_count": 1, "explicit_count": 1}
+
+
+@pytest.mark.parametrize(
+    "start,expected_margin", [("18:16", 0), ("18:19", 3), ("18:21", None), ("18:22", None)]
+)
+async def test_less_than_five_minutes_is_only_an_advisory(start, expected_margin):
+    from tripweave.real_planner import buffer_advisories
+
+    maps = Routes()
+    maps.cache = {("p", "q", "mixed"): {"duration_minutes": 36}}
+    output = plan(timing(buffer_minutes=60), next_start=start)
+    assert await validate(req(), output, data(maps), maps) == []
+    warnings = buffer_advisories(req(), output, data(maps), maps)
+    if expected_margin is None:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1 and warnings[0]["severity"] == "warning"
+        assert warnings[0]["actual_minutes"] == expected_margin
+
+
+async def test_actual_rest_is_deducted_from_advisory_margin_and_short_route_still_fails():
+    from tripweave.real_planner import buffer_advisories
+
+    maps = Routes()
+    maps.cache = {("p", "q", "mixed"): {"duration_minutes": 36}}
+    output = plan(
+        timing(rest_after=[{"start_time": "18:16", "end_time": "18:25"}]), next_start="18:27"
+    )
+    assert await issues(output) == []
+    warnings = buffer_advisories(req(), output, data(maps), maps)
+    assert warnings[0]["actual_minutes"] == 2
+    short = plan(timing(), next_start="18:10")
+    assert any(i["code"] == "connection" for i in await issues(short))
+    assert buffer_advisories(req(), short, data(maps), maps) == []
+
+
+async def test_low_buffer_never_starts_extra_planner_repair():
+    import json
+
+    import httpx2
+    from draft_helpers import packet, reply, route_queries
+    from test_planning_workflow import itinerary, map_response, requirements, tool_names
+    from test_real_planner import configured
+
+    from tripweave.real_planner import run_plan
+
+    calls = []
+
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            return map_response(request)
+        body = json.loads(request.content)
+        calls.append(body)
+        if tool_names(body) == {"review_report"}:
+            return reply("review_report", {"summary": "合成通过", "suggestions": []})
+        current = itinerary()
+        current["stops"][0]["transfer"] = {
+            "departure_time": "09:55",
+            "arrival_time": "10:00",
+            "buffer_minutes": 60,
+        }
+        return reply("draft_proposal", packet(current, queries=route_queries(current)))
+
+    result = await run_plan(
+        requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
+    )
+    assert result["outcome"] == "ready" and result["issues"] == [] and len(calls) == 3
+    assert result["buffer_advisories"][0]["actual_minutes"] == 0
+
+
+def test_suggested_buffer_has_no_business_upper_cap():
+    assert timing(buffer_minutes=300).buffer_minutes == 300

@@ -225,6 +225,52 @@ def costs(req: Requirements, itinerary: Itinerary) -> dict:
     }
 
 
+def buffer_advisories(req, output, data, maps):
+    """Cached evidence only. Low spare time never blocks or starts model repair."""
+    warnings = []
+    for day in range(1, req.days + 1):
+        previous = output.hotel_id if 2 <= day <= req.hotel_nights + 1 else data["origin"]["id"]
+        previous_end = None
+        for number, stop in enumerate((s for s in output.stops if s.day == day), 1):
+            timing = stop.transfer
+            leg = cached_route(maps.cache, previous, stop.place_id, req.transport)
+            if timing and leg is not None and previous != stop.place_id:
+                departure, arrival = minutes(timing.departure_time), minutes(timing.arrival_time)
+                rests = sorted(
+                    (minutes(r.start_time), minutes(r.end_time)) for r in timing.rest_after
+                )
+                valid = arrival >= departure + leg["duration_minutes"] and arrival <= minutes(
+                    stop.start_time
+                )
+                end = arrival
+                for start, finish in rests:
+                    valid = valid and start >= end and finish <= minutes(stop.start_time)
+                    end = max(end, finish)
+                valid = valid and (previous_end is None or departure >= previous_end)
+                margin = (
+                    minutes(stop.start_time)
+                    - departure
+                    - leg["duration_minutes"]
+                    - sum(b - a for a, b in rests)
+                )
+                if valid and 0 <= margin < 5:
+                    warnings.append(
+                        {
+                            "category": "advisory",
+                            "severity": "warning",
+                            "code": "low_travel_buffer",
+                            "day": day,
+                            "stop_number": number,
+                            "place_id": stop.place_id,
+                            "actual_minutes": margin,
+                            "suggested_minutes": 5,
+                            "message": f"第{day}天第{number}站：扣除地图路程和已安排的休息后，缓冲约{margin}分钟，可酌情多留一点；此项仅提醒。",
+                        }
+                    )
+            previous, previous_end = stop.place_id, minutes(stop.end_time)
+    return warnings
+
+
 def preference_deviations(req, output, data, maps, metrics=None):
     """Read cached evidence only; never move a stop or fetch more data."""
     if metrics is None:
@@ -440,7 +486,7 @@ async def validate(req: Requirements, output: Itinerary, data: dict, maps: MapCl
                         previous_rest_end = max(previous_rest_end, end_rest)
                     if field == "rest_after" and rests:
                         rest_end = max(rest_end, max(minutes(r.end_time) for r in rests))
-            earliest = rest_end + (timing.buffer_minutes if timing else 0)
+            earliest = rest_end
             if minutes(stop.start_time) < earliest:
                 day_offset, minute_of_day = divmod(earliest, 24 * 60)
                 arrival_time = clock(minute_of_day)
@@ -451,7 +497,7 @@ async def validate(req: Requirements, output: Itinerary, data: dict, maps: MapCl
                     "connection",
                     f"第{day}天第{stop_number}站：从{previous['name']} {clock(departure)}出发，"
                     f"到{target['name']}需{travel_minutes}分钟，"
-                    f"原定{stop.start_time}开始，计入休息和缓冲后最早{arrival_label}开始本站",
+                    f"原定{stop.start_time}开始，扣除已安排休息后最早{arrival_label}开始本站",
                     day=day,
                     stop_number=stop_number,
                     origin_id=previous["id"],
@@ -1666,7 +1712,7 @@ async def run_plan(
                                     "booking存在时保留booking.id、booking_day/start/end和booking类型，不新增或冒称已预约。保留手选酒店；从第1天连续住宿hotel_nights晚，过夜日最后一站为所选hotel_id、kind=hotel，备注「过夜当天返回酒店」。次日从酒店出发，其余天从origin出发。\n"
                                     "【节奏计量】max_*字段是目标，锁定规则见前述需求分类。景点数为每天不同activity/booking地点数，同一地点上午、下午、晚上分段仍计1个，实际游玩分钟全部累计；已知experience_group的不同ID算同一内容，避免重复安排，用户明确多次预约除外。没有每日至少1景点的统一下限，但不能漏必去。\n"
                                     "max_sightseeing_minutes累计各参观体验的end-start；max_sightseeing_ratio分子为该分钟数，分母固定为原始requirements.end_time-start_time，不能通过增加留白或改变作息放大分母。meal、hotel、纯休息和交通不计景点/游玩时长。max_transport_minutes累计首段、中间段及过夜回酒店的地图耗时，不含缓冲与休息。\n"
-                                    "【结构化衔接】每站transfer填写departure_time实际出发、arrival_time实际拟定到达、rest_before出发前原地点休息、rest_after到达后本站地点休息，以及buffer_minutes额外缓冲。休息每段写start_time/end_time，无休息返回空列表。原地点休息须在上一站结束后且出发前；目的地休息不得早于实际出发加地图耗时。下一站开始不得早于到达、目的地休息结束的较晚者再加缓冲。休息和缓冲不能重复占用同一段时间。明确安排的休息或出发时刻必须写入这些字段，不能只放reason/summary；说明引用同一组字段，不再独立编一套时刻。酒店end_time表示办理入住/当天活动结束，不用23:59代表整夜住宿。"
+                                    "【结构化衔接】每站transfer填写departure_time实际出发、arrival_time实际拟定到达、rest_before出发前原地点休息、rest_after到达后本站地点休息，以及buffer_minutes额外缓冲。休息每段写start_time/end_time，无休息返回空列表。原地点休息须在上一站结束后且出发前；目的地休息不得早于实际出发加地图耗时。下一站开始不得早于到达与目的地休息结束的较晚者。交通不足或休息冲突必须修正；额外缓冲是软建议，实际余量低于5分钟仅提醒，不单独重排，高于等于5分钟不另设上下限；buffer_minutes只是模型建议，不能当作硬约束。休息和缓冲不能重复占用同一段时间。明确安排的休息或出发时刻必须写入这些字段，不能只放reason/summary；说明引用同一组字段，不再独立编一套时刻。酒店end_time表示办理入住/当天活动结束，不用23:59代表整夜住宿。"
                                     "【时间与交通】所有时刻为目的地当地时间；stop.start_time表示到达并开始本站，hotel同样如此；end_time是结束本站及前往下一站的最早出发时刻。结束必须晚于开始，站点不得重叠，下一站开始不得早于上一站结束加地图耗时。首段也要算；时间未锁定时可调整每日出发/结束并在summary明示，但不能突破明确预约和截止要求。\n"
                                     "新路线在query_requests提交route的origin_id/destination_id/transport/reason，由程序查询后修订；mixed允许单段walking，walking不允许擅自改mixed；不要凭空假定交通可行。地图需20分钟时可预留总30分钟（额外10分钟），需60分钟可总80分钟（额外20分钟）；按换乘、入口及用户节奏决定缓冲，预约前留足。\n"
                                     "相邻总留白=下站start-上站end=地图耗时+交通缓冲+另留休息。休息不能重复算作交通缓冲；reason的时刻和数字须与字段一致，不确定就省略。首段按实际拟定出发时刻核对；实际衔接或硬要求不满足时由你综合取舍，不靠程序顺延。提交前逐天自查计数、分钟、固定分母比例、交通、预约和衔接。\n"
@@ -1827,6 +1873,9 @@ async def run_plan(
             }
             if measured
             else None,
+            "buffer_advisories": buffer_advisories(req, measured, data, maps)
+            if measured and data.get("origin")
+            else [],
             "preference_policy": "soft_targets_v1",
             "preference_deviations": preference_deviations(req, measured, data, maps, metrics)
             if measured and data.get("origin")
