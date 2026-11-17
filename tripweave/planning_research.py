@@ -93,6 +93,8 @@ async def research_missing_information(
     transport=None,
     on_progress=None,
     prefetch=False,
+    prior_facts=(),
+    prior_diagnostics=(),
 ) -> dict:
     """Resolve only explicit planning gaps, sharing the planning request budget.
 
@@ -233,8 +235,13 @@ async def research_missing_information(
                 FIELD_LABELS[field] for field in (refresh_fields or tasks[key]["fields"])
             )
             query = f"{date} {req.city} {place['name'][:60]} {fields} 官方 {place.get('address', '')[:40]}"
+            if prior_facts or prior_diagnostics:
+                question = " ".join(tasks[key]["questions"])[-65:]
+                query = f"{req.city} {place['name'][:35]} {fields} {question} 官方 {date}"
             if refresh_fields is not None:
                 query = f"{req.city} {place['name'][:60]} 官网 参观须知 {fields} {place.get('address', '')[:40]}"
+                if prior_facts or prior_diagnostics:
+                    query = f"{req.city} {place['name'][:35]} {fields} {' '.join(tasks[key]['questions'])[-65:]} 官网 参观须知"
             search_calls += 1
             queried_at = datetime.now(UTC).isoformat()
             sources = []
@@ -310,6 +317,11 @@ async def research_missing_information(
 
         prompt = {
             "city": req.city,
+            "prior_facts": [f for f in prior_facts if (f["place_id"], f["day"]) in tasks],
+            "prior_diagnostics": [
+                d for d in prior_diagnostics if (d["place_id"], d["day"]) in tasks
+            ],
+            "followup_instruction": "已有资料不代表回答了新的具体问题。针对questions剩余缺口补证据；不得仅复述旧摘要。仍不能回答时具体说明缺什么，不把found当已确认所有预约细节。",
             "tasks": [
                 {
                     "place_id": pid,

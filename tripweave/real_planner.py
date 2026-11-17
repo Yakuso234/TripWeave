@@ -967,6 +967,7 @@ async def run_planning_graph(
     executor = None
     repeated = {}
     checked = set()
+    research_repeated = {}
 
     def draft_identity(draft):
         return {
@@ -1212,8 +1213,6 @@ async def run_planning_graph(
             update["research_requests"] = state.get("research_requests", []) + [
                 request.model_dump(mode="json")
             ]
-            if state["research_rounds"] >= 1:
-                update.update(outcome="needs_information", issues=information_issues(request))
             if any(n.place_id not in known_places() or n.day > req.days for n in request.needs):
                 update.update(
                     outcome="incomplete",
@@ -1352,15 +1351,51 @@ async def run_planning_graph(
                     "error": "共享模型请求预算已用完，未启动额外研究；不代表需求无解。",
                 }
             )
-        data["critical_needs"] = [need.model_dump(mode="json") for need in request.needs]
+        critical = {(n["place_id"], n["day"]): n for n in data.get("critical_needs", [])}
+        for need in request.needs:
+            item = need.model_dump(mode="json")
+            key = (need.place_id, need.day)
+            item["fields"] = list(
+                dict.fromkeys(critical.get(key, {}).get("fields", []) + need.fields)
+            )
+            critical[key] = item
+        data["critical_needs"] = list(critical.values())
+        data["research_history"] = state["research_facts"]
+        data["research_feedback"] = state.get("research_diagnostics", [])
         record({"research_rounds": state["research_rounds"] + 1})
         report = await researcher(request.needs)
         facts = state["research_facts"] + report.get("facts", [])
-        data["planning_facts"] = facts
+        # Keep history for audit/context; business checks use the latest version
+        # of each field so superseded opening windows cannot contradict repairs.
+        data["planning_facts"] = list(
+            {(f["place_id"], f["day"], f["field"]): f for f in facts}.values()
+        )
         outcome = report.get("outcome", "needs_information")
+        signature = json.dumps(
+            {
+                "questions": request.model_dump(mode="json")["needs"],
+                "facts": [
+                    {k: v for k, v in f.items() if k != "queried_at"}
+                    for f in report.get("facts", [])
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        research_repeated[signature] = research_repeated.get(signature, 0) + 1
+        no_progress = research_repeated[signature] >= 2
         # Unknown is feedback, not automatically END: give the planner one
         # budgeted chance to avoid optional dependencies or preserve a draft.
         can_return = outcome in {"complete", "needs_information"}
+        if no_progress:
+            outcome, can_return = "needs_information", False
+            report["error"] = (
+                "同一具体问题重复补查未带来新证据，已保留草稿与历次资料；不代表用户需求无解。"
+            )
+            report["issues"] = information_issues(request)
+            for issue in report["issues"]:
+                issue["code"] = "research_no_progress"
+            trace.append({"event": "research_no_progress", "detail": report["error"]})
         if (
             can_return
             and settings.max_requests is not None
@@ -1752,10 +1787,16 @@ async def run_plan(
                                     trace,
                                     transport=transport,
                                     prefetch=True,
+                                    prior_facts=data.get("research_history", []),
+                                    prior_diagnostics=data.get("research_feedback", []),
                                     on_progress=lambda facts, diagnostics: progress.update(
                                         {
-                                            "research_facts": facts,
-                                            "research_diagnostics": diagnostics,
+                                            "research_facts": data.get("research_history", [])
+                                            + facts,
+                                            "research_diagnostics": data.get(
+                                                "research_feedback", []
+                                            )
+                                            + diagnostics,
                                         }
                                     ),
                                 )

@@ -256,7 +256,14 @@ async def test_planner_research_return_uses_independent_context_and_shared_usage
     research_messages = json.dumps(models[1]["messages"])
     assert PRIVATE_NOTE not in research_messages and "draft_stops" not in research_messages
     research_prompt = json.loads(models[1]["messages"][-1]["content"])
-    assert set(research_prompt) == {"city", "tasks"}
+    assert set(research_prompt) == {
+        "city",
+        "tasks",
+        "prior_facts",
+        "prior_diagnostics",
+        "followup_instruction",
+    }
+    assert research_prompt["prior_facts"] == research_prompt["prior_diagnostics"] == []
     assert research_prompt["tasks"][0]["date"] == "2026-11-21"
     assert research_prompt["tasks"][0]["sources"]
     assert PRIVATE_NOTE not in json.dumps(searches)
@@ -366,7 +373,7 @@ async def test_unknown_returns_to_planner_once_but_service_failure_stops(search_
     assert bool(result["error"]) == (search_mode == "service_error")
 
 
-async def test_second_information_request_stops_after_single_research_round():
+async def test_second_information_request_can_research_and_reach_approved_plan():
     calls, searches = [], []
     planners = []
 
@@ -378,10 +385,27 @@ async def test_second_information_request_stops_after_single_research_round():
             return sources()
         body = json.loads(request.content)
         calls.append(body)
+        if "review_report" in tool_names(body):
+            return completion("review_report", {"summary": "认可", "suggestions": []}, len(calls))
         if "research_report" in tool_names(body):
-            return completion("research_report", {"facts": [fact()]}, len(calls))
+            task = json.loads(body["messages"][-1]["content"])["tasks"][0]
+            answer = (
+                fact()
+                if task["fields"] == ["opening_hours"]
+                else fact(field="last_admission", windows=[], last_admission="16:00")
+            )
+            if task["fields"] == ["last_admission"]:
+                assert (
+                    json.loads(body["messages"][-1]["content"])["prior_facts"][0]["field"]
+                    == "opening_hours"
+                )
+            return completion("research_report", {"facts": [answer]}, len(calls))
         planners.append(body)
-        needs = gap(field="opening_hours" if len(planners) == 1 else "last_admission")["needs"]
+        needs = (
+            gap(field="opening_hours" if len(planners) == 1 else "last_admission")["needs"]
+            if len(planners) <= 2
+            else []
+        )
         return completion(
             "draft_proposal",
             packet(itinerary(), queries=None if len(planners) == 1 else [], needs=needs),
@@ -389,12 +413,33 @@ async def test_second_information_request_stops_after_single_research_round():
         )
 
     result = await run(requirements(), provider)
+    assert result["outcome"] == "ready", result
+    assert result["research_rounds"] == len(searches) == 2
+    assert result["usage"]["requests"] == 6 and len(calls) == 5  # wrapper supplies review
+    assert {f["field"] for f in result["research_facts"]} == {"opening_hours", "last_admission"}
+    assert result["issues"] == [] and result["review"]["status"] == "approved"
+
+
+async def test_identical_research_question_with_unchanged_evidence_stops_as_no_progress():
+    searches = []
+
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            return map_response(request)
+        if request.url.path.endswith("/tools/search"):
+            searches.append(json.loads(request.content))
+            return sources()
+        body = json.loads(request.content)
+        if "research_report" in tool_names(body):
+            return completion("research_report", {"facts": [fact()]}, 1)
+        return completion("draft_proposal", packet(itinerary(), needs=gap()["needs"]), 1)
+
+    result = await run(requirements(), provider, limit=None)
     assert result["outcome"] == "needs_information", result
-    assert result["research_rounds"] == len(searches) == 1
-    assert result["usage"]["requests"] == len(calls) == 3
-    assert result["research_facts"][0]["field"] == "opening_hours"
-    assert result["issues"][0]["missing_fields"] == ["last_admission"]
-    assert result["draft"] == itinerary()
+    assert result["research_rounds"] == len(searches) == 2
+    assert result["issues"][0]["code"] == "research_no_progress"
+    assert result["draft"] == itinerary() and result["itinerary"] is None
+    assert any(t["event"] == "research_no_progress" for t in result["trace"])
 
 
 async def test_shared_budget_exhaustion_retains_failed_draft_and_original_problem():
