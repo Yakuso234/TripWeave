@@ -56,6 +56,10 @@ def configured():
         amap_api_key="test-map-key",
         run_timeout=30,
         max_requests=6,
+        max_candidates=3,
+        planner_max_tokens=6000,
+        research_max_tokens=4000,
+        reviewer_max_tokens=6000,
     )
 
 

@@ -153,3 +153,6 @@ DeepSeek官方端点显式使用max_tokens（不发送OpenAI默认的max_complet
 
 
 修正DeepSeek字段后一次真实请求证实max_tokens=6000生效：输出6000且全部为思考、finish_reason=length，未生成首稿；当前max强度下该样本预算不足，不能将38秒截断称规划提速。[实测记录](docs/evaluations/MAX_TOKENS_6000_LIVE_20261117.md)。
+
+
+当前按用户要求以完整方案为优先：本地总时限600秒，规划/研究/校验输出及模型轮次/候选检查次数默认不设本地上限（供应商默认仍适用）。.env可用数字恢复限额，null表示不设置；思考仍max/high/max，业务硬校验与一轮校验协商不变。页面和每轮预算快照如实显示。

@@ -345,3 +345,8 @@ cd3da0e先推送再单个/plan，新prefix独占dispatch，沿用旧输入仅补
 ### 2026-11-17 max_tokens=6000唯一实测
 
 ffd9214先push再单个/plan，input/model/thinking/budget与stage-prompts样本相等；实际max_tokens6000。38.385秒incomplete，模型35.247秒、HTTP1/完整1/SDK1，输入8540含cache8320、输出6000全为思考，finish_reason=length。无draft、研究或Reviewer，非300秒或业务约束耗尽；地图6/搜索0，SQLite1run/0站/1candidate/accepted0。按记录价表完整模型估算0.02438640元，不含地图未对账；本次失败不能称单位可用方案降本。保留原额度和强度，未追加提高预算或再测。详见[MAX_TOKENS_6000_LIVE](MAX_TOKENS_6000_LIVE_20261117.md)。
+
+
+### 2026-11-17 完成优先、600秒及日期范围（离线）
+
+当前默认墙钟600秒，输出/请求/候选检查为None：model_settings省略max_tokens而非发送0/null，有限额fixture显式固定原值。重复无进展、未知证据、身份和硬业务校验仍在，图遍历保护1000步，校验协商仍一轮。6个完整日期区间用例涵盖至/破折号/波浪线、范围外、孤立日期及非法日；日期不适用可进入原一次定向恢复。新增完整SDK+图用例连续4份有物理冲突的候选返回定位反馈后修好，原3份检查上限关闭时可进入Reviewer approved；无输出字段，思考保留。新增Node显示None为不设本地上限/供应商默认而非null或0。474Python/4PGskip、56Node，Ruff/格式/JS语法/diff通过。真实一次600秒效果另记，不能将这些Mock结果当真实ready。

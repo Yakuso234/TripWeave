@@ -1074,7 +1074,7 @@ async def run_planning_graph(
         return record({"issues": issues, "outcome": "needs_user_decision" if issues else None})
 
     async def propose(state: PlanningState) -> dict:
-        if usage.requests >= settings.max_requests:
+        if settings.max_requests is not None and usage.requests >= settings.max_requests:
             return record(
                 {"outcome": "incomplete", "error": "模型轮次预算已用完，已保留当前草稿与证据。"}
             )
@@ -1144,11 +1144,7 @@ async def run_planning_graph(
                     output_type=ToolOutput(DraftProposal, name="draft_proposal", strict=False),
                     usage=usage,
                     usage_limits=UsageLimits(request_limit=settings.max_requests),
-                    model_settings={
-                        "max_tokens": settings.planner_max_tokens,
-                        "openai_reasoning_effort": settings.planner_effort,
-                        "extra_body": {"thinking": {"type": "enabled"}},
-                    },
+                    model_settings=settings.generation_settings("planner"),
                 )
         except UsageLimitExceeded:
             return record(
@@ -1348,7 +1344,7 @@ async def run_planning_graph(
         request = state["information_request"]
         if researcher is None:
             return record({"outcome": "needs_information", "issues": information_issues(request)})
-        if usage.requests >= settings.max_requests:
+        if settings.max_requests is not None and usage.requests >= settings.max_requests:
             return record(
                 {
                     "outcome": "incomplete",
@@ -1365,7 +1361,11 @@ async def run_planning_graph(
         # Unknown is feedback, not automatically END: give the planner one
         # budgeted chance to avoid optional dependencies or preserve a draft.
         can_return = outcome in {"complete", "needs_information"}
-        if can_return and usage.requests >= settings.max_requests:
+        if (
+            can_return
+            and settings.max_requests is not None
+            and usage.requests >= settings.max_requests
+        ):
             outcome = "incomplete"
             can_return = False
             report["error"] = "资料处理后模型轮次已耗尽，已保留草稿、事实与缺口。"
@@ -1389,8 +1389,17 @@ async def run_planning_graph(
 
     async def check_candidate(state: PlanningState) -> dict:
         signature = state["candidate"].model_dump_json()
-        if signature not in checked and len(checked) >= 3:
-            return record({"outcome": "incomplete", "error": "最多检查3份候选，当前草稿已保存。"})
+        if (
+            settings.max_candidates is not None
+            and signature not in checked
+            and len(checked) >= settings.max_candidates
+        ):
+            return record(
+                {
+                    "outcome": "incomplete",
+                    "error": f"最多检查{settings.max_candidates}份候选，当前草稿已保存。",
+                }
+            )
         checked.add(signature)
         identities = check_draft_identity(req, state["candidate"], known_places(), data["hotels"])
         issues = identities or await validate(req, state["candidate"], data, maps)
@@ -1417,7 +1426,11 @@ async def run_planning_graph(
         outcome = None
         if critical:
             outcome = "needs_information"
-        elif issues and len(checked) >= 3:
+        elif (
+            issues
+            and settings.max_candidates is not None
+            and len(checked) >= settings.max_candidates
+        ):
             outcome = "incomplete"
         return record({"issues": issues, "outcome": outcome, "attempts": len(checked)})
 
@@ -1442,7 +1455,7 @@ async def run_planning_graph(
         }
 
     def review_budget(stage):
-        if usage.requests < settings.max_requests:
+        if settings.max_requests is None or usage.requests < settings.max_requests:
             return None
         return record(
             {
@@ -1494,7 +1507,11 @@ async def run_planning_graph(
             "status": "awaiting_adjudication",
             "planner_response": response.model_dump(mode="json"),
         }
-        if response.revised_itinerary is not None and state["attempts"] >= 3:
+        if (
+            response.revised_itinerary is not None
+            and settings.max_candidates is not None
+            and state["attempts"] >= settings.max_candidates
+        ):
             return record(
                 {
                     "review": {
@@ -1622,7 +1639,7 @@ async def run_planning_graph(
         "respond_to_review", lambda state: END if state.get("outcome") else "collect_queries"
     )
     graph.add_edge("adjudicate_review", END)
-    return await graph.compile().ainvoke({})
+    return await graph.compile().ainvoke({}, config={"recursion_limit": 1000})
 
 
 async def run_plan(

@@ -13,6 +13,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
+        env_parse_none_str="null",
     )
     api_key: SecretStr | None = Field(
         default=None, validation_alias=AliasChoices("DEEPSEEK_API_KEY", "LLM_API_KEY")
@@ -29,21 +30,35 @@ class Settings(BaseSettings):
     reviewer_effort: Literal["low", "high", "max"] = Field(
         default="max", validation_alias="TRIPWEAVE_REVIEWER_EFFORT"
     )
-    run_timeout: int = Field(default=300, ge=5, le=300, validation_alias="TRIPWEAVE_RUN_TIMEOUT")
-    max_requests: int = Field(default=8, ge=2, le=10, validation_alias="TRIPWEAVE_MAX_REQUESTS")
-    planner_max_tokens: int = Field(
-        default=6000, ge=1, le=393216, validation_alias="TRIPWEAVE_PLANNER_MAX_TOKENS"
+    run_timeout: int | None = Field(default=600, ge=5, validation_alias="TRIPWEAVE_RUN_TIMEOUT")
+    max_requests: int | None = Field(default=None, ge=2, validation_alias="TRIPWEAVE_MAX_REQUESTS")
+    planner_max_tokens: int | None = Field(
+        default=None, ge=1, le=393216, validation_alias="TRIPWEAVE_PLANNER_MAX_TOKENS"
     )
-    research_max_tokens: int = Field(
-        default=4000, ge=1, le=393216, validation_alias="TRIPWEAVE_RESEARCH_MAX_TOKENS"
+    research_max_tokens: int | None = Field(
+        default=None, ge=1, le=393216, validation_alias="TRIPWEAVE_RESEARCH_MAX_TOKENS"
     )
-    reviewer_max_tokens: int = Field(
-        default=6000, ge=1, le=393216, validation_alias="TRIPWEAVE_REVIEWER_MAX_TOKENS"
+    reviewer_max_tokens: int | None = Field(
+        default=None, ge=1, le=393216, validation_alias="TRIPWEAVE_REVIEWER_MAX_TOKENS"
+    )
+    max_candidates: int | None = Field(
+        default=None, ge=1, validation_alias="TRIPWEAVE_MAX_CANDIDATES"
     )
     database: str = Field(
         default=".runtime/tripweave.sqlite3", validation_alias="TRIPWEAVE_DATABASE"
     )
     database_url: SecretStr | None = Field(default=None, validation_alias="DATABASE_URL")
+
+    def generation_settings(self, role: Literal["planner", "research", "reviewer"]) -> dict:
+        """None omits the provider cap; it does not send a zero/null cap."""
+        cap = getattr(self, f"{role}_max_tokens")
+        result = {
+            "openai_reasoning_effort": getattr(self, f"{role}_effort"),
+            "extra_body": {"thinking": {"type": "enabled"}},
+        }
+        if cap is not None:
+            result["max_tokens"] = cap
+        return result
 
     @property
     def configured(self) -> bool:

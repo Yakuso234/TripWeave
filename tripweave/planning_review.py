@@ -143,11 +143,7 @@ class ReviewSession:
                 message_history=self.messages,
                 usage=self.usage,
                 usage_limits=UsageLimits(request_limit=self.settings.max_requests),
-                model_settings={
-                    "max_tokens": self.settings.reviewer_max_tokens,
-                    "openai_reasoning_effort": self.settings.reviewer_effort,
-                    "extra_body": {"thinking": {"type": "enabled"}},
-                },
+                model_settings=self.settings.generation_settings("reviewer"),
             )
         self.messages = result.all_messages()
         return result.output
@@ -166,10 +162,6 @@ class ReviewSession:
                 ),
                 usage=self.usage,
                 usage_limits=UsageLimits(request_limit=self.settings.max_requests),
-                model_settings={
-                    "max_tokens": self.settings.planner_max_tokens,
-                    "openai_reasoning_effort": self.settings.planner_effort,
-                    "extra_body": {"thinking": {"type": "enabled"}},
-                },
+                model_settings=self.settings.generation_settings("planner"),
             )
         return result.output

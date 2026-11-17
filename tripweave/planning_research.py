@@ -153,7 +153,7 @@ async def research_missing_information(
 
     if not tasks:
         return result("complete")
-    if usage.requests >= settings.max_requests:
+    if settings.max_requests is not None and usage.requests >= settings.max_requests:
         return result(
             "incomplete",
             error="共享模型轮次预算已用完，未启动额外搜索。",
@@ -337,11 +337,7 @@ async def research_missing_information(
                 json.dumps(prompt, ensure_ascii=False),
                 usage=usage,
                 usage_limits=UsageLimits(request_limit=settings.max_requests),
-                model_settings={
-                    "max_tokens": settings.research_max_tokens,
-                    "openai_reasoning_effort": settings.research_effort,
-                    "extra_body": {"thinking": {"type": "enabled"}},
-                },
+                model_settings=settings.generation_settings("research"),
             )
         except UsageLimitExceeded:
             return result(
@@ -386,6 +382,7 @@ async def research_missing_information(
             "excerpt_insufficient",
             "sources_conflict",
             "date_not_applicable",
+            "explicit_date_mismatch",
             "search_timeout",
             "search_connection_error",
         }
@@ -408,7 +405,7 @@ async def research_missing_information(
         if repair_keys:
             # Reserve the minimum one planner call + one initial review call.
             # Tool/schema retries can still consume that remainder; it is not a success guarantee.
-            if usage.requests + 3 > settings.max_requests:
+            if settings.max_requests is not None and usage.requests + 3 > settings.max_requests:
                 return result(
                     "incomplete",
                     error="剩余共享请求预算不足以恢复资料并继续排程和校验。",
@@ -463,11 +460,7 @@ async def research_missing_information(
                     message_history=response.all_messages(),
                     usage=usage,
                     usage_limits=UsageLimits(request_limit=settings.max_requests),
-                    model_settings={
-                        "max_tokens": settings.research_max_tokens,
-                        "openai_reasoning_effort": settings.research_effort,
-                        "extra_body": {"thinking": {"type": "enabled"}},
-                    },
+                    model_settings=settings.generation_settings("research"),
                 )
             except (UsageLimitExceeded, UnexpectedModelBehavior) as exc:
                 return result(

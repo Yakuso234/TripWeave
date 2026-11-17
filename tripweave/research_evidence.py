@@ -2,12 +2,28 @@
 
 import re
 from collections import defaultdict
+from datetime import date
 
 FIELD_NAMES = {
     "opening_hours": "开放时段",
     "last_admission": "最晚入场时间",
     "reservation_rules": "预约规则",
 }
+
+
+def date_in_explicit_range(target: str, text: str) -> bool:
+    """Recognize directly joined full-date endpoints, not unrelated date lists."""
+    full = r"(\d{4})(?:-|年)(\d{1,2})(?:-|月)(\d{1,2})(?:日)?"
+    compact = "".join(ch for ch in text if not ch.isspace())
+    for match in re.finditer(full + r"(?:至|到|[-~～—–－])" + full, compact):
+        values = list(map(int, match.groups()))
+        try:
+            start, end = date(*values[:3]), date(*values[3:])
+            if start <= date.fromisoformat(target) <= end:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def clock_in_quote(value: str, quote: str) -> bool:
@@ -165,11 +181,15 @@ def validate_evidence(empty_facts, proposals, searches):
                 "".join(ch for ch in source_quote if not ch.isspace()),
             )
         }
-        if explicit_dates and empty["date"] not in explicit_dates:
+        if (
+            explicit_dates
+            and empty["date"] not in explicit_dates
+            and not date_in_explicit_range(empty["date"], source_quote)
+        ):
             reject(
                 "evidence",
                 "explicit_date_mismatch",
-                "引文明示日期与旅行日期不匹配；不推断日期范围的适用性。",
+                "引文明示日期或直接给出的完整日期范围不包含旅行日期；不能据此确认适用性。",
                 expected=empty["date"],
                 actual=sorted(explicit_dates),
             )

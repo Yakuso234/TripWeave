@@ -1036,3 +1036,21 @@ test('low-buffer advisory is visible but never blocks an otherwise acceptable pl
   assert.equal(h.canAccept(),true);
   assert.doesNotMatch(html,/data-action="accept"[^>]*disabled/);
 });
+
+
+test('completion-first budgets show omitted caps without null or a false zero', () => {
+  const h=harness();observedCalls(h);
+  const budget={max_model_requests:null,run_timeout_seconds:600,planner_max_output_tokens:null,
+    research_max_output_tokens:null,reviewer_max_output_tokens:null,input_token_limit:null};
+  h.S.config.planning_budget=budget;
+  h.S.candidate.usage_observation.budget=budget;
+  h.S.candidate.usage_observation.model_calls[0].max_output_tokens=null;
+  const html=h.itinerary();
+  assert.match(html,/供应商默认/);
+  assert.match(html,/不设本地上限/);
+  assert.doesNotMatch(html,/NaN|undefined|null/);
+  h.S.page='settings';h.render();
+  const settings=h.elements.get('app').innerHTML;
+  assert.match(settings,/不设本地上限/);
+  assert.match(settings,/600 秒/);
+});

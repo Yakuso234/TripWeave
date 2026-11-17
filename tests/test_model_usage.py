@@ -284,11 +284,11 @@ def test_active_config_exposes_budget_not_credentials(tmp_path):
     with TestClient(create_app(str(tmp_path / "config.db"))) as client:
         budget = client.get("/api/config").json()["planning_budget"]
     assert budget == {
-        "max_model_requests": 8,
-        "run_timeout_seconds": 300,
-        "planner_max_output_tokens": 6000,
-        "research_max_output_tokens": 4000,
-        "reviewer_max_output_tokens": 6000,
+        "max_model_requests": None,
+        "run_timeout_seconds": 600,
+        "planner_max_output_tokens": None,
+        "research_max_output_tokens": None,
+        "reviewer_max_output_tokens": None,
         "input_token_limit": None,
     }
     with pytest.raises(ValueError):

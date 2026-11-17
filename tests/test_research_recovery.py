@@ -18,6 +18,28 @@ from tripweave.research_evidence import match_quote, validate_evidence
 from tripweave.storage import Store
 
 
+@pytest.mark.parametrize(
+    "dates,accepted",
+    [
+        ("2026年11月1日至2026年11月30日", True),
+        ("2026-11-01—2026-11-30", True),
+        ("2026-11-01 ~ 2026-11-30", True),
+        ("2026年10月1日至2026年10月30日", False),
+        ("2026年11月1日、2026年11月30日", False),
+        ("2026年11月31日至2026年12月30日", False),
+    ],
+)
+def test_quote_date_range_contains_trip_date_without_accepting_unrelated_dates(dates, accepted):
+    quote = dates + "：开放时间09:00–17:00。"
+    facts, diagnostics = evidence([fact(quote=quote)], excerpt=quote)
+    assert (facts[0]["status"] == "found") == accepted
+    assert (
+        not any(d["code"] == "explicit_date_mismatch" for d in diagnostics)
+        if accepted
+        else any(d["code"] == "explicit_date_mismatch" for d in diagnostics)
+    )
+
+
 def evidence(proposals, *, excerpt=QUOTE, extra_sources=()):
     return validate_evidence(
         [_unknown("p0", 1, "opening_hours", requirements())],
