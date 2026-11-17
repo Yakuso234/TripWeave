@@ -241,7 +241,7 @@ def test_active_config_exposes_budget_not_credentials(tmp_path):
         budget = client.get("/api/config").json()["planning_budget"]
     assert budget == {
         "max_model_requests": 8,
-        "run_timeout_seconds": 180,
+        "run_timeout_seconds": 300,
         "planner_max_output_tokens": 6000,
         "research_max_output_tokens": 4000,
         "reviewer_max_output_tokens": 6000,

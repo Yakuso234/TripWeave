@@ -273,3 +273,60 @@ async def test_unknown_research_identity_does_not_launch_search_or_hide_missing_
     assert result["outcome"] == "incomplete" and result["draft"] == itinerary()
     assert result["issues"][0]["code"] == "invalid_research_scope"
     assert result["research_search_calls"] == 0
+
+
+async def test_walking_evidence_covers_mixed_graph_validation_metrics_and_output_routes():
+    calls, directions = [], []
+
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            if "/direction/" in request.url.path:
+                directions.append(request)
+            return map_response(request)
+        body = json.loads(request.content)
+        calls.append(body)
+        if tool_names(body) == {"review_report"}:
+            return reply("review_report", {"summary": "合成通过", "suggestions": []})
+        queries = route_queries(itinerary()) if len(calls) == 1 else []
+        for q in queries:
+            q["transport"] = "walking"
+        return reply("draft_proposal", packet(itinerary(), queries=queries))
+
+    result = await run_plan(
+        requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
+    )
+    assert result["outcome"] == "ready", result
+    assert len(calls) == 3 and len(directions) == 1
+    assert result["daily_metrics"][0]["transport_minutes"] is not None
+    assert len(result["routes"]) == 1
+
+
+async def test_local_repair_allows_unaffected_day_annotation_change_but_rechecks_full_plan():
+    calls = []
+    plan = itinerary(days=2)
+    broken = deepcopy(plan)
+    broken["stops"][0]["start_time"] = "00:00"
+
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            return map_response(request)
+        body = json.loads(request.content)
+        calls.append(body)
+        if tool_names(body) == {"review_report"}:
+            return reply("review_report", {"summary": "合成通过", "suggestions": []})
+        context = json.loads(body["messages"][-1]["content"])
+        current = deepcopy(broken)
+        if any(i["code"] == "connection" for i in context.get("validation_issues", [])):
+            assert context["revision_days"] == [1]
+            current = deepcopy(plan)
+            current["stops"][1]["reason"] = "说明更新，实际地点和时间未变"
+        return reply("draft_proposal", packet(current, queries=route_queries(current)))
+
+    result = await run_plan(
+        requirements(days=2, strict_preferences=["start_time"]),
+        "deepseek",
+        configured(),
+        transport=httpx2.MockTransport(provider),
+    )
+    assert result["outcome"] == "ready", result
+    assert result["itinerary"]["stops"][1]["reason"] == "说明更新，实际地点和时间未变"

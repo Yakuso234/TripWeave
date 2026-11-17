@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     reviewer_effort: Literal["low", "high", "max"] = Field(
         default="max", validation_alias="TRIPWEAVE_REVIEWER_EFFORT"
     )
-    run_timeout: int = Field(default=180, ge=5, le=180, validation_alias="TRIPWEAVE_RUN_TIMEOUT")
+    run_timeout: int = Field(default=300, ge=5, le=300, validation_alias="TRIPWEAVE_RUN_TIMEOUT")
     max_requests: int = Field(default=8, ge=2, le=10, validation_alias="TRIPWEAVE_MAX_REQUESTS")
     planner_max_tokens: int = Field(
         default=6000, ge=1, le=393216, validation_alias="TRIPWEAVE_PLANNER_MAX_TOKENS"

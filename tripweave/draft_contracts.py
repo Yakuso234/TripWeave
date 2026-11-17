@@ -12,6 +12,7 @@ from unicodedata import normalize
 from pydantic import BaseModel, Field, TypeAdapter
 
 from .domain import Itinerary, Requirements
+from .maps import transport_allowed
 from .planning_contracts import Contract, PlaceId, PlanningNeed
 
 Reason = Annotated[str, Field(min_length=1, max_length=300)]
@@ -110,7 +111,7 @@ def check_query_requests(
                         "unknown_ids": list(dict.fromkeys(missing)),
                     }
                 )
-            if query.transport != req.transport:
+            if not transport_allowed(req.transport, query.transport):
                 issues.append(
                     {
                         **base,

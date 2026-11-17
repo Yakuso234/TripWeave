@@ -27,7 +27,7 @@ from .api_cost import estimate_cost
 from .domain import Itinerary, Requirements, Stop, clock, minutes
 from .draft_contracts import DraftProposal, check_draft_identity, packet_context
 from .evidence import load_evidence
-from .maps import MapClient, MapError, distance
+from .maps import MapClient, MapError, cached_route, distance
 from .model_usage import ModelUsageRecorder
 from .pacing import REQUIREMENT_POLICY, daily_metrics, pacing_issues
 from .planning_contracts import (
@@ -233,7 +233,7 @@ def preference_deviations(req, output, data, maps, metrics=None):
             previous = output.hotel_id if 2 <= day <= req.hotel_nights + 1 else data["origin"]["id"]
             duration, complete = 0, True
             for stop in (s for s in output.stops if s.day == day):
-                leg = maps.cache.get((previous, stop.place_id, req.transport))
+                leg = cached_route(maps.cache, previous, stop.place_id, req.transport)
                 if previous != stop.place_id:
                     if leg is None:
                         complete = False
@@ -260,7 +260,7 @@ def preference_deviations(req, output, data, maps, metrics=None):
         if not stops:
             continue
         origin = output.hotel_id if 2 <= day <= req.hotel_nights + 1 else data["origin"]["id"]
-        leg = maps.cache.get((origin, stops[0].place_id, req.transport))
+        leg = cached_route(maps.cache, origin, stops[0].place_id, req.transport)
         duration = 0 if origin == stops[0].place_id else leg["duration_minutes"] if leg else None
         if "start_time" not in req.strict_preferences and duration is not None:
             departure = minutes(stops[0].start_time) - duration
@@ -993,7 +993,7 @@ async def run_planning_graph(
             days.update(day for i in issues for day in i.get("required_days", []))
             prompt["revision_days"] = sorted(days)
             prompt["instruction"] += (
-                "已指定revision_days时，仅改这些日期，仍返回完整草稿；其他日期保持原样。"
+                "已指定revision_days时，仅改这些日期，仍返回完整草稿；其他日期的地点、时段和类型保持原样，说明文字可更新。自动酒店若需调整可联动其他日期，并在summary解释原因；用户手选酒店不得替换。"
             )
         trace.append(
             {
@@ -1024,9 +1024,22 @@ async def run_planning_graph(
             )
         output = response.output
         if days and state.get("candidate"):
-            before = [x.model_dump() for x in state["candidate"].stops if x.day not in days]
-            after = [x.model_dump() for x in output.draft.stops if x.day not in days]
-            if before != after or output.draft.hotel_id != state["candidate"].hotel_id:
+            before = [
+                x.model_dump(exclude={"reason", "title"})
+                for x in state["candidate"].stops
+                if x.day not in days
+            ]
+            after = [
+                x.model_dump(exclude={"reason", "title"})
+                for x in output.draft.stops
+                if x.day not in days
+            ]
+            automatic_hotel_changed = (
+                not req.hotel_id and output.draft.hotel_id != state["candidate"].hotel_id
+            )
+            if not automatic_hotel_changed and (
+                before != after or output.draft.hotel_id != state["candidate"].hotel_id
+            ):
                 return record(
                     {
                         "outcome": "incomplete",
@@ -1100,7 +1113,7 @@ async def run_planning_graph(
                     # Same POI is local identity evidence, not a missing map route.
                     # MapClient.route already returns zero without any HTTP call.
                     and origin != stop.place_id
-                    and (origin, stop.place_id, req.transport) not in maps.cache
+                    and cached_route(maps.cache, origin, stop.place_id, req.transport) is None
                 ):
                     routes.append(
                         {
@@ -1571,13 +1584,13 @@ async def run_plan(
                                 + (
                                     "你是旅行规划Agent，按本次需求和已获取证据提出方案，不执行预约、订房、支付或其他副作用。\n"
                                     "首次及普通修订都输出DraftProposal：完整draft、query_requests查询清单、information_needs关键缺口、assumptions暂定事项。没有普通工具可调用，不先反复查工具才交草稿。\n"
-                                    "task=respond_to_review时使用respond_to_review输出合同逐项修订或解释拒绝；收到revision_days时仅改指定日期，仍返回完整行程并原样保留其他天，修改时参考全程避免新增冲突。\n"
+                                    "task=respond_to_review时使用respond_to_review输出合同逐项修订或解释拒绝；收到revision_days时仅改指定日期，仍返回完整行程，保留其他天的实际地点和时段，说明文字可更新；自动酒店需改变时可解释原因并联动全程，手选酒店不得替换。\n"
                                     "【身份与固定安排】仅引用本次已知地点ID；每站day为1至旅行天数。must_visit、selected_attractions中的地点须作为activity或booking保留。visit_constraints是明确锁定的必去窗口：任选其中一个window完整停留且不少于min_duration_minutes；fixed=true精确按唯一窗口排booking。\n"
                                     "booking存在时保留booking.id、booking_day/start/end和booking类型，不新增或冒称已预约。保留手选酒店；从第1天连续住宿hotel_nights晚，过夜日最后一站为所选hotel_id、kind=hotel，备注「过夜当天返回酒店」。次日从酒店出发，其余天从origin出发。\n"
                                     "【节奏计量】max_*字段是目标，锁定规则见前述需求分类。景点数为每天不同activity/booking地点数，同一地点上午、下午、晚上分段仍计1个，实际游玩分钟全部累计；已知experience_group的不同ID算同一内容，避免重复安排，用户明确多次预约除外。没有每日至少1景点的统一下限，但不能漏必去。\n"
                                     "max_sightseeing_minutes累计各参观体验的end-start；max_sightseeing_ratio分子为该分钟数，分母固定为原始requirements.end_time-start_time，不能通过增加留白或改变作息放大分母。meal、hotel、纯休息和交通不计景点/游玩时长。max_transport_minutes累计首段、中间段及过夜回酒店的地图耗时，不含缓冲与休息。\n"
                                     "【时间与交通】所有时刻为目的地当地时间；stop.start_time表示到达并开始本站，hotel同样如此；end_time是结束本站及前往下一站的最早出发时刻。结束必须晚于开始，站点不得重叠，下一站开始不得早于上一站结束加地图耗时。首段也要算；时间未锁定时可调整每日出发/结束并在summary明示，但不能突破明确预约和截止要求。\n"
-                                    "新路线在query_requests提交route的origin_id/destination_id/transport/reason，由程序查询后修订；不要凭空假定交通可行。地图需20分钟时可预留总30分钟（额外10分钟），需60分钟可总80分钟（额外20分钟）；按换乘、入口及用户节奏决定缓冲，预约前留足。\n"
+                                    "新路线在query_requests提交route的origin_id/destination_id/transport/reason，由程序查询后修订；mixed允许单段walking，walking不允许擅自改mixed；不要凭空假定交通可行。地图需20分钟时可预留总30分钟（额外10分钟），需60分钟可总80分钟（额外20分钟）；按换乘、入口及用户节奏决定缓冲，预约前留足。\n"
                                     "相邻总留白=下站start-上站end=地图耗时+交通缓冲+另留休息。休息不能重复算作交通缓冲；reason的时刻和数字须与字段一致，不确定就省略。首段按实际拟定出发时刻核对；实际衔接或硬要求不满足时由你综合取舍，不靠程序顺延。提交前逐天自查计数、分钟、固定分母比例、交通、预约和衔接。\n"
                                     "【休息与正餐】类型仅activity/booking/meal/hotel。出发、赶路不虚构为站点；纯午休、自由时间用留白，在summary或reason交代起止，不能标activity或把实际游玩标meal逃避计量。\n"
                                     "行程跨午晚餐或用户要求用餐时留合理正餐时间。需要具体餐厅就提交nearby_restaurants清单；首稿可用已知景点/起点/酒店ID作附近自选正餐区域锚点，title与reason明确具体餐厅及正餐供应待核实，不能说锚点自身供餐。同ID地图0分钟仍要留找店和步行时间；茶饮、甜品、咖啡POI不等于能供正餐。\n"
@@ -1666,7 +1679,7 @@ async def run_plan(
                 for stop_index, stop in enumerate(s for s in result.stops if s.day == day):
                     if stop.place_id not in maps.places:
                         continue
-                    leg = maps.cache.get((previous["id"], stop.place_id, req.transport))
+                    leg = cached_route(maps.cache, previous["id"], stop.place_id, req.transport)
                     if leg:
                         routes.append({**leg, "day": day, "stop_index": stop_index})
                     previous = maps.places[stop.place_id]
@@ -1680,7 +1693,7 @@ async def run_plan(
                     previous_id = measured.hotel_id
                 duration, complete = 0, True
                 for stop in (s for s in measured.stops if s.day == day):
-                    leg = maps.cache.get((previous_id, stop.place_id, req.transport))
+                    leg = cached_route(maps.cache, previous_id, stop.place_id, req.transport)
                     if previous_id == stop.place_id:
                         pass  # Same POI adds no inter-POI travel, even before full validation.
                     elif leg is None:

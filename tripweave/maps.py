@@ -13,6 +13,18 @@ class MapError(Exception):
     pass
 
 
+def transport_allowed(preference: str, requested: str) -> bool:
+    return requested == preference or preference == "mixed" and requested == "walking"
+
+
+def cached_route(cache, origin_id, destination_id, mode):
+    """A verified walking route also satisfies mixed travel, never the reverse."""
+    exact = cache.get((origin_id, destination_id, mode))
+    if exact is not None:
+        return exact
+    return cache.get((origin_id, destination_id, "walking")) if mode == "mixed" else None
+
+
 def distance(a: dict, b: dict) -> float:
     return (float(a["longitude"]) - float(b["longitude"])) ** 2 + (
         float(a["latitude"]) - float(b["latitude"])
@@ -207,8 +219,9 @@ class MapClient:
 
     async def route(self, a: dict, b: dict, city: str, mode: str) -> dict:
         key = (a["id"], b["id"], mode)
-        if key in self.cache:
-            return self.cache[key]
+        known = cached_route(self.cache, a["id"], b["id"], mode)
+        if known is not None:
+            return known
         if a["id"] == b["id"]:
             result = {
                 "origin_id": a["id"],

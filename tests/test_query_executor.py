@@ -118,7 +118,7 @@ async def test_map_cache_can_be_new_evidence_to_executor_without_another_http_re
     "query,code",
     [
         (route(destination_id="unknown"), "unknown_place_id"),
-        (route(transport="walking"), "transport_mismatch"),
+        (route(transport="flying"), "transport_mismatch"),
         (route(reason=""), "query_reason_missing"),
         (route(city="北京"), "unexpected_query_fields"),
         (
@@ -302,3 +302,27 @@ async def test_batch_size_guard_runs_before_any_query_and_keys_preserve_directio
     assert query_key(route()) != query_key(route(origin_id="b", destination_id="a"))
     assert query_key(route()) != query_key(route(transport="walking"))
     assert query_key(route()) == query_key(route(reason="换一个理由。"))
+
+
+async def test_mixed_accepts_walking_and_reuses_it_even_after_map_budget_is_exhausted():
+    async with workspace() as (executor, maps, _, calls):
+        first = await executor.execute([route(transport="walking")])
+        assert first["results"][0]["status"] == "ok"
+        before = len(calls)
+        maps.max_calls = maps.calls
+        second = await executor.execute([route()])
+        assert second["results"][0]["status"] == "ok"
+        assert second["results"][0]["cache_hit"]
+        assert len(calls) == before == 1
+
+
+async def test_walking_only_still_rejects_mixed_without_any_supplier_call():
+    async with workspace(req=Requirements(date="2026-11-21", transport="walking")) as (
+        executor,
+        _,
+        _,
+        calls,
+    ):
+        result = await executor.execute([route()])
+        assert result["results"][0]["code"] == "transport_mismatch"
+        assert calls == []

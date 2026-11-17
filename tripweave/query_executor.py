@@ -9,7 +9,7 @@ from copy import deepcopy
 from time import monotonic
 from unicodedata import normalize
 
-from .maps import MapError
+from .maps import MapError, cached_route, transport_allowed
 
 MAX_BATCH_QUERIES = 24
 QUERY_FIELDS = {
@@ -137,7 +137,7 @@ class QueryExecutor:
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
             return "query_reason_missing", "查询必须说明具体必要性，且不超过500字。"
         if kind == "route":
-            if query.get("transport") != self.req.transport:
+            if not transport_allowed(self.req.transport, query.get("transport")):
                 return "transport_mismatch", "路线交通方式必须遵守本次用户设置，不能静默更换。"
             if not self._known(query.get("origin_id")) or not self._known(
                 query.get("destination_id")
@@ -220,7 +220,9 @@ class QueryExecutor:
             else:
                 # Existing MapClient routes remain reusable when the map quota
                 # is exhausted: no request is needed to return cached evidence.
-                map_cached = query["kind"] == "route" and key[1:] in self.maps.cache
+                map_cached = (
+                    query["kind"] == "route" and cached_route(self.maps.cache, *key[1:]) is not None
+                )
                 item["cache_hit"] = map_cached
                 if self.maps.calls >= self.maps.max_calls and not map_cached:
                     item.update(

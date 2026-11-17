@@ -183,10 +183,10 @@ async def test_deepseek_contract_feedback_and_usage(
             business_feedback.append(prompt)
             corrected = deepcopy(original) if repair else deepcopy(broken)
             if outside_scope:
-                # Changing an unaffected day's explanation is still outside the
+                # Changing an unaffected day's actual time is outside the
                 # allowed repair scope; the engine must retain the old draft.
-                next(stop for stop in corrected["stops"] if stop["day"] == 2)["reason"] = (
-                    "不应改动的第二天"
+                next(stop for stop in corrected["stops"] if stop["day"] == 2)["start_time"] = (
+                    "10:01"
                 )
             return reply(
                 "draft_proposal", packet(corrected, queries=route_queries(corrected)), len(calls)
