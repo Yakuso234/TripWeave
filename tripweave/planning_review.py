@@ -16,6 +16,7 @@ from .domain import Itinerary
 from .draft_contracts import QueryRequest
 from .pacing import REQUIREMENT_POLICY
 from .planning_contracts import Contract
+from .planning_prompts import planner_instructions
 
 
 class ReviewContractError(UnexpectedModelBehavior):
@@ -159,6 +160,7 @@ class ReviewSession:
                     {**context, "task": "respond_to_review", "instruction": RESPONSE_INSTRUCTIONS},
                     ensure_ascii=False,
                 ),
+                instructions=planner_instructions("review_response"),
                 output_type=ToolOutput(
                     PlannerReviewResponse, name="respond_to_review", strict=False
                 ),
