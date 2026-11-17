@@ -4,6 +4,7 @@ import json
 from copy import deepcopy
 
 import httpx2
+import pytest
 from draft_helpers import packet, reply, route_queries
 from test_planning_research import fact, sources
 from test_planning_workflow import gap, itinerary, map_response, requirements, tool_names
@@ -91,6 +92,38 @@ async def test_cache_reuse_is_normal_and_does_not_trigger_false_no_progress():
     )
     assert result["outcome"] == "ready" and len(directions) == 1
     assert len(result["query_log"]) == 2 and result["query_log"][1]["cache_hit"]
+
+
+@pytest.mark.parametrize("limit, outcome", [(2, "incomplete"), (6, "ready")])
+async def test_same_poi_meal_anchor_needs_no_route_query_or_extra_model_round(limit, outcome):
+    plan = itinerary()
+    plan["stops"].append(
+        {**plan["stops"][0], "start_time": "11:30", "end_time": "12:30", "kind": "meal"}
+    )
+    calls, directions = [], []
+
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            if "/direction/" in request.url.path:
+                directions.append(request)
+            return map_response(request)
+        body = json.loads(request.content)
+        calls.append(body)
+        if tool_names(body) == {"review_report"}:
+            return reply("review_report", {"summary": "合成复核通过。", "suggestions": []})
+        queries = [q for q in route_queries(plan) if q["origin_id"] != q["destination_id"]]
+        return reply("draft_proposal", packet(plan, queries=queries if len(calls) == 1 else []))
+
+    result = await run_plan(
+        requirements(),
+        "deepseek",
+        configured().model_copy(update={"max_requests": limit}),
+        transport=httpx2.MockTransport(provider),
+    )
+    assert result["outcome"] == outcome, result
+    assert len(calls) == (2 if limit == 2 else 3) and len(directions) == 1
+    assert result["daily_metrics"][0]["transport_minutes"] is not None
+    assert not any(i["code"] == "route_queries_missing" for i in result["issues"])
 
 
 async def test_identical_failed_batch_with_only_changed_reason_stops_before_global_budget():

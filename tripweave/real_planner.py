@@ -1025,6 +1025,9 @@ async def run_planning_graph(
                 if (
                     origin in maps.places
                     and stop.place_id in maps.places
+                    # Same POI is local identity evidence, not a missing map route.
+                    # MapClient.route already returns zero without any HTTP call.
+                    and origin != stop.place_id
                     and (origin, stop.place_id, req.transport) not in maps.cache
                 ):
                     routes.append(
@@ -1526,7 +1529,7 @@ async def run_plan(
                                 "\n保留用户手选的酒店。从第1天起连续住宿hotel_nights晚，"
                                 "每个过夜当天的最后一站必须是所选酒店，kind设为hotel，备注「过夜当天返回酒店」。"
                                 "过夜后的次日从酒店出发，其余天从origin出发。"
-                                "\n调用route核实路段，按时间顺序排站。"
+                                "\n在query_requests中提交route查询，由程序核实路段，按时间顺序排站。"
                                 "下一站的开始时间不得早于上一站的结束时间加上route返回的duration_minutes。"
                                 "所有时刻均为目的地当地时间。requirements.start_time是每天从当天起点出发的时刻，"
                                 "requirements.end_time是每日所有站点结束的最晚边界。"
@@ -1674,7 +1677,9 @@ async def run_plan(
                 duration, complete = 0, True
                 for stop in (s for s in measured.stops if s.day == day):
                     leg = maps.cache.get((previous_id, stop.place_id, req.transport))
-                    if leg is None:
+                    if previous_id == stop.place_id:
+                        pass  # Same POI adds no inter-POI travel, even before full validation.
+                    elif leg is None:
                         complete = False
                     else:
                         duration += leg["duration_minutes"]
