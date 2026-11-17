@@ -172,7 +172,9 @@ def preflight_requirements(req, resolved_by_constraint: Mapping | None = None) -
     resolved = resolved_by_constraint or {}
     issues, fixed_visits = [], []
     daily = {"start_time": req.start_time, "end_time": req.end_time}
-    start, end = _minutes(req.start_time), _minutes(req.end_time)
+    strict = getattr(req, "strict_preferences", [])
+    start = _minutes(req.start_time) if "start_time" in strict else 0
+    end = _minutes(req.end_time) if "end_time" in strict else 1440
     if req.booking_query:
         booking = {
             "constraint_id": "booking",
@@ -183,7 +185,7 @@ def preflight_requirements(req, resolved_by_constraint: Mapping | None = None) -
             "end_time": req.booking_end,
         }
         fixed_visits.append(booking)
-        if req.booking_start < req.start_time or req.booking_end > req.end_time:
+        if _minutes(req.booking_start) < start or _minutes(req.booking_end) > end:
             issues.append(
                 {
                     "category": "hard_conflict",
@@ -206,7 +208,7 @@ def preflight_requirements(req, resolved_by_constraint: Mapping | None = None) -
             >= constraint.min_duration_minutes
             and (
                 not constraint.fixed
-                or (window.start_time >= req.start_time and window.end_time <= req.end_time)
+                or (_minutes(window.start_time) >= start and _minutes(window.end_time) <= end)
             )
         ]
         if not feasible:

@@ -14,6 +14,7 @@ from pydantic_ai.usage import UsageLimits
 
 from .domain import Itinerary
 from .draft_contracts import QueryRequest
+from .pacing import REQUIREMENT_POLICY
 from .planning_contracts import Contract
 
 
@@ -70,11 +71,13 @@ class PlannerReviewResponse(Contract):
 
 
 REVIEW_INSTRUCTIONS = (
-    "你是独立旅行校验Agent，只检查给定草稿是否贴合本次用户要求、体验与合理性。"
+    REQUIREMENT_POLICY + "你是独立旅行校验Agent，只检查给定草稿是否贴合本次用户要求、体验与合理性。"
     "revision_request是用户本次修订说明，与本次具体需求一起优先于一般或长期偏好。"
     "程序硬约束校验另行负责，不可放行硬约束失败，不声称需求无解。"
     "结合完整多天安排，核对轻松程度、连续高强度游玩、正餐、交通缓冲及说明与时间字段一致性。"
     "不是为了提意见而提意见；有具体依据才建议修改，最多5条。"
+    "preference_deviations是目标偏离，不等于硬错误；有合理取舍且整体体验合适时接受，不为数值轻微偏离强制重排。"
+    "特别核对notes/custom_*和revision_request的明确不可突破要求；未被程序结构化的文本条件需要你语义检查，不能漏掉。"
     "每条意见给稳定suggestion_id、具体day/当天1起站序stop_number/place_id、"
     "concern、requirement_basis（引用实际用户要求或明确证据）、proposed_change。"
     "资料未知必须明确未知，不能伪造开放时间、体力数据或官方承诺。"
@@ -88,7 +91,8 @@ REVIEW_INSTRUCTIONS = (
 RESPONSE_INSTRUCTIONS = (
     "逐条回应校验Agent的全部suggestion_id，每条action为revise或decline并解释reason。"
     "保留revision_request中的用户本次修改意图，其优先于一般或长期偏好。"
-    "意见是建议，不高于用户硬要求；不得因其他Agent要求而删改必去、预约、时间和节奏上限。"
+    "意见是建议，不高于用户硬要求；不得删改必去、预约、锁定时间和明确不可突破条件。"
+    "普通节奏和期望金额允许具体解释后权衡，不能仅因超过软目标而判失败。"
     "认为有道理则修订，参考所有日期防止新的冲突。只要有revise，返回修订后的完整"
     "revised_itinerary；未受影响安排保留。全部decline则不返回行程，程序原样保留草稿。"
     "不修改必须说明具体用户需求、现有安排或证据为何支持原案，不用泛泛理由。"

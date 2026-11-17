@@ -80,7 +80,12 @@ async def test_declared_booking_outside_daily_bounds_stops_before_any_supplier_c
         raise AssertionError("a proved user requirement conflict must not call suppliers")
 
     result = await run(
-        requirements(booking_query="上海博物馆", booking_start="21:00", booking_end="22:00"),
+        requirements(
+            booking_query="上海博物馆",
+            booking_start="21:00",
+            booking_end="22:00",
+            strict_preferences=["end_time"],
+        ),
         forbidden,
     )
     assert result["status"] == "conflict"
@@ -202,7 +207,12 @@ async def test_pacing_violation_returns_actual_limit_and_segments_for_local_revi
             len(calls),
         )
 
-    result = await run(requirements(days=2, max_sightseeing_minutes=90), provider)
+    result = await run(
+        requirements(
+            days=2, max_sightseeing_minutes=90, strict_preferences=["max_sightseeing_minutes"]
+        ),
+        provider,
+    )
     assert result["outcome"] == "ready", result
     revision = json.loads(calls[2]["messages"][-1]["content"])
     assert revision["revision_days"] == [1]

@@ -129,3 +129,4 @@ section.summary-card{position:static}
 
 /* Saved execution drafts remain separate from acceptable itinerary candidates. */
 .saved-run{padding:18px 0;border-top:1px solid var(--line,#e7ebe6)}.saved-run h4{margin-bottom:6px}.saved-draft{margin-top:16px}.saved-draft ol,.query-records{padding-left:22px}.saved-draft li,.query-records li{margin:12px 0;overflow-wrap:anywhere}.saved-draft p,.query-records p{margin:7px 0}.planning-runs .tag{margin-right:6px}
+.strict-choice{display:flex;align-items:center;gap:8px;font-size:.82rem;color:var(--muted);margin:4px 0 16px}.strict-choice input{width:17px;height:17px;min-height:0;accent-color:#245c49}.extra-requirements{border-top:1px solid #e4e8df;padding-top:18px;margin-top:22px}.preference-deviations{margin-top:20px;border-left:3px solid #b58a43}.preference-deviations li{margin-bottom:8px}

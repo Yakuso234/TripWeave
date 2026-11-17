@@ -68,6 +68,12 @@ async def test_morning_afternoon_evening_same_place_counts_once_but_all_time_acc
 
 async def test_each_exceeded_metric_has_day_actual_limit_and_precise_segments():
     requirements = req(
+        strict_preferences=[
+            "max_attractions",
+            "max_sightseeing_minutes",
+            "max_sightseeing_ratio",
+            "max_transport_minutes",
+        ],
         max_attractions=0,
         max_sightseeing_minutes=179,
         max_sightseeing_ratio=24.99,
@@ -96,7 +102,9 @@ def test_ratio_denominator_does_not_shrink_with_early_finish_or_expand_with_blan
 
 
 async def test_transport_includes_first_leg_meal_legs_and_hotel_return_and_next_day_origin():
-    requirements = req(days=2, max_transport_minutes=29)
+    requirements = req(
+        days=2, max_transport_minutes=29, strict_preferences=["max_transport_minutes"]
+    )
     plan = Itinerary(
         summary="测试",
         hotel_id="h",

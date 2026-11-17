@@ -35,6 +35,7 @@ def visit(cid="a", pid="poi-a", windows=None, **kwargs):
 
 def requirements(constraints=(), **changes):
     values = {
+        "strict_preferences": ["start_time", "end_time"],
         "days": 2,
         "start_time": "09:00",
         "end_time": "20:30",

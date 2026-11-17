@@ -428,7 +428,7 @@ test('time requirements save alternative days and preserve other requirements wi
   assert.equal(h.visibleFieldsValid(), true);
   assert.equal(h.canAccept(), false);
   const html = h.preferences();
-  assert.match(html,/完整游玩时段必须落在所填窗口内/);
+  assert.match(html,/完整游玩须在窗口内并达到所填时长/);
   assert.match(html,/任选一天/);
   let saved;
   h.context.fetch = async (url, options) => {
@@ -569,14 +569,14 @@ test('four pacing controls are optional and distinguish cleared values from expl
   h.S.step = 2;
   const html = h.preferences();
   for (const key of ['max_attractions','max_sightseeing_minutes','max_sightseeing_ratio','max_transport_minutes']) {
-    assert.match(html,new RegExp(`data-field="${key}"[^>]*placeholder="留空不限"`));
+    assert.match(html,new RegExp(`data-field="${key}"[^>]*placeholder="留空不设目标"`));
     h.listeners.input({target:{dataset:{field:key},type:'number',value:'0'}});
     assert.equal(h.S.draft[key],0);
     h.listeners.input({target:{dataset:{field:key},type:'number',value:''}});
     assert.equal(h.S.draft[key],null);
   }
   assert.doesNotMatch(html,/data-field="max_activities"|每日活动上限/);
-  assert.match(html,/固定窗口/);
+  assert.match(html,/固定窗口|分母不因方案调整而改变/);
   h.S.travelProfile = {values:copy(h.S.draft)};
   assert.match(h.profile(),/name="max_transport_minutes"/);
   assert.match(h.profile(),/name="max_sightseeing_ratio"/);
@@ -944,4 +944,64 @@ test('switching trips clears execution drafts and viewing completed runs never a
   h.adoptTrip({id:'new-trip',requirements:copy(requirements),requirements_revision:1,accepted_version:0,accepted_plan:null});
   assert.equal(h.S.planningRuns.length,0);
   assert.equal(h.S.planningRunsOpen,false);
+});
+
+
+test('every preference step exposes the same escaped extra requirements and expected-money labels', () => {
+  const h=harness();
+  h.changeDraft('notes','必须保留景点 <script>bad()</script>');
+  for (const step of [1,2,3]) {
+    h.S.step=step;
+    const html=h.preferences();
+    assert.equal((html.match(/data-field="notes"/g)||[]).length,1);
+    assert.match(html,/额外要求与不可突破条件/);
+    assert.match(html,/&lt;script&gt;bad\(\)&lt;\/script&gt;/);
+    assert.doesNotMatch(html,/<script>/);
+    if(step===1)assert.match(html,/整趟期望金额/);
+    if(step===3)assert.match(html,/住宿期望金额/);
+  }
+  assert.equal(h.S.trip.requirements.notes,'');
+});
+
+test('explicit strict choices survive navigation and can be independently removed', () => {
+  const h=harness();
+  const input=(key,checked)=>h.listeners.input({target:{dataset:{strictPreference:key},type:'checkbox',checked}});
+  input('max_transport_minutes',true);input('end_time',true);
+  assert.deepEqual(copy(h.S.draft.strict_preferences),['max_transport_minutes','end_time']);
+  h.S.step=2;
+  assert.match(h.preferences(),/data-strict-preference="max_transport_minutes" checked/);
+  assert.match(h.preferences(),/data-strict-preference="end_time" checked/);
+  input('max_transport_minutes',false);
+  assert.deepEqual(copy(h.S.draft.strict_preferences),['end_time']);
+  assert.equal(h.canAccept(),false);
+  assert.equal(h.S.trip.requirements.strict_preferences,undefined);
+});
+
+test('soft deviations remain visible without being hard conflicts and provider text is escaped', () => {
+  const h=harness();
+  h.S.candidate.preference_policy='soft_targets_v1';
+  h.S.candidate.preference_deviations=[{message:'交通107分钟，期望90分钟 <img onerror=bad>'}];
+  h.S.candidate.daily_metrics=[{day:1,attraction_count:1,sightseeing_minutes:60,sightseeing_ratio:10,transport_minutes:107,
+    available_minutes:690,strict_preferences:['max_attractions'],limits:{max_attractions:2,max_sightseeing_minutes:90,max_sightseeing_ratio:20,max_transport_minutes:90}}];
+  const html=h.itinerary();
+  assert.match(html,/与期望目标的差异/);
+  assert.match(html,/107分钟，期望90分钟 &lt;img onerror=bad&gt;/);
+  assert.match(html,/实际 \/ 期望/);
+  assert.match(html,/2个 · 不可调整/);
+  assert.equal(h.canAccept(),true);
+});
+
+test('profile submission retains multiple strict choices instead of the last checkbox only', async () => {
+  const h=harness();
+  h.S.travelProfile={revision:2,values:copy(requirements)};
+  h.context.FormData=class {
+    *[Symbol.iterator](){yield* [['hotel_budget','450'],['max_attractions','2'],['max_sightseeing_minutes',''],['max_sightseeing_ratio',''],['max_transport_minutes','90'],['strict_preferences','max_attractions'],['strict_preferences','max_transport_minutes']];}
+    getAll(name){return [...this].filter(([key])=>key===name).map(([,value])=>value);}
+  };
+  let sent;
+  h.context.fetch=async(url,options)=>{sent=JSON.parse(options.body);return {ok:true,json:async()=>({revision:3,values:sent.values})};};
+  await h.listeners.submit({target:{id:'travel-profile'},preventDefault(){}});
+  assert.deepEqual(sent.values.strict_preferences,['max_attractions','max_transport_minutes']);
+  assert.equal(sent.values.max_transport_minutes,90);
+  assert.equal(sent.values.max_sightseeing_minutes,null);
 });

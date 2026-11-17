@@ -8,6 +8,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .planning_contracts import VisitConstraint
 
 Clock = Annotated[str, Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")]
+StrictPreference = Literal[
+    "max_attractions",
+    "max_sightseeing_minutes",
+    "max_sightseeing_ratio",
+    "max_transport_minutes",
+    "start_time",
+    "end_time",
+]
 
 
 def minutes(value: str) -> int:
@@ -25,6 +33,11 @@ class AttractionSelection(BaseModel):
 
 
 class TravelPreferences(BaseModel):
+    strict_preferences: list[StrictPreference] = Field(
+        default_factory=list,
+        max_length=6,
+        description="用户明确锁定的数值或每日时间要求；其他数值为期望目标，允许解释偏离",
+    )
     hotel_budget: int = Field(default=450, ge=100, le=5000)
     hotel_preference: Literal["balanced", "value", "riverside"] = "balanced"
     pace: Literal["relaxed", "balanced", "full"] = "balanced"
@@ -38,26 +51,26 @@ class TravelPreferences(BaseModel):
         default=3,
         ge=0,
         le=20,
-        description="每日不同景点/体验地点数量上限；同地点分段只计一个，空值不限",
+        description="每日不同景点/体验地点期望数量；同地点分段只计一个，空值不设目标；仅strict_preferences明确锁定时为上限",
     )
     max_sightseeing_minutes: int | None = Field(
         default=None,
         ge=0,
         le=1440,
-        description="每日activity和booking实际游玩时段累计分钟上限；空值不限",
+        description="每日实际游玩累计分钟期望值；空值不设目标；仅明确锁定时为上限",
     )
     max_sightseeing_ratio: float | None = Field(
         default=None,
         ge=0,
         le=100,
         allow_inf_nan=False,
-        description="每日游玩分钟占用户start_time到end_time固定窗口的百分比上限，0至100；空值不限",
+        description="每日游玩占原始出发至结束固定窗口的期望百分比；仅明确锁定时为上限",
     )
     max_transport_minutes: int | None = Field(
         default=None,
         ge=0,
         le=1440,
-        description="每日全部地图路段耗时累计分钟上限，含首段和回酒店，不含额外缓冲；空值不限",
+        description="每日地图交通累计分钟期望值，含首段和回酒店，不含缓冲；仅明确锁定时为上限",
     )
 
     @model_validator(mode="before")
@@ -80,14 +93,19 @@ class Requirements(TravelPreferences):
     days: int = Field(default=1, ge=1, le=7)
     nights: int | None = Field(default=None, ge=0, le=6)
     party_size: int = Field(default=2, ge=1, le=6)
-    budget_total: int = Field(default=3000, ge=100, le=100000)
+    budget_total: int = Field(
+        default=3000,
+        ge=100,
+        le=100000,
+        description="全体人数整趟期望金额，不是最高承诺；硬性金额要求在notes明确",
+    )
     hotel_id: str | None = None
     origin_query: str = Field(default="人民广场", max_length=200)
     start_time: Clock = Field(
-        default="09:00", description="每天从当天起点出发的时刻，目的地当地时间"
+        default="09:00", description="每日期望出发时刻；仅明确锁定时不可提前，目的地当地时间"
     )
     end_time: Clock = Field(
-        default="20:30", description="每日所有站点结束的最晚边界，目的地当地时间"
+        default="20:30", description="每日期望结束时刻；仅明确锁定时为最晚边界，目的地当地时间"
     )
     must_visit: list[Annotated[str, Field(min_length=1, max_length=80)]] = Field(
         default_factory=list, max_length=5

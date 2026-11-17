@@ -1,6 +1,6 @@
 # 草稿优先与结构化查询
 
-更新：2026-11-17。本轮复用现有 LangGraph、Pydantic AI、SQLite 和三个业务角色，不新增框架或 Agent。草稿优先协议421项Python/48项Node通过；一次真实测试已保存草稿与清单，但180秒超时，没有可接受方案，详见[真实记录](evaluations/DRAFT_FIRST_LIVE_20261117.md)与[QA](evaluations/V02_QA.md)。不沿用旧真实流程的成功率或费用作为新版效果。
+更新：2026-11-17。本轮复用现有 LangGraph、Pydantic AI、SQLite 和三个业务角色，不新增框架或 Agent。草稿优先协议435项Python/52项Node通过；一次真实测试已保存草稿与清单，但180秒超时，没有可接受方案，详见[真实记录](evaluations/DRAFT_FIRST_LIVE_20261117.md)与[QA](evaluations/V02_QA.md)。不沿用旧真实流程的成功率或费用作为新版效果。
 
 ## 一次规划怎么执行
 
@@ -82,3 +82,5 @@ API 在长调用前创建 `planning_runs`，绑定旅行ID、需求修订号、�
 `GET /api/trips/{trip_id}/planning-runs` 返回执行记录；页面可查看首稿、查询清单/结果和未完成情况。旧候选仍可查看，不伪造新的首稿或查询明细。新增模型用量字段 `phase` 将轮次标为 `first_draft/revision/research/review/review_response`，并与查询日志的 `model_round` 对照。
 
 正常返回或捕获错误可保存阶段状态；这不是 LangGraph checkpoint、后台任务、自动续跑或任意节点恢复。进程被强制结束时，最后已落盘的草稿可查看，尚未完成的动作不会自动继续。尚无网页正文读取或新版可接受行程的真实验收，不能把历史流程的测试结果迁移过来。同POI衔接按本地0分钟处理，无需声明查自身路线；附近找店、实际步行与缓冲仍须安排。
+
+2026-11-17新增[软硬要求分类](REQUIREMENT_POLICY.md)：普通节奏/作息/金额为期望，偏离不直接进入validation_issues；锁定数值/时间、固定景点与预约、实际衔接仍严格检查。preference_deviations随候选保存并传Reviewer，summary由模型解释具体取舍。没有增加Agent或前置模型调用，只有离线与页面验证，未新增真实规划。

@@ -82,7 +82,9 @@ async def test_unresolved_booking_is_returned_without_calling_deepseek(pois):
 @pytest.mark.asyncio
 async def test_basic_plans_real_adapter_results_and_reacts_to_input():
     transport = httpx2.MockTransport(handler)
-    req = Requirements(date="2026-11-07", days=2, booking_query="上海博物馆")
+    req = Requirements(
+        date="2026-11-07", days=2, booking_query="上海博物馆", strict_preferences=["start_time"]
+    )
     first = await run_plan(req, "basic", configured(), transport=transport)
     assert first["status"] == "ready", first
     assert first["hotel"]["name"] == "接口返回的酒店"
@@ -141,7 +143,10 @@ async def test_deepseek_contract_feedback_and_usage(
     repair, request_limit, outside_scope, booking_case
 ):
     req = Requirements(
-        date="2026-11-07", days=2, booking_query="上海博物馆" if booking_case else ""
+        date="2026-11-07",
+        days=2,
+        booking_query="上海博物馆" if booking_case else "",
+        strict_preferences=["start_time"],
     )
     seed = await run_plan(req, "basic", configured(), transport=httpx2.MockTransport(handler))
     assert seed["status"] == "ready", seed["issues"]
