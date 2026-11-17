@@ -150,3 +150,6 @@ Get-Content tests/frontend_state.cjs -Raw | node
 
 
 DeepSeek官方端点显式使用max_tokens（不发送OpenAI默认的max_completion_tokens）；用量记录同时保存output_limit_parameter。配置值与供应商实际执行上限仍需实测核对，不能将SDK设置视为已生效证明。
+
+
+修正DeepSeek字段后一次真实请求证实max_tokens=6000生效：输出6000且全部为思考、finish_reason=length，未生成首稿；当前max强度下该样本预算不足，不能将38秒截断称规划提速。[实测记录](docs/evaluations/MAX_TOKENS_6000_LIVE_20261117.md)。

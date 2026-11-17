@@ -340,3 +340,8 @@ cd3da0e先推送再单个/plan，新prefix独占dispatch，沿用旧输入仅补
 ### 2026-11-17 DeepSeek输出限制字段适配（离线）
 
 官方端点及/v1的OpenAIModelProfile显式openai_chat_supports_max_completion_tokens=False，SDK实际发送max_tokens；普通自定义兼容地址保留原默认。规划/研究/校验实际HTTP模拟断言只出现max_tokens，思考max/high/max及6000/4000/6000不变。用量记录新增output_limit_parameter字符串，无请求正文或思考泄漏；SQLite保存该记录。新增v1端点和finish_reason=length且只有思考的响应，确认incomplete而非ready，同时保留可计费用量。467Python通过/4PostgreSQL跳过，Ruff/格式/diff通过，前端未改不重复计55Node。真实字段是否生效和6000是否足够须本次授权的唯一测试判断，不靠离线模拟声称供应商遵守。官方依据https://api-docs.deepseek.com/api/create-chat-completion/，未改提示词/强度或数值预算。
+
+
+### 2026-11-17 max_tokens=6000唯一实测
+
+ffd9214先push再单个/plan，input/model/thinking/budget与stage-prompts样本相等；实际max_tokens6000。38.385秒incomplete，模型35.247秒、HTTP1/完整1/SDK1，输入8540含cache8320、输出6000全为思考，finish_reason=length。无draft、研究或Reviewer，非300秒或业务约束耗尽；地图6/搜索0，SQLite1run/0站/1candidate/accepted0。按记录价表完整模型估算0.02438640元，不含地图未对账；本次失败不能称单位可用方案降本。保留原额度和强度，未追加提高预算或再测。详见[MAX_TOKENS_6000_LIVE](MAX_TOKENS_6000_LIVE_20261117.md)。
