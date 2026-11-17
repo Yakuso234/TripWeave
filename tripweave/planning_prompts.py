@@ -42,5 +42,10 @@ def planner_instructions(phase: Literal["first_draft", "revision", "review_respo
     if phase == "revision":
         return REQUIREMENT_POLICY + REVISION_INSTRUCTIONS
     if phase == "review_response":
-        return REQUIREMENT_POLICY + REVISION_INSTRUCTIONS + REVIEW_RESPONSE_INSTRUCTIONS
+        # Negotiation has a different output contract; don't present both.
+        rules = REVISION_INSTRUCTIONS.replace(
+            "修订阶段输出DraftProposal：完整draft、query_requests查询清单、information_needs关键缺口、assumptions暂定事项。没有普通工具可调用。\n",
+            "",
+        )
+        return REQUIREMENT_POLICY + rules + REVIEW_RESPONSE_INSTRUCTIONS
     raise ValueError(f"Unknown planner phase: {phase}")

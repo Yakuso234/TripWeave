@@ -144,3 +144,6 @@ Get-Content tests/frontend_state.cjs -Raw | node
 
 
 首稿、证据修订与校验协商使用分阶段提示词，首稿先提交完整暂定安排与待查清单；最终物理可行性与硬要求校验不放宽，见docs/PROMPTS_CURRENT.md。
+
+
+分阶段提示词的一次真实同输入对照：首稿120.8秒，完整流程仍300秒超时，研究后修订未完整返回，尚无最终方案；[完整记录](docs/evaluations/STAGE_PROMPTS_LIVE_20261117.md)。

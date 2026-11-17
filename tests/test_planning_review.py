@@ -63,6 +63,7 @@ async def negotiate(*, reports=None, response=None, req=None, limit=6, repair=No
                 if message["role"] == "system"
             )
             assert "使用respond_to_review输出合同" in system
+            assert "修订阶段输出DraftProposal" not in system
             assert "只输出计划或资料请求" not in system
             return completion("respond_to_review", response, len(calls))
         assert names == {"draft_proposal"}

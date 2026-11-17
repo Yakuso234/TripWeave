@@ -50,6 +50,7 @@ async def test_actual_requests_use_first_draft_then_evidence_revision_instructio
 def test_review_response_keeps_authority_rules_and_uses_its_own_contract():
     instructions = planner_instructions("review_response")
     assert "使用respond_to_review输出合同" in instructions
+    assert "修订阶段输出DraftProposal" not in instructions
     assert "提交前逐天自查计数" in instructions
     assert "本阶段只提出" not in instructions
     assert "需求分为三类" in instructions
