@@ -4,6 +4,7 @@ import json
 
 import httpx2
 import pytest
+from draft_helpers import packet, reply
 from pydantic import ValidationError
 from review_mock import with_approved_review
 from test_real_planner import configured, handler, poi
@@ -276,45 +277,17 @@ async def test_map_client_remains_open_during_final_model_validation(monkeypatch
 
     monkeypatch.setattr(planner, "validate", check_client)
 
+    model_calls = []
+
     def provider(request):
         if request.url.host != "api.deepseek.com":
             return handler(request)
         body = json.loads(request.content)
-        output_name = next(
-            t["function"]["name"]
-            for t in body["tools"]
-            if t["function"]["name"] not in ("lookup_places", "route", "nearby_restaurants")
-        )
-        return httpx2.Response(
-            200,
-            json={
-                "id": "test-completion",
-                "object": "chat.completion",
-                "created": 1,
-                "model": "deepseek-flash",
-                "choices": [
-                    {
-                        "index": 0,
-                        "finish_reason": "tool_calls",
-                        "message": {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": "call-output",
-                                    "type": "function",
-                                    "function": {
-                                        "name": output_name,
-                                        "arguments": json.dumps(output),
-                                    },
-                                }
-                            ],
-                        },
-                    }
-                ],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            },
-        )
+        model_calls.append(body)
+        assert {tool["function"]["name"] for tool in body["tools"]} == {"draft_proposal"}
+        prompt = json.loads(body["messages"][-1]["content"])
+        proposal = packet(output) if prompt["task"] == "first_draft" else packet(output, queries=[])
+        return reply("draft_proposal", proposal, len(model_calls))
 
     result = await planner.run_plan(
         req,
@@ -324,3 +297,4 @@ async def test_map_client_remains_open_during_final_model_validation(monkeypatch
     )
     assert result["status"] == "ready", result["error"]
     assert validations == [False]
+    assert len(model_calls) == 2

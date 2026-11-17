@@ -67,6 +67,17 @@ candidates = Table(
     Column("trip_id", Text, nullable=False),
     Column("body", Text, nullable=False),
 )
+planning_runs = Table(
+    "planning_runs",
+    metadata,
+    Column("id", String(32), primary_key=True),
+    Column("trip_id", Text, ForeignKey("trips.id"), nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Column("body", Text, nullable=False),
+)
+planning_run_index = Index(
+    "ix_planning_runs_trip_time", planning_runs.c.trip_id, planning_runs.c.created_at
+)
 trip_events = Table(
     "trip_events",
     metadata,
@@ -139,7 +150,7 @@ class Store:
         with self._transaction() as connection:
             metadata.create_all(connection)
             # create_all does not add new indexes on an already existing table.
-            for index in (candidate_index, event_index, event_candidate_index):
+            for index in (candidate_index, event_index, event_candidate_index, planning_run_index):
                 index.create(connection, checkfirst=True)
 
     def dispose(self) -> None:
@@ -486,6 +497,150 @@ class Store:
                 candidate_id=candidate["id"],
             )
         return candidate
+
+    def start_planning_run(
+        self, trip_id: str, requirements_revision: int, base_version: int
+    ) -> dict:
+        """Create an execution record, without consuming an accepted-plan version."""
+        with self._transaction() as connection:
+            _, trip = self._read(connection, trip_id)
+            if (trip["requirements_revision"], trip["accepted_version"]) != (
+                requirements_revision,
+                base_version,
+            ):
+                raise StoreError(409, "需求或已接受行程已更新，请重新开始规划。")
+            timestamp = now()
+            run = {
+                "id": uuid4().hex,
+                "trip_id": trip_id,
+                "requirements_revision": requirements_revision,
+                "base_version": base_version,
+                "requirements": trip["requirements"],
+                "status": "running",
+                "outcome": None,
+                "phase": "preparing",
+                "draft": None,
+                "query_requests": [],
+                "pending_information": [],
+                "assumptions": [],
+                "query_log": [],
+                "places": [],
+                "issues": [],
+                "candidate_id": None,
+                "error": None,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }
+            connection.execute(
+                planning_runs.insert().values(
+                    id=run["id"],
+                    trip_id=trip_id,
+                    created_at=timestamp,
+                    body=encode(run),
+                )
+            )
+        return run
+
+    def _read_planning_run(self, connection, trip_id: str, run_id: str) -> tuple[str, dict]:
+        body = connection.execute(
+            select(planning_runs.c.body).where(
+                planning_runs.c.id == run_id,
+                planning_runs.c.trip_id == trip_id,
+            )
+        ).scalar_one_or_none()
+        if body is None:
+            raise StoreError(404, "规划执行记录不存在")
+        return body, json.loads(body)
+
+    def _replace_planning_run(self, connection, old_body: str, run: dict):
+        run["updated_at"] = now()
+        changed = connection.execute(
+            update(planning_runs)
+            .where(
+                planning_runs.c.id == run["id"],
+                planning_runs.c.body == old_body,
+            )
+            .values(body=encode(run))
+        )
+        if changed.rowcount != 1:
+            raise StoreError(409, "规划执行记录已更新，请重新读取。")
+
+    def save_planning_draft(self, trip_id: str, run_id: str, progress: dict) -> dict:
+        """Persist a draft immediately; model data cannot replace immutable run bindings."""
+        fields = (
+            "draft",
+            "query_requests",
+            "pending_information",
+            "assumptions",
+            "query_log",
+            "places",
+            "phase",
+        )
+        with self._transaction() as connection:
+            old_body, run = self._read_planning_run(connection, trip_id, run_id)
+            if run["status"] != "running":
+                raise StoreError(409, "本次规划已经结束，不能覆盖草稿。")
+            run.update({key: progress[key] for key in fields if key in progress})
+            self._replace_planning_run(connection, old_body, run)
+        return run
+
+    def finish_planning_run(
+        self, trip_id: str, run_id: str, result: dict | None = None, *, error: str | None = None
+    ) -> dict:
+        with self._transaction() as connection:
+            old_body, run = self._read_planning_run(connection, trip_id, run_id)
+            if run["status"] != "running":
+                return run
+            if result is not None:
+                if result["trip_id"] != trip_id or (
+                    result["requirements_revision"],
+                    result["base_version"],
+                ) != (run["requirements_revision"], run["base_version"]):
+                    raise StoreError(409, "规划结果与执行记录依据不一致。")
+                run["candidate_id"] = result["id"]
+                run["outcome"] = result.get("outcome", result["status"])
+                run["status"] = "completed" if run["outcome"] == "ready" else "incomplete"
+                # A successful result may contain only itinerary; keep it inspectable
+                # as an execution snapshot while acceptance still uses candidates.
+                run["draft"] = result.get("itinerary") or result.get("draft") or run["draft"]
+                for key in (
+                    "query_log",
+                    "query_requests",
+                    "pending_information",
+                    "assumptions",
+                    "places",
+                    "issues",
+                ):
+                    if key in result:
+                        run[key] = result[key]
+                run["error"] = result.get("error")
+                run["phase"] = "finished"
+            else:
+                run.update(
+                    status="interrupted",
+                    outcome="incomplete",
+                    phase="interrupted",
+                    error=error or "本次规划已中断，已保存的草稿仍可查看。",
+                )
+            self._replace_planning_run(connection, old_body, run)
+        return run
+
+    def list_planning_runs(self, trip_id: str) -> list[dict]:
+        with self._transaction() as connection:
+            self._read(connection, trip_id)
+            bodies = (
+                connection.execute(
+                    select(planning_runs.c.body)
+                    .where(
+                        planning_runs.c.trip_id == trip_id,
+                    )
+                    .order_by(planning_runs.c.created_at.desc(), planning_runs.c.id.desc())
+                    .limit(20)
+                )
+                .scalars()
+                .all()
+            )
+        return [json.loads(body) for body in bodies]
 
     def get_candidate(self, trip_id: str, candidate_id: str) -> dict:
         with self._transaction() as connection:

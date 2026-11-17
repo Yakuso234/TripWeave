@@ -887,3 +887,61 @@ test('research diagnostics are escaped and absent from untouched legacy records'
   assert.match(html,/&lt;script&gt;/);
   assert.doesNotMatch(html,/<img src=x|<script>bad/);
 });
+test('saved planning runs load without replacing candidates or enabling acceptance', async () => {
+  const h=harness();
+  h.S.candidate=null;
+  h.context.fetch=async (url,options)=>{
+    assert.equal(url,'/api/trips/trip-1/planning-runs');
+    assert.equal(options.method,'GET');
+    return {ok:true,json:async()=>({runs:[{id:'run-1',trip_id:'trip-1',requirements:copy(requirements),requirements_revision:1,base_version:0,status:'interrupted',draft:{summary:'首稿已保存',stops:[{day:1,place_id:'p',start_time:'10:00',end_time:'11:00',reason:'开放时间待核实'}]},places:[{id:'p',name:'过程草稿景点'}],query_requests:[{type:'route',origin_id:'o',destination_id:'p',transport:'mixed'}],updated_at:'2026-11-16T03:00:00Z'}]})};
+  };
+  await h.actions['planning-runs']();
+  const html=h.itinerary();
+  assert.match(html,/首稿已保存/);
+  assert.match(html,/开放时间待核实/);
+  assert.match(html,/执行已中断/);
+  assert.match(html,/o → 过程草稿景点/);
+  assert.equal(h.S.candidate,null);
+  assert.equal(h.canAccept(),false);
+  assert.doesNotMatch(html,/data-action="accept"/);
+});
+
+test('execution drafts retain their old input and escape all displayed content', () => {
+  const h=harness(), payload='<img src=x onerror=alert(1)>';
+  h.S.candidate=null;h.S.planningRunsOpen=true;
+  h.S.trip.requirements_revision=2;
+  h.S.planningRuns=[{id:'run-old',requirements:{...copy(requirements),city:'旧目的地'},requirements_revision:1,base_version:0,status:'running',draft:{summary:payload,stops:[{day:1,place_id:'p',start_time:'10:00',end_time:'11:00',reason:payload}]},places:[{id:'p',name:payload}],query_requests:[{type:'route',origin_id:'p',destination_id:'q',reason:payload}],error:payload}];
+  const html=h.itinerary();
+  assert.match(html,/旧目的地/);
+  assert.match(html,/基于旧需求或旧行程/);
+  assert.match(html,/服务已经退出/);
+  assert.match(html,/&lt;img/);
+  assert.doesNotMatch(html,/<img src=x/);
+  assert.equal(h.canAccept(),false);
+});
+
+test('draft-first candidate exposes a provisional draft and structured route result', () => {
+  const h=harness();
+  Object.assign(h.S.candidate,{planning_protocol:'draft_first',status:'conflict',outcome:'incomplete',itinerary:null,draft:{summary:'根据证据待修订',stops:[{day:1,place_id:'p',start_time:'10:00',end_time:'11:00',reason:'路程待核实'}]},assumptions:['营业时间仍待确认'],query_log:[{query:{kind:'route',origin_id:'p',destination_id:'h',transport:'mixed',reason:'核实返回酒店的路段'},status:'ok',cache_hit:true,model_round:1,phase:'first_draft',elapsed_ms:3}]});
+  const html=h.itinerary();
+  assert.match(html,/草稿与定向查询/);
+  assert.match(html,/根据证据待修订/);
+  assert.match(html,/核实返回酒店的路段/);
+  assert.match(html,/模型第 1 轮/);
+  assert.match(html,/营业时间仍待确认/);
+  assert.match(html,/复用已查结果/);
+  assert.match(html,/data-action="accept"[^>]*disabled/);
+  assert.equal(h.canAccept(),false);
+});
+
+test('switching trips clears execution drafts and viewing completed runs never accepts them', () => {
+  const h=harness();
+  h.S.planningRunsOpen=true;
+  h.S.planningRuns=[{id:'old-run',status:'completed',candidate_id:'final-candidate',requirements:copy(requirements),requirements_revision:1,base_version:0,draft:{summary:'流程草稿',stops:[{day:1,place_id:'p',reason:'测试'}]}}];
+  assert.match(h.itinerary(),/最终结果已存入规划记录/);
+  const oldCandidate=h.S.candidate;
+  assert.equal(h.S.candidate,oldCandidate);
+  h.adoptTrip({id:'new-trip',requirements:copy(requirements),requirements_revision:1,accepted_version:0,accepted_plan:null});
+  assert.equal(h.S.planningRuns.length,0);
+  assert.equal(h.S.planningRunsOpen,false);
+});

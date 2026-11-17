@@ -13,6 +13,7 @@ from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.usage import UsageLimits
 
 from .domain import Itinerary
+from .draft_contracts import QueryRequest
 from .planning_contracts import Contract
 
 
@@ -55,6 +56,7 @@ class ReviewDecision(Contract):
 class PlannerReviewResponse(Contract):
     decisions: list[ReviewDecision] = Field(min_length=1, max_length=5)
     revised_itinerary: Itinerary | None = None
+    query_requests: list[QueryRequest] = Field(default_factory=list, max_length=24)
 
     @model_validator(mode="after")
     def consistent_decisions(self):
@@ -90,6 +92,7 @@ RESPONSE_INSTRUCTIONS = (
     "认为有道理则修订，参考所有日期防止新的冲突。只要有revise，返回修订后的完整"
     "revised_itinerary；未受影响安排保留。全部decline则不返回行程，程序原样保留草稿。"
     "不修改必须说明具体用户需求、现有安排或证据为何支持原案，不用泛泛理由。"
+    "修订新增路段或需要餐饮时，用query_requests提交结构化清单，不直接调用普通工具。"
     "这是一轮协商，不直接宣布已通过；程序重新校验，随后校验Agent复核。"
 )
 
@@ -128,7 +131,7 @@ class ReviewSession:
         self.messages = None
 
     async def review(self, context):
-        with self.recorder.role("reviewer"):
+        with self.recorder.role("reviewer"), self.recorder.stage("review"):
             result = await self.agent.run(
                 json.dumps(context, ensure_ascii=False),
                 message_history=self.messages,
@@ -145,18 +148,21 @@ class ReviewSession:
 
     async def respond(self, context):
         # A separate run receives explicit full context, not reviewer private thinking.
-        result = await self.planner.run(
-            json.dumps(
-                {**context, "task": "respond_to_review", "instruction": RESPONSE_INSTRUCTIONS},
-                ensure_ascii=False,
-            ),
-            output_type=ToolOutput(PlannerReviewResponse, name="respond_to_review", strict=False),
-            usage=self.usage,
-            usage_limits=UsageLimits(request_limit=self.settings.max_requests),
-            model_settings={
-                "max_tokens": self.settings.planner_max_tokens,
-                "openai_reasoning_effort": self.settings.planner_effort,
-                "extra_body": {"thinking": {"type": "enabled"}},
-            },
-        )
+        with self.recorder.stage("review_response"):
+            result = await self.planner.run(
+                json.dumps(
+                    {**context, "task": "respond_to_review", "instruction": RESPONSE_INSTRUCTIONS},
+                    ensure_ascii=False,
+                ),
+                output_type=ToolOutput(
+                    PlannerReviewResponse, name="respond_to_review", strict=False
+                ),
+                usage=self.usage,
+                usage_limits=UsageLimits(request_limit=self.settings.max_requests),
+                model_settings={
+                    "max_tokens": self.settings.planner_max_tokens,
+                    "openai_reasoning_effort": self.settings.planner_effort,
+                    "extra_body": {"thinking": {"type": "enabled"}},
+                },
+            )
         return result.output

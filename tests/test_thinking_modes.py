@@ -1,10 +1,11 @@
-"""Verify DeepSeek thinking configuration and history with real SDK HTTP mocks."""
+"""Thinking stays configured while draft-first stages exchange explicit data only."""
 
 import json
 from copy import deepcopy
 
 import httpx2
 import pytest
+from draft_helpers import packet
 from pydantic import ValidationError
 from test_planning_research import fact, sources
 from test_planning_research import final as research_final
@@ -25,7 +26,6 @@ def with_thinking(response, marker):
 def assert_mode(body, effort):
     assert body["thinking"] == {"type": "enabled"}
     assert body["reasoning_effort"] == effort
-    # The SDK must preserve the provider field, not put private thinking in content.
     for message in body["messages"]:
         if message["role"] == "assistant":
             assert "reasoning_content" in message
@@ -33,7 +33,9 @@ def assert_mode(body, effort):
 
 
 @pytest.mark.parametrize("planner,research", [("max", "high"), ("high", "max")])
-async def test_both_roles_think_at_configured_effort_and_keep_reasoning_separate(planner, research):
+async def test_three_roles_think_at_configured_effort_and_only_explicit_context_crosses_stages(
+    planner, research
+):
     counters = {"planner": 0, "research": 0, "reviewer": 0}
     calls = []
 
@@ -43,39 +45,48 @@ async def test_both_roles_think_at_configured_effort_and_keep_reasoning_separate
         if request.url.path.endswith("/tools/search"):
             return sources()
         body = json.loads(request.content)
+        names = tool_names(body)
         role = (
             "reviewer"
-            if "review_report" in tool_names(body)
+            if names == {"review_report"}
             else "research"
-            if "search_place_information" in tool_names(body)
+            if names == {"research_report"}
             else "planner"
         )
         counters[role] += 1
         number = counters[role]
+        assert names == {
+            {
+                "planner": "draft_proposal",
+                "research": "research_report",
+                "reviewer": "review_report",
+            }[role]
+        }
         assert_mode(
             body, research if role == "research" else "max" if role == "reviewer" else planner
         )
-        other = "planner" if role == "research" else "research"
-        assert f"PRIVATE-THINKING-{other}" not in json.dumps(body["messages"])
-        if number > 1:
-            assistants = [m for m in body["messages"] if m["role"] == "assistant"]
-            assert assistants[0]["reasoning_content"] == f"PRIVATE-THINKING-{role}-1"
+        assert "PRIVATE-THINKING" not in json.dumps(body["messages"])
         calls.append(body)
         if role == "reviewer":
-            assert "PRIVATE-THINKING" not in json.dumps(body["messages"])
-            response = completion("review_report", {"summary": "模拟认可", "suggestions": []}, 5)
+            response = completion(
+                "review_report", {"summary": "模拟认可", "suggestions": []}, len(calls)
+            )
         elif role == "research":
-            response = (
-                completion("search_place_information", {"place_id": "p0", "day": 1}, 2)
-                if number == 1
-                else research_final(body, [fact()])
-            )
+            context = json.loads(body["messages"][-1]["content"])
+            assert context["tasks"][0]["sources"]
+            response = research_final(body, [fact()])
         else:
-            response = (
-                completion("request_information", gap(), 1)
-                if number == 1
-                else completion("final_result", itinerary(), 4)
-            )
+            context = json.loads(body["messages"][-1]["content"])
+            if number == 1:
+                assert context["task"] == "first_draft"
+                response = completion(
+                    "draft_proposal", packet(itinerary(), needs=gap()["needs"]), len(calls)
+                )
+            else:
+                assert context["task"] == "revision"
+                assert context["draft"] == itinerary()
+                assert context["planning_facts"][0]["evidence_status"] == "web_reported"
+                response = completion("draft_proposal", packet(itinerary(), queries=[]), len(calls))
         return with_thinking(response, f"PRIVATE-THINKING-{role}-{number}")
 
     settings = configured().model_copy(
@@ -85,54 +96,68 @@ async def test_both_roles_think_at_configured_effort_and_keep_reasoning_separate
         requirements(), "deepseek", settings, transport=httpx2.MockTransport(provider)
     )
     assert result["outcome"] == "ready", result
-    assert counters == {"planner": 2, "research": 2, "reviewer": 1}
-    assert result["usage"]["requests"] == 5
+    assert counters == {"planner": 2, "research": 1, "reviewer": 1}
+    assert result["usage"]["requests"] == 4
     assert result["thinking_configuration"] == {
         "planner": {"enabled": True, "effort": planner},
         "research": {"enabled": True, "effort": research},
         "reviewer": {"enabled": True, "effort": "max"},
     }
     assert "PRIVATE-THINKING" not in json.dumps(result)
-    assert [b["max_completion_tokens"] for b in calls] == [6000, 4000, 4000, 6000, 6000]
+    assert [b["max_completion_tokens"] for b in calls] == [6000, 4000, 6000, 6000]
+    assert [r["phase"] for r in result["usage_observation"]["model_calls"]] == [
+        "first_draft",
+        "research",
+        "revision",
+        "review",
+    ]
 
 
-async def test_planner_tool_and_local_repair_replay_all_thinking_fields():
+async def test_planner_repair_uses_current_draft_and_validation_feedback_not_private_history():
     calls = []
     original = itinerary()
     broken = deepcopy(original)
     broken["stops"][0]["start_time"] = "00:00"
+    planner_calls = 0
 
     def provider(request):
+        nonlocal planner_calls
         if request.url.host != "api.deepseek.com":
             return map_response(request)
         body = json.loads(request.content)
-        assert_mode(body, "max")
-        for message in body["messages"]:
-            if message["role"] == "assistant":
-                assert message["reasoning_content"].startswith("PRIVATE-THINKING-round-")
         calls.append(body)
-        number = len(calls)
-        if "review_report" in tool_names(body):
-            assert "PRIVATE-THINKING" not in json.dumps(body["messages"])
-            response = completion(
-                "review_report", {"summary": "模拟认可", "suggestions": []}, number
+        assert_mode(body, "max")
+        assert "PRIVATE-THINKING" not in json.dumps(body["messages"])
+        names = tool_names(body)
+        if names == {"review_report"}:
+            reply = completion(
+                "review_report", {"summary": "模拟认可", "suggestions": []}, len(calls)
             )
-        elif number == 1:
-            response = completion("lookup_places", {}, number)
-        elif number == 2:
-            response = completion("final_result", broken, number)
         else:
-            assert "revise_days" in tool_names(body)
-            response = completion("revise_days", {"stops": original["stops"]}, number)
-        return with_thinking(response, f"PRIVATE-THINKING-round-{number}")
+            assert names == {"draft_proposal"}
+            planner_calls += 1
+            context = json.loads(body["messages"][-1]["content"])
+            if planner_calls == 1:
+                answer = packet(original)
+            elif planner_calls == 2:
+                assert context["draft"] == original
+                assert context["evidence_results"]
+                answer = packet(broken, queries=[])
+            else:
+                assert context["draft"] == broken
+                assert context["validation_issues"][0]["code"] == "connection"
+                assert context["revision_days"] == [1]
+                answer = packet(original, queries=[])
+            reply = completion("draft_proposal", answer, len(calls))
+        return with_thinking(reply, f"PRIVATE-THINKING-stage-{len(calls)}")
 
     result = await run_plan(
         requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
     )
     assert result["outcome"] == "ready", result
-    assert len(calls) == 4 and result["usage"]["requests"] == 4
+    assert len(calls) == result["usage"]["requests"] == 4
     assert result["usage_observation"]["model_http_attempts"] == 4
-    assert [row["role"] for row in result["usage_observation"]["model_calls"]] == [
+    assert [r["role"] for r in result["usage_observation"]["model_calls"]] == [
         "planner",
         "planner",
         "planner",

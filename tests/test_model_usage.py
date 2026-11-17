@@ -5,6 +5,7 @@ import json
 
 import httpx2
 import pytest
+from draft_helpers import packet
 from fastapi.testclient import TestClient
 from test_planning_research import fact, sources
 from test_planning_research import final as research_final
@@ -34,7 +35,7 @@ async def test_role_requests_tokens_and_limits_match_supplier_without_double_cou
             "reviewer"
             if "review_report" in tool_names(body)
             else "research"
-            if "search_place_information" in tool_names(body)
+            if "research_report" in tool_names(body)
             else "planner"
         )
         roles[role] += 1
@@ -43,16 +44,13 @@ async def test_role_requests_tokens_and_limits_match_supplier_without_double_cou
             reply = completion("review_report", {"summary": "模拟认可", "suggestions": []}, n)
         elif role == "planner":
             reply = (
-                completion("request_information", gap(), n)
+                completion("draft_proposal", packet(itinerary(), needs=gap()["needs"]), n)
                 if roles[role] == 1
-                else completion("final_result", itinerary(), n)
+                else completion("draft_proposal", packet(itinerary(), queries=[]), n)
             )
         else:
-            reply = (
-                completion("search_place_information", {"place_id": "p0", "day": 1}, n)
-                if roles[role] == 1
-                else research_final(body, [fact()])
-            )
+            assert tool_names(body) == {"research_report"}
+            reply = research_final(body, [fact()])
         data = reply.json()
         data["usage"] = {
             "prompt_tokens": n * 100,
@@ -72,16 +70,16 @@ async def test_role_requests_tokens_and_limits_match_supplier_without_double_cou
         requirements(), "deepseek", settings, transport=httpx2.MockTransport(provider)
     )
     assert result["outcome"] == "ready", result
-    assert result["usage"] == {"requests": 5, "input_tokens": 1500, "output_tokens": 150}
+    assert result["usage"] == {"requests": 4, "input_tokens": 1000, "output_tokens": 100}
     observation = result["usage_observation"]
-    assert observation["model_http_attempts"] == 5 and observation["usage_complete"]
+    assert observation["model_http_attempts"] == 4 and observation["usage_complete"]
     rows = observation["model_calls"]
-    assert [r["role"] for r in rows] == ["planner", "research", "research", "planner", "reviewer"]
-    assert [r["input_tokens"] for r in rows] == [100, 200, 300, 400, 500]
-    assert [r["max_output_tokens"] for r in rows] == [7000, 5000, 5000, 7000, 6000]
-    assert [body["max_completion_tokens"] for body in bodies] == [7000, 5000, 5000, 7000, 6000]
+    assert [r["role"] for r in rows] == ["planner", "research", "planner", "reviewer"]
+    assert [r["input_tokens"] for r in rows] == [100, 200, 300, 400]
+    assert [r["max_output_tokens"] for r in rows] == [7000, 5000, 7000, 6000]
+    assert [body["max_completion_tokens"] for body in bodies] == [7000, 5000, 7000, 6000]
     assert all(r["reasoning_tokens"] == 3 and r["cache_read_tokens"] == 20 for r in rows)
-    assert [r["cache_miss_tokens"] for r in rows] == [80, 180, 280, 380, 480]
+    assert [r["cache_miss_tokens"] for r in rows] == [80, 180, 280, 380]
     assert all(r["finish_reason"] == "tool_calls" and r["elapsed_ms"] >= 0 for r in rows)
     assert "PRIVATE-REASONING" not in json.dumps(observation)
     assert all(
@@ -91,6 +89,7 @@ async def test_role_requests_tokens_and_limits_match_supplier_without_double_cou
             "started_at",
             "model",
             "role",
+            "phase",
             "status",
             "max_output_tokens",
             "input_tokens",
@@ -130,15 +129,22 @@ async def test_role_requests_tokens_and_limits_match_supplier_without_double_cou
 
 
 async def test_missing_provider_usage_is_unknown_not_zero():
+    planner_calls = 0
+
     def provider(request):
+        nonlocal planner_calls
         if request.url.host != "api.deepseek.com":
             return map_response(request)
         body = json.loads(request.content)
-        data = (
-            completion("review_report", {"summary": "模拟认可", "suggestions": []}, 2).json()
-            if "review_report" in tool_names(body)
-            else completion("final_result", itinerary(), 1).json()
-        )
+        if "review_report" in tool_names(body):
+            data = completion("review_report", {"summary": "模拟认可", "suggestions": []}, 3).json()
+        else:
+            planner_calls += 1
+            data = completion(
+                "draft_proposal",
+                packet(itinerary(), queries=None if planner_calls == 1 else []),
+                planner_calls,
+            ).json()
         data.pop("usage")
         return httpx2.Response(200, json=data)
 
@@ -147,7 +153,7 @@ async def test_missing_provider_usage_is_unknown_not_zero():
     )
     observation = result["usage_observation"]
     assert result["outcome"] == "ready"
-    assert observation["model_http_attempts"] == 2 and not observation["usage_complete"]
+    assert observation["model_http_attempts"] == 3 and not observation["usage_complete"]
     row = observation["model_calls"][0]
     assert row["input_tokens"] is row["output_tokens"] is row["reasoning_tokens"] is None
 

@@ -4,6 +4,7 @@ import json
 
 import httpx2
 import pytest
+from draft_helpers import packet
 from pydantic_ai.usage import RunUsage
 from test_planning_research import QUOTE, completion, fact, final, need, run_research, sources
 from test_planning_workflow import gap, itinerary, map_response, requirements, tool_names
@@ -267,20 +268,21 @@ async def test_unknown_returns_to_planner_and_cannot_be_hidden_for_required_plac
             return planner_completion(
                 "review_report", {"summary": "合成复核通过。", "suggestions": []}, len(calls)
             )
-        if "search_place_information" in names:
-            if len(calls) == 2:
-                return completion([("search_place_information", {"place_id": "p0", "day": 1})])
+        if "research_report" in names:
             return final(
                 body, [{"place_id": "p0", "day": 1, "field": "opening_hours", "status": "unknown"}]
             )
         if len(calls) == 1:
-            return planner_completion("request_information", gap(), len(calls))
+            return planner_completion(
+                "draft_proposal", packet(itinerary(), needs=gap()["needs"]), len(calls)
+            )
         prompt = json.loads(body["messages"][-1]["content"])
         assert prompt["research_feedback"][0]["code"] == "model_unknown_unspecified"
         plan = itinerary()
         if not required:
             plan["stops"][0]["place_id"] = "p1"
-        return planner_completion("final_result", plan, len(calls))
+        queries = None if not required and len(calls) == 3 else []
+        return planner_completion("draft_proposal", packet(plan, queries=queries), len(calls))
 
     req = requirements(selected_attractions=[{"id": "p0", "name": "接口景点0"}] if required else [])
     result = await run_plan(req, "deepseek", configured(), transport=httpx2.MockTransport(provider))

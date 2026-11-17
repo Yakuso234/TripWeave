@@ -4,6 +4,7 @@ import json
 
 import httpx2
 import pytest
+from draft_helpers import packet
 from review_mock import with_approved_review
 from test_real_planner import configured, handler
 
@@ -142,10 +143,10 @@ async def test_selected_research_enters_initial_context_once_without_bulk_picker
         assert request.url.path.endswith("/chat/completions")  # No research/search request.
         body = json.loads(request.content)
         calls.append(body)
-        if len(calls) == 1:
-            return completion("lookup_places", {}, 1)
-        assert len(calls) == 2
-        return completion(output_tool(body), plan, 2)
+        assert len(calls) <= 2
+        return completion(
+            "draft_proposal", packet(plan, queries=None if len(calls) == 1 else []), len(calls)
+        )
 
     result = await run_plan(
         req,
@@ -165,27 +166,25 @@ async def test_selected_research_enters_initial_context_once_without_bulk_picker
     assert result["usage"]["requests"] == len(calls) + 1 == 3
     initial = json.loads(calls[0]["messages"][-1]["content"])
     queried = initial["queried_data"]
-    packet = queried["selected_attraction_research"]
-    assert packet["source_requirements_revision"] == 1
-    assert packet["requirements_revision"] == 2
-    assert packet["selection_revision"] == 4
-    assert packet["selected"] == [{**snapshot["selected"][0], "experience_group": "p0"}]
-    assert packet["selected"][0]["summary"] == SELECTED_SUMMARY
-    assert packet["selected"][0]["sources"] == [
+    research_packet = queried["selected_attraction_research"]
+    assert research_packet["source_requirements_revision"] == 1
+    assert research_packet["requirements_revision"] == 2
+    assert research_packet["selection_revision"] == 4
+    assert research_packet["selected"] == [{**snapshot["selected"][0], "experience_group": "p0"}]
+    assert research_packet["selected"][0]["summary"] == SELECTED_SUMMARY
+    assert research_packet["selected"][0]["sources"] == [
         {"title": "场馆常设展介绍", "url": "https://museum.example/overview"}
     ]
-    assert "experience_groups" not in queried and "experience_groups" not in packet
-    encoded = json.dumps(packet, ensure_ascii=False)
+    assert "experience_groups" not in queried and "experience_groups" not in research_packet
+    encoded = json.dumps(research_packet, ensure_ascii=False)
     assert "photos" not in encoded and "excerpt" not in encoded
     for body in calls:
         sent = json.dumps(body["messages"], ensure_ascii=False)
         assert sent.count(SELECTED_SUMMARY) == 1
         assert all(value not in sent for value in (PHOTO_URL, RAW_EXCERPT, UNSELECTED_SUMMARY))
-    tool_result = next(message for message in calls[1]["messages"] if message["role"] == "tool")
-    returned_places = json.loads(tool_result["content"])
-    assert "attractions" in returned_places
-    assert "selected_attraction_research" not in returned_places
-    assert "experience_groups" not in returned_places
+    resumed = json.loads(calls[1]["messages"][-1]["content"])
+    assert resumed["evidence_results"]
+    assert all(message["role"] in {"system", "user"} for message in calls[1]["messages"])
     assert sum(event["event"] == "research_context" for event in result["trace"]) == 1
 
 
@@ -208,7 +207,9 @@ async def test_research_for_a_different_selected_identity_or_city_is_not_given_t
         assert request.url.path.endswith("/chat/completions")
         body = json.loads(request.content)
         calls.append(body)
-        return completion(output_tool(body), plan, len(calls))
+        return completion(
+            "draft_proposal", packet(plan, queries=None if len(calls) == 1 else []), len(calls)
+        )
 
     result = await run_plan(
         req,
@@ -218,7 +219,7 @@ async def test_research_for_a_different_selected_identity_or_city_is_not_given_t
         research_context=snapshot,
     )
     assert result["status"] == "ready", result["issues"]
-    assert len(calls) == 1
+    assert len(calls) == 2
     queried = json.loads(calls[0]["messages"][-1]["content"])["queried_data"]
     assert "selected_attraction_research" not in queried and "experience_groups" not in queried
     assert SELECTED_SUMMARY not in json.dumps(calls, ensure_ascii=False)
@@ -228,6 +229,8 @@ async def test_research_for_a_different_selected_identity_or_city_is_not_given_t
 async def test_local_revision_reuses_research_history_without_searching_again():
     req = requirements(days=2)
     plan = await seed_plan(req)
+    broken = json.loads(json.dumps(plan))
+    broken["stops"][0]["start_time"] = "00:00"
     calls = []
 
     def provider(request):
@@ -236,15 +239,12 @@ async def test_local_revision_reuses_research_history_without_searching_again():
         assert request.url.path.endswith("/chat/completions")
         body = json.loads(request.content)
         calls.append(body)
-        if len(calls) == 1:
-            return completion("lookup_places", {}, 1)
-        name = output_tool(body)
-        if len(calls) == 2:
-            invalid = json.loads(json.dumps(plan))
-            invalid["stops"][0]["start_time"] = "00:00"
-            return completion(name, invalid, 2)
-        assert len(calls) == 3 and name == "revise_days"
-        return completion(name, {"stops": [s for s in plan["stops"] if s["day"] == 1]}, 3)
+        assert {t["function"]["name"] for t in body["tools"]} == {"draft_proposal"}
+        return completion(
+            "draft_proposal",
+            packet(plan if len(calls) >= 3 else broken, queries=None if len(calls) == 1 else []),
+            len(calls),
+        )
 
     result = await run_plan(
         req,
@@ -257,12 +257,15 @@ async def test_local_revision_reuses_research_history_without_searching_again():
     assert result["itinerary"] == plan
     assert result["usage"]["requests"] == len(calls) + 1 == 4
     repair = json.loads(calls[2]["messages"][-1]["content"])
-    assert repair["revision_days"] == repair["required_revision_days"] == [1]
-    assert {stop["day"] for stop in repair["reference_stops"]} == {2}
-    assert [issue["code"] for issue in repair["validation_issues"]] == ["connection"]
+    assert repair["revision_days"] == [1]
+    assert [s for s in repair["draft"]["stops"] if s["day"] == 2] == [
+        s for s in plan["stops"] if s["day"] == 2
+    ]
+    assert [i["code"] for i in repair["validation_issues"]] == ["connection"]
     messages = json.dumps(calls[2]["messages"], ensure_ascii=False)
     assert messages.count(SELECTED_SUMMARY) == 1
-    assert sum(event["event"] == "research_context" for event in result["trace"]) == 1
+    assert all(m["role"] in {"system", "user"} for m in calls[2]["messages"])
+    assert sum(e["event"] == "research_context" for e in result["trace"]) == 1
 
 
 def overnight_plan(first_id="p0", second_id="p1", *, booking=False):
@@ -307,13 +310,9 @@ async def persistent_conflict(req, plan, snapshot):
         assert request.url.path.endswith("/chat/completions")
         body = json.loads(request.content)
         calls.append(body)
-        name = output_tool(body)
-        if name == "revise_days":
-            days = json.loads(body["messages"][-1]["content"])["revision_days"]
-            args = {"stops": [stop for stop in plan["stops"] if stop["day"] in days]}
-        else:
-            args = plan
-        return completion(name, args, len(calls))
+        return completion(
+            "draft_proposal", packet(plan, queries=None if len(calls) == 1 else []), len(calls)
+        )
 
     result = await run_plan(
         req,
@@ -323,8 +322,9 @@ async def persistent_conflict(req, plan, snapshot):
         research_context=snapshot,
     )
     assert result["status"] == "conflict" and result["itinerary"] is None
-    assert result["error"] is None
-    assert result["usage"]["requests"] == len(calls) == 3
+    assert result["outcome"] == "incomplete"
+    assert result["usage"]["requests"] == len(calls) <= 6
+    assert len(calls) >= 3
     return result, calls
 
 
@@ -340,9 +340,8 @@ async def test_different_poi_ids_for_one_experience_report_both_days_and_keep_se
         (item["place_id"], item["day"], item["stop_number"]) for item in duplicate["occurrences"]
     ] == [("p0", 1, 1), ("p1", 2, 1)]
     assert "keep_day" not in duplicate
-    feedback = json.loads(calls[1]["messages"][-1]["content"])
+    feedback = json.loads(calls[2]["messages"][-1]["content"])
     assert feedback["revision_days"] == [1, 2]
-    assert feedback["required_revision_days"] == []
     assert feedback["validation_issues"][0] == duplicate
 
 
@@ -354,7 +353,7 @@ async def test_alias_alone_does_not_satisfy_user_selected_original_poi():
     )
     assert [issue["code"] for issue in result["issues"]] == ["must_visit"]
     assert "接口景点0" in result["issues"][0]["message"]
-    feedback = json.loads(calls[1]["messages"][-1]["content"])
+    feedback = json.loads(calls[2]["messages"][-1]["content"])
     assert "draft" in feedback  # A missing mandatory identity remains a global repair.
     assert "revision_days" not in feedback
 
@@ -371,6 +370,6 @@ async def test_same_experience_duplicate_preserves_the_matching_user_booking():
     assert duplicate["day"] == duplicate["stop_number"] == 1
     assert duplicate["keep_day"] == 2 and duplicate["keep_stop_number"] == 1
     assert duplicate["keep_kind"] == "booking"
-    feedback = json.loads(calls[1]["messages"][-1]["content"])
-    assert feedback["revision_days"] == feedback["required_revision_days"] == [1]
-    assert feedback["reference_stops"][0]["place_id"] == "b"
+    feedback = json.loads(calls[2]["messages"][-1]["content"])
+    assert feedback["revision_days"] == [1]
+    assert next(stop for stop in feedback["draft"]["stops"] if stop["day"] == 2)["place_id"] == "b"

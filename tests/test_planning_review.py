@@ -5,6 +5,7 @@ from copy import deepcopy
 
 import httpx2
 import pytest
+from draft_helpers import packet
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from test_planning_research import fact, sources
@@ -64,13 +65,19 @@ async def negotiate(*, reports=None, response=None, req=None, limit=6, repair=No
             assert "使用respond_to_review输出合同" in system
             assert "只输出计划或资料请求" not in system
             return completion("respond_to_review", response, len(calls))
-        if "revise_days" in names:
-            return completion(
-                "revise_days", {"stops": (repair or itinerary())["stops"]}, len(calls)
-            )
-        return completion(
-            "final_result", repair if repair and len(calls) > 1 else itinerary(), len(calls)
+        assert names == {"draft_proposal"}
+        context = json.loads(body["messages"][-1]["content"])
+        plan = repair if repair and context["validation_issues"] else itinerary()
+        queries = (
+            None
+            if context["task"] == "first_draft"
+            else [
+                q
+                for issue in context["validation_issues"]
+                for q in issue.get("required_queries", [])
+            ]
         )
+        return completion("draft_proposal", packet(plan, queries=queries), len(calls))
 
     result = await run_plan(
         req or requirements(notes="用户希望轻松慢游。"),
@@ -87,9 +94,10 @@ async def test_clean_review_is_required_before_ready_and_recorded_as_max_role():
     assert result["review"]["status"] == "approved"
     assert result["review"]["initial"] == report()
     assert "final" not in result["review"]
-    assert len(calls) == 2 and len(reviews) == 1
-    assert result["usage"] == {"requests": 2, "input_tokens": 84, "output_tokens": 40}
+    assert len(calls) == 3 and len(reviews) == 1
+    assert result["usage"] == {"requests": 3, "input_tokens": 126, "output_tokens": 60}
     assert [row["role"] for row in result["usage_observation"]["model_calls"]] == [
+        "planner",
         "planner",
         "reviewer",
     ]
@@ -119,9 +127,13 @@ async def test_planner_revision_is_checked_then_reviewed_with_full_context():
     )
     assert result["outcome"] == "ready", result
     assert result["itinerary"] == revised
-    assert result["review"]["planner_response"] == response
-    assert len(calls) == 4 and len(reviews) == 2
+    assert result["review"]["planner_response"] == {
+        **response,
+        "query_requests": response.get("query_requests", []),
+    }
+    assert len(calls) == 5 and len(reviews) == 2
     assert [row["role"] for row in result["usage_observation"]["model_calls"]] == [
+        "planner",
         "planner",
         "reviewer",
         "planner",
@@ -146,7 +158,7 @@ async def test_explained_decline_can_be_accepted_without_changing_any_stop():
     assert result["itinerary"] == itinerary()
     assert result["review"]["planner_response"]["decisions"] == response["decisions"]
     assert result["review"]["final"] == report()
-    assert len(calls) == 4 and len(reviews) == 2
+    assert len(calls) == 5 and len(reviews) == 2
 
 
 async def test_unresolved_disagreement_retains_both_positions_and_draft():
@@ -173,7 +185,7 @@ async def test_unresolved_disagreement_retains_both_positions_and_draft():
             "suggestion_id": "pace-1",
         }
     ]
-    assert len(calls) == 4  # No unbounded self-debate after the final disagreement.
+    assert len(calls) == 5  # No unbounded self-debate after the final disagreement.
 
 
 async def test_planner_may_accept_some_suggestions_and_decline_others():
@@ -192,11 +204,14 @@ async def test_planner_may_accept_some_suggestions_and_decline_others():
     )
     assert result["outcome"] == "ready", result
     assert result["itinerary"] == revised
-    assert result["review"]["planner_response"] == response
-    assert len(calls) == 4
+    assert result["review"]["planner_response"] == {
+        **response,
+        "query_requests": response.get("query_requests", []),
+    }
+    assert len(calls) == 5
 
 
-@pytest.mark.parametrize("limit,stage", [(2, "planner_response"), (3, "final_review")])
+@pytest.mark.parametrize("limit,stage", [(3, "planner_response"), (4, "final_review")])
 async def test_budget_exhaustion_is_incomplete_never_invented_disagreement(limit, stage):
     result, calls, _ = await negotiate(
         reports=[report(suggestion()), report()],
@@ -226,7 +241,7 @@ async def test_invalid_review_location_is_not_shown_as_user_conflict(position):
     assert result["itinerary"] is None and result["draft"] == itinerary()
     assert result["review"]["status"] != "disputed"
     assert "不存在的日期、站序或地点" in result["error"]
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 @pytest.mark.parametrize(
@@ -244,7 +259,7 @@ async def test_planner_cannot_ignore_or_invent_suggestion_ids(decisions):
     assert result["itinerary"] is None
     assert result["review"]["status"] != "disputed"
     assert "未逐条回应原校验意见" in result["error"]
-    assert len(calls) == 3
+    assert len(calls) == 4
 
 
 async def test_review_cannot_authorize_omitting_users_selected_attraction():
@@ -261,7 +276,7 @@ async def test_review_cannot_authorize_omitting_users_selected_attraction():
     assert result["itinerary"] is None
     assert any(issue["code"] == "must_visit" for issue in result["issues"])
     assert len(reviews) == 1  # Program check must stop unsafe plan before final approval.
-    assert len(calls) == 4
+    assert 4 <= len(calls) <= 6
 
 
 @pytest.mark.parametrize(
@@ -302,49 +317,42 @@ async def test_research_planner_and_reviewer_keep_private_thinking_isolated():
         names = tool_names(body)
         role = (
             "research"
-            if "search_place_information" in names
+            if names == {"research_report"}
             else "reviewer"
-            if "review_report" in names
+            if names == {"review_report"}
             else "planner"
         )
         counters[role] += 1
-        count = counters[role]
         calls.append(body)
-        serialized = json.dumps(body["messages"])
-        for other in counters:
-            if other != role:
-                assert f"PRIVATE-THINKING-{other}" not in serialized
+        assert "PRIVATE-THINKING" not in json.dumps(body["messages"])
         assert body["reasoning_effort"] == ("high" if role == "research" else "max")
         if role == "research":
-            reply = (
-                completion("search_place_information", {"place_id": "p0", "day": 1}, len(calls))
-                if count == 1
-                else research_final(body, [fact()])
-            )
+            reply = research_final(body, [fact()])
         elif role == "reviewer":
             context = json.loads(body["messages"][-1]["content"])
             assert context["queried_data"]["planning_facts"][0]["evidence_status"] == "web_reported"
             assert context["program_issues"] == []
             reply = completion("review_report", report(), len(calls))
         else:
-            reply = (
-                completion("request_information", gap(), len(calls))
-                if count == 1
-                else completion("final_result", itinerary(), len(calls))
+            reply = completion(
+                "draft_proposal",
+                packet(itinerary(), needs=gap()["needs"])
+                if counters[role] == 1
+                else packet(itinerary(), queries=[]),
+                len(calls),
             )
         payload = reply.json()
-        payload["choices"][0]["message"]["reasoning_content"] = f"PRIVATE-THINKING-{role}-{count}"
+        payload["choices"][0]["message"]["reasoning_content"] = f"PRIVATE-THINKING-{role}"
         return httpx2.Response(200, json=payload)
 
     result = await run_plan(
         requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
     )
     assert result["outcome"] == "ready", result
-    assert counters == {"planner": 2, "research": 2, "reviewer": 1}
-    assert result["usage"]["requests"] == 5
-    assert [row["role"] for row in result["usage_observation"]["model_calls"]] == [
+    assert counters == {"planner": 2, "research": 1, "reviewer": 1}
+    assert result["usage"]["requests"] == 4
+    assert [r["role"] for r in result["usage_observation"]["model_calls"]] == [
         "planner",
-        "research",
         "research",
         "planner",
         "reviewer",
@@ -391,40 +399,38 @@ def test_disputed_review_survives_sqlite_restart_and_cannot_be_accepted(tmp_path
         assert restarted.post(base + f"/candidates/{candidate['id']}/accept").status_code == 409
 
 
-async def test_review_revision_does_not_create_fourth_candidate_after_three_drafts():
+async def test_review_revision_does_not_create_fourth_candidate_after_three_checked_plans():
     calls, reviews = [], []
     broken = itinerary()
     broken["stops"][0]["start_time"] = "00:00"
+    another = deepcopy(broken)
+    another["stops"][0]["start_time"] = "00:01"
     revised = itinerary()
     revised["stops"][0].update(start_time="10:30", end_time="11:30")
+    planner_calls = 0
 
     def provider(request):
+        nonlocal planner_calls
         if request.url.host != "api.deepseek.com":
             return map_response(request)
         body = json.loads(request.content)
         calls.append(body)
         names = tool_names(body)
-        if "review_report" in names:
+        if names == {"review_report"}:
             reviews.append(body)
             return completion("review_report", report(suggestion()), len(calls))
-        if "respond_to_review" in names:
+        if names == {"respond_to_review"}:
             return completion(
                 "respond_to_review",
-                {
-                    "decisions": [decision(action="revise")],
-                    "revised_itinerary": revised,
-                },
+                {"decisions": [decision(action="revise")], "revised_itinerary": revised},
                 len(calls),
             )
-        if "revise_days" in names:
-            return completion(
-                "revise_days",
-                {
-                    "stops": (broken if len(calls) == 2 else itinerary())["stops"],
-                },
-                len(calls),
-            )
-        return completion("final_result", broken, len(calls))
+        assert names == {"draft_proposal"}
+        planner_calls += 1
+        plan = broken if planner_calls <= 2 else another if planner_calls == 3 else itinerary()
+        return completion(
+            "draft_proposal", packet(plan, queries=None if planner_calls == 1 else []), len(calls)
+        )
 
     result = await run_plan(
         requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
@@ -432,9 +438,8 @@ async def test_review_revision_does_not_create_fourth_candidate_after_three_draf
     assert result["outcome"] == "incomplete", result
     assert result["review"]["pending_stage"] == "candidate_limit"
     assert result["review"]["planner_response"]["revised_itinerary"] == revised
-    assert result["draft"] == itinerary()
-    assert result["itinerary"] is None
-    assert len(reviews) == 1 and len(calls) == 5
+    assert result["draft"] == itinerary() and result["itinerary"] is None
+    assert len(reviews) == 1 and len(calls) == 6
 
 
 async def test_reviewer_unavailable_is_service_error_not_planning_disagreement():
@@ -449,7 +454,16 @@ async def test_reviewer_unavailable_is_service_error_not_planning_disagreement()
             return httpx2.Response(
                 429, json={"error": {"message": "PRIVATE-SUPPLIER-ERROR", "type": "rate_limit"}}
             )
-        return completion("final_result", itinerary(), len(calls))
+        return completion(
+            "draft_proposal",
+            packet(
+                itinerary(),
+                queries=None
+                if json.loads(body["messages"][-1]["content"])["task"] == "first_draft"
+                else [],
+            ),
+            len(calls),
+        )
 
     result = await run_plan(
         requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
@@ -459,7 +473,7 @@ async def test_reviewer_unavailable_is_service_error_not_planning_disagreement()
     assert result["review"]["status"] != "disputed"
     assert "PRIVATE-SUPPLIER-ERROR" not in json.dumps(result)
     rows = result["usage_observation"]["model_calls"]
-    assert len(rows) == 2 and rows[-1]["role"] == "reviewer"
+    assert len(rows) == 3 and rows[-1]["role"] == "reviewer"
     assert rows[-1]["status"] == "http_error" and rows[-1]["http_status"] == 429
 
 
@@ -485,13 +499,22 @@ async def test_reviewer_cannot_call_unexposed_search_or_execution_tool():
                 "Unknown tool name" in str(message.get("content")) for message in body["messages"]
             )
             return completion("review_report", report(), len(calls))
-        return completion("final_result", itinerary(), len(calls))
+        return completion(
+            "draft_proposal",
+            packet(
+                itinerary(),
+                queries=None
+                if json.loads(body["messages"][-1]["content"])["task"] == "first_draft"
+                else [],
+            ),
+            len(calls),
+        )
 
     result = await run_plan(
         requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
     )
     assert result["outcome"] == "ready", result
-    assert review_calls == 2 and len(calls) == result["usage"]["requests"] == 3
+    assert review_calls == 2 and len(calls) == result["usage"]["requests"] == 4
     assert result["research_rounds"] == result["research_search_calls"] == 0
 
 
@@ -523,7 +546,16 @@ async def test_negotiation_handoffs_do_not_share_other_agents_private_thinking()
             assert context["draft"] == itinerary()
             reply = completion("respond_to_review", {"decisions": [decision()]}, len(calls))
         else:
-            reply = completion("final_result", itinerary(), len(calls))
+            reply = completion(
+                "draft_proposal",
+                packet(
+                    itinerary(),
+                    queries=None
+                    if json.loads(body["messages"][-1]["content"])["task"] == "first_draft"
+                    else [],
+                ),
+                len(calls),
+            )
         payload = reply.json()
         payload["choices"][0]["message"]["reasoning_content"] = f"PRIVATE-{role}"
         return httpx2.Response(200, json=payload)
@@ -532,7 +564,7 @@ async def test_negotiation_handoffs_do_not_share_other_agents_private_thinking()
         requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
     )
     assert result["outcome"] == "ready", result
-    assert len(calls) == 4
+    assert len(calls) == 5
     assert "PRIVATE-" not in json.dumps(result)
 
 
@@ -580,8 +612,10 @@ async def test_program_repair_after_review_revision_is_the_plan_seen_by_final_re
     fixed["stops"][0].update(
         start_time="10:30", end_time="11:30", reason="修正错误时刻且遵从慢游偏好。"
     )
+    planner_calls = 0
 
     def provider(request):
+        nonlocal planner_calls
         if request.url.host != "api.deepseek.com":
             return map_response(request)
         body = json.loads(request.content)
@@ -589,7 +623,7 @@ async def test_program_repair_after_review_revision_is_the_plan_seen_by_final_re
         names = tool_names(body)
         context = json.loads(body["messages"][-1]["content"])
         assert context["revision_request"] == revision_request
-        if "review_report" in names:
+        if names == {"review_report"}:
             reviews.append(body)
             if len(reviews) == 2:
                 assert context["draft"] == fixed
@@ -597,18 +631,26 @@ async def test_program_repair_after_review_revision_is_the_plan_seen_by_final_re
             return completion(
                 "review_report", report(suggestion()) if len(reviews) == 1 else report(), len(calls)
             )
-        if "respond_to_review" in names:
+        if names == {"respond_to_review"}:
             return completion(
                 "respond_to_review",
                 {"decisions": [decision(action="revise")], "revised_itinerary": broken},
                 len(calls),
             )
-        if "revise_days" in names:
+        assert names == {"draft_proposal"}
+        planner_calls += 1
+        if planner_calls == 1:
+            assert context["previous_plan"]["revision_request"] == revision_request
+            answer = packet(itinerary())
+        elif planner_calls == 2:
+            assert context["previous_plan"] is None
+            answer = packet(itinerary(), queries=[])
+        else:
             assert context["requirements"]["notes"] == "轻松慢游。"
-            assert context["draft_stops"][0]["start_time"] == "00:00"
-            return completion("revise_days", {"stops": fixed["stops"]}, len(calls))
-        assert context["previous_plan"]["revision_request"] == revision_request
-        return completion("final_result", itinerary(), len(calls))
+            assert context["draft"]["stops"][0]["start_time"] == "00:00"
+            assert context["revision_days"] == [1]
+            answer = packet(fixed, queries=[])
+        return completion("draft_proposal", answer, len(calls))
 
     result = await run_plan(
         requirements(notes="轻松慢游。"),
@@ -620,7 +662,7 @@ async def test_program_repair_after_review_revision_is_the_plan_seen_by_final_re
     assert result["outcome"] == "ready", result
     assert result["itinerary"] == fixed
     assert result["review"]["planner_response"]["revised_itinerary"] == broken
-    assert len(calls) == 5 and len(reviews) == 2
+    assert len(calls) == 6 and len(reviews) == 2
 
 
 async def test_reviewer_omitting_explicit_suggestions_cannot_silently_approve():
@@ -631,5 +673,5 @@ async def test_reviewer_omitting_explicit_suggestions_cannot_silently_approve():
     assert result["itinerary"] is None and result["draft"] == itinerary()
     assert result["review"]["status"] != "approved"
     assert "UnexpectedModelBehavior" in result["error"]
-    assert len(calls) == 3 and len(reviews) == 2  # One bounded SDK output correction.
+    assert len(calls) == 4 and len(reviews) == 2  # One bounded SDK output correction.
     assert any("suggestions" in str(message.get("content")) for message in reviews[-1]["messages"])

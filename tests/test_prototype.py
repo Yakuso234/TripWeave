@@ -326,7 +326,9 @@ def test_full_api_versions_restore_and_pages(tmp_path, monkeypatch):
 
     previous_inputs = []
 
-    async def tested_planner(req, *, mode, settings, previous_plan, research_context=None):
+    async def tested_planner(
+        req, *, mode, settings, previous_plan, research_context=None, on_draft=None
+    ):
         previous_inputs.append(previous_plan)
         assert mode == "deepseek"
         return await run_plan(

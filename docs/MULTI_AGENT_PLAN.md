@@ -25,8 +25,10 @@ flowchart TD
     B -->|继续| C[prepare_evidence: 地图身份与必要交通]
     C -->|固定要求互斥| U
     C -->|继续| D[propose: 排程Agent]
-    D -->|行程草稿| E[check_candidate: 全程业务检查]
-    D -->|具体资料缺口且尚可补查| F[research_information: 研究Agent]
+    D -->|完整首稿即时保存| XQ[collect_queries: 程序执行清单]
+    XQ -->|证据覆盖| E[check_candidate: 全程业务检查]
+    XQ -->|新资料或问题| D
+    XQ -->|具体资料缺口且尚可补查| F[research_information: 研究Agent]
     F -->|已补齐或带具体缺口回流一次| D
     D -->|关键缺口仍阻碍要求| I[needs_information]
     F -->|服务异常| S[service_error]
@@ -48,7 +50,7 @@ flowchart TD
     X --> P
 ```
 
-图的八个节点是`preflight`、`prepare_evidence`、`propose`、`research_information`、`check_candidate`、`review_candidate`、`respond_to_review`、`adjudicate_review`。程序检查通过后，尚未初审则进入初审，已有排程回应则进入复核，不同时走两条边。请求数或总时限耗尽会结束为`incomplete`，保存已有结果；不是为每个节点重分额度。源码入口见[real_planner.py](../tripweave/real_planner.py)，带备注的说明见[CORE_FLOW](CORE_FLOW.md)。
+图的九个节点是`preflight`、`prepare_evidence`、`propose`、`collect_queries`、`research_information`、`check_candidate`、`review_candidate`、`respond_to_review`、`adjudicate_review`。程序检查通过后，尚未初审则进入初审，已有排程回应则进入复核，不同时走两条边。请求数或总时限耗尽会结束为`incomplete`，保存已有结果；不是为每个节点重分额度。源码入口见[real_planner.py](../tripweave/real_planner.py)，带备注的说明见[CORE_FLOW](CORE_FLOW.md)。
 
 ## 问题类别决定处理动作
 
@@ -150,3 +152,6 @@ ResearchFact
 
 
 2026-11-16经用户确认：默认实验预算调整为180秒、8轮，思考强度和单次输出上限不变。轮次按SDK已进入历史的模型响应计数，工具执行本身不占模型轮次；读取工具结果继续推理会产生下一轮。HTTP尝试另行记录，不能把轮次限额当绝对费用上限。旧候选保留当时6轮/90秒快照。
+
+
+2026-11-17当前协议以[DRAFT_FIRST_FLOW](DRAFT_FIRST_FLOW.md)为准：同一规划角色首稿/修订仅结构化输出，程序执行清单；研究程序预取后提取，原Agent自由高德工具循环已移除。

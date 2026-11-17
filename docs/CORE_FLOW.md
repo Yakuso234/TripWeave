@@ -1,33 +1,24 @@
 # 当前核心链路与阅读备注
 
-核对日期：2026-11-15。本文对应当前实现：**LangGraph分类编排＋排程Agent＋按需定向事实研究Agent＋独立校验Agent**。初始选景排序与短摘要仍是HTTP函数流水线。三角色职责见[多Agent架构](MULTI_AGENT_PLAN.md)，协商合同见[校验协商](REVIEW_NEGOTIATION.md)，真实测试过程见[QA记录](evaluations/V02_QA.md)。
+核对日期：2026-11-17。本文对应当前实现：**LangGraph分类编排＋排程Agent＋按需定向事实研究Agent＋独立校验Agent**。初始选景排序与短摘要仍是HTTP函数流水线。三角色职责见[多Agent架构](MULTI_AGENT_PLAN.md)，协商合同见[校验协商](REVIEW_NEGOTIATION.md)，真实测试过程见[QA记录](evaluations/V02_QA.md)。
 
 ## 整体链路
 
 ```text
-旅行需求（长期偏好只作新建默认值）
-  ├─ 一键规划 ────────────────────────────────┐
-  └─ 协作选景：高德召回→HTTP模型排序/分组       │
-               →每批最多5项摘要/照片            │
-               →用户勾选→原子确认资料快照 ──────┤
-                                                ↓
-LangGraph：preflight → prepare_evidence → propose → check_candidate
-             │              │              │             │
-             │              │              │             ├─通过→review_candidate独立初审
-             │              │              │             ├─草稿有错→propose局部修订
-             │              │              │             └─仍缺关键事实/耗尽→明确结束
-             │              │              └─明确资料缺口→research_information
-             │              │                                  │
-             │              │                                  ├─补齐→propose继续/修订
-             │              │                                  └─未知/异常/耗尽→明确结束
-             └─用户硬要求互斥┴─核实身份/必要交通后仍互斥→needs_user_decision
-                                                ↓
-      初审有意见 → respond_to_review修改或解释 → 程序再检查 → adjudicate_review复核
-      初审无意见或复核认同 → ready；复核仍分歧 → needs_user_decision（不是无解证明）
-                                                ↓
-                              保存结果/草稿/事实/协商/问题至SQLite
-                                                ↓
-                              仅ready可接受，事务核对需求与接受版本
+需求/选景快照 → preflight → prepare_evidence
+  → propose（只交完整草稿＋查询清单，普通工具权限为0）
+  → 首稿即时保存SQLite planning_runs
+  → collect_queries（程序按起点/终点/交通方式等清单验证/执行/缓存）
+      ├─关键资料请求 → research_information（程序预取来源→研究提取/有限恢复）→propose
+      ├─新证据/待修问题 → propose（仅显式最新状态，不堆旧工具历史）
+      └─证据覆盖、无待处理问题 → check_candidate（整份业务检查）
+          ├─错误 → propose按定位修订
+          └─通过 → review_candidate独立初审
+              ├─无意见 → ready
+              └─有意见 → respond_to_review修改或解释→collect_queries→程序检查→adjudicate_review
+                  ├─认同 → ready
+                  └─仍分歧 → needs_user_decision（不是需求无解）
+正常返回/预算/错误 → 候选及执行记录保存；只有ready候选经过版本检查才可接受
 ```
 
 图中的预检、地图读取和业务检查是普通程序节点。研究、排程和校验各有自己的Pydantic AI角色、工具范围、消息上下文及结构化输出，共享本次规划的模型用量与运行时限。校验没有搜索或执行工具，意见不能覆盖程序检查。
@@ -63,7 +54,8 @@ LangGraph：preflight → prepare_evidence → propose → check_candidate
 | --- | --- | --- |
 | `preflight` | 只看结构化用户要求。检查固定预约超每日边界、停留窗口均不足、已明确身份的固定预约重叠。无联网即可证明的冲突提前停止。 | 硬冲突结束；其余到`prepare_evidence` |
 | `prepare_evidence` | 高德解析出发点、酒店、必去和约束地点，加载可信选景快照；按已核实身份再次预检，并核对固定承诺之间的必要交通。 | 硬冲突结束；其余到`propose` |
-| `propose` | 排程Agent读取本次需求、证据和草稿，输出`Itinerary`，或输出具体`PlanningInformationRequest`。 | 行程到`check_candidate`；资料缺口到`research_information`；预算/范围错误结束 |
+| `propose` | 排程Agent读取本次需求、证据和草稿，输出完整`DraftProposal`并即时存首稿。 | 到`collect_queries`；预算/合同错误保留已有草稿结束 |
+| `collect_queries` | 程序校验结构化清单，执行/复用地图查询，按草稿核对漏查路段，记录阶段/模型轮号和结果。 | 补查到研究；新证据/问题到修订；其余到全量检查；无进展结束 |
 | `research_information` | 研究Agent只补指定地点、日期和字段，核对实际来源后将事实交回图状态。一个阶段内最多恢复一次、合计5搜索。 | 已补齐或带缺口回`propose`一次；服务异常或预算不足结束 |
 | `check_candidate` | Python检查整份候选，以及已声明关键事实是否适用于实际安排日期。 | 初次通过到`review_candidate`；已有协商回应则到`adjudicate_review`；可修草稿回`propose`；关键事实仍缺失或轮数耗尽结束 |
 | `review_candidate` | 独立校验Agent读取完整多天安排、用户要求与已知证据，最多5条意见须定位具体站点。 | 无意见ready；有意见到`respond_to_review`；预算不足未完成 |
@@ -76,9 +68,9 @@ LangGraph：preflight → prepare_evidence → propose → check_candidate
 
 ## 四、排程与研究的定向交接
 
-排程Agent的工具是`lookup_places`、已知ID之间的`route`、`nearby_restaurants`；基于原方案修改时另有`find_place`。它不能支付、预订或自行放宽用户硬要求。
+排程Agent仅输出draft_proposal，没有普通工具；query_requests由程序按路线两端ID/交通方式、附近餐饮锚点或明确地点名执行。每轮都交完整草稿与新增清单，不能支付、预订或自行放宽用户硬要求。
 
-遇到关键资料缺口时，排程输出：
+遇到关键资料缺口时，排程在DraftProposal.information_needs内填写以下PlanningNeed（不是只返回缺口而没有草稿）：
 
 ```python
 PlanningInformationRequest(

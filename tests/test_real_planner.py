@@ -1,9 +1,11 @@
 """Network contract tests use simulated HTTP responses, never real provider results."""
 
 import json
+from copy import deepcopy
 
 import httpx2
 import pytest
+from draft_helpers import packet, reply, route_queries
 from review_mock import with_approved_review
 
 from tripweave.domain import Requirements
@@ -143,7 +145,23 @@ async def test_deepseek_contract_feedback_and_usage(
     )
     seed = await run_plan(req, "basic", configured(), transport=httpx2.MockTransport(handler))
     assert seed["status"] == "ready", seed["issues"]
-    calls = []
+    original = deepcopy(seed["itinerary"])
+    # Restaurants are not known before the first draft. Use an explicit meal
+    # area anchor instead of carrying an ID discovered by the basic fixture.
+    for stop in original["stops"]:
+        if stop["kind"] == "meal":
+            stop.update(place_id="o", title="人民广场附近自选正餐", reason="具体餐厅与供应待核实。")
+    broken = deepcopy(original)
+    if booking_case:
+        broken["stops"] = [stop for stop in broken["stops"] if stop["kind"] != "booking"]
+        if booking_case == "wrong_day":
+            wrong_stop = next(
+                stop for stop in broken["stops"] if stop["day"] == 2 and stop["kind"] == "activity"
+            )
+            wrong_stop.update(kind="booking", place_id="b")
+    else:
+        broken["stops"][0]["start_time"] = "00:00"
+    calls, business_feedback = [], []
     revision_days = [1, 2] if booking_case == "wrong_day" else [1]
 
     def provider(request):
@@ -151,102 +169,66 @@ async def test_deepseek_contract_feedback_and_usage(
             return handler(request)
         body = json.loads(request.content)
         calls.append(body)
-        if len(calls) == 1:
-            name, args = "lookup_places", {}
-        elif len(calls) == 2:
-            name, args = "nearby_restaurants", {"place_id": "o"}
-        else:
-            name = next(
-                t["function"]["name"]
-                for t in body["tools"]
-                if t["function"]["name"] not in ("lookup_places", "route", "nearby_restaurants")
+        assert {tool["function"]["name"] for tool in body["tools"]} == {"draft_proposal"}
+        prompt = json.loads(body["messages"][-1]["content"])
+        issues = prompt.get("validation_issues", [])
+        codes = {issue["code"] for issue in issues}
+        target_error = "booking" if booking_case else "connection"
+        if target_error in codes:
+            business_feedback.append(prompt)
+            corrected = deepcopy(original) if repair else deepcopy(broken)
+            if outside_scope:
+                # Changing an unaffected day's explanation is still outside the
+                # allowed repair scope; the engine must retain the old draft.
+                next(stop for stop in corrected["stops"] if stop["day"] == 2)["reason"] = (
+                    "不应改动的第二天"
+                )
+            return reply(
+                "draft_proposal", packet(corrected, queries=route_queries(corrected)), len(calls)
             )
-            args = json.loads(json.dumps(seed["itinerary"]))
-            if len(calls) == 3 or not repair:
-                if booking_case:
-                    args["stops"] = [stop for stop in args["stops"] if stop["kind"] != "booking"]
-                    if booking_case == "wrong_day":
-                        wrong_stop = next(
-                            stop
-                            for stop in args["stops"]
-                            if stop["day"] == 2 and stop["kind"] == "activity"
-                        )
-                        wrong_stop.update(kind="booking", place_id="b")
-                else:
-                    args["stops"][0]["start_time"] = "00:00"
-            if name == "revise_days":
-                stops = args["stops"]
-                if not (outside_scope and len(calls) == 4):
-                    stops = [stop for stop in stops if stop["day"] in revision_days]
-                args = {"stops": stops}
-        return httpx2.Response(
-            200,
-            json={
-                "id": "test-completion",
-                "object": "chat.completion",
-                "created": 1,
-                "model": "deepseek-flash",
-                "choices": [
-                    {
-                        "index": 0,
-                        "finish_reason": "tool_calls",
-                        "message": {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": "call" + str(len(calls)),
-                                    "type": "function",
-                                    "function": {"name": name, "arguments": json.dumps(args)},
-                                }
-                            ],
-                        },
-                    }
-                ],
-                "usage": {"prompt_tokens": 42, "completion_tokens": 20, "total_tokens": 62},
-            },
-        )
+        if prompt["task"] == "first_draft":
+            return reply("draft_proposal", packet(original), len(calls))
+        return reply("draft_proposal", packet(broken, queries=route_queries(broken)), len(calls))
 
     settings = configured().model_copy(update={"max_requests": request_limit})
     output = await run_plan(
         req, "deepseek", settings, transport=httpx2.MockTransport(with_approved_review(provider))
     )
-    expected_calls = 4 + outside_scope if repair else min(5, request_limit)
-    assert len(calls) == expected_calls
     assert calls[0]["model"] == "deepseek-flash"
-    assert output["usage"]["requests"] == expected_calls + int(repair)
-    assert output["usage"]["input_tokens"] == 42 * (expected_calls + int(repair))
-    if len(calls) > 3:
-        revision = json.loads(calls[3]["messages"][-1]["content"])
-        assert revision["revision_days"] == revision_days
-        assert revision["required_revision_days"] == revision_days
-        assert {stop["day"] for stop in revision["draft_stops"]} == set(revision_days)
-        assert {stop["day"] for stop in revision["reference_stops"]} == {1, 2} - set(revision_days)
-        feedback = revision["validation_issues"]
-    if len(calls) > 3 and booking_case:
-        assert [issue["code"] for issue in feedback] == ["booking"]
-        booking = feedback[0]
+    # The explicit review fixture has its own real SDK response and usage.
+    approved = repair and not outside_scope
+    assert output["usage"]["requests"] == len(calls) + int(approved)
+    assert output["usage"]["input_tokens"] == 42 * output["usage"]["requests"]
+    assert output["usage"]["requests"] <= request_limit
+    assert business_feedback
+    revision = business_feedback[0]
+    assert revision["revision_days"] == revision_days
+    assert revision["draft"] == broken
+    feedback = revision["validation_issues"]
+    if booking_case:
+        booking = next(issue for issue in feedback if issue["code"] == "booking")
         assert booking["day"] == 1 and booking["place_id"] == "b"
         assert booking["expected_kind"] == "booking"
         assert booking["expected_start"] == "14:00" and booking["expected_end"] == "15:00"
         assert [stop["day"] for stop in booking["occurrences"]] == revision_days[1:]
-    elif len(calls) > 3:
+    else:
         connection = next(issue for issue in feedback if issue["code"] == "connection")
         assert connection["day"] == connection["stop_number"] == 1
         assert connection["origin_id"] == "o"
-        assert connection["destination_id"] == seed["itinerary"]["stops"][0]["place_id"]
-        assert connection["departure_time"] == "09:00"
-        assert connection["travel_minutes"] == 5
+        assert connection["destination_id"] == original["stops"][0]["place_id"]
+        assert connection["departure_time"] == "09:00" and connection["travel_minutes"] == 5
         assert connection["scheduled_start"] == "00:00"
-        assert connection["earliest_arrival_day"] == 1
-        assert connection["earliest_arrival_time"] == "09:05"
-    if repair:
+        assert (
+            connection["earliest_arrival_day"] == 1
+            and connection["earliest_arrival_time"] == "09:05"
+        )
+    if approved:
         assert output["status"] == "ready", (output["error"], output["trace"])
-        assert output["itinerary"] == seed["itinerary"]
-        if outside_scope:
-            assert "只提交第 [1] 天" in calls[4]["messages"][-1]["content"]
+        assert output["itinerary"] == original
     else:
         assert output["status"] == "conflict" and output["itinerary"] is None
-        if request_limit == 3:
-            assert "UsageLimitExceeded" in output["error"]
-        assert any(issue["code"] == "connection" for issue in output["issues"])
+        assert output["draft"] == broken
+        if outside_scope:
+            assert "局部修订范围之外" in output["error"]
+        else:
+            assert any(issue["code"] == "connection" for issue in output["issues"])

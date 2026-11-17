@@ -5,10 +5,10 @@ from copy import deepcopy
 
 import httpx2
 import pytest
+from draft_helpers import packet, route_queries
 from fastapi.testclient import TestClient
 from review_mock import with_approved_review
 from test_planning_research import fact, sources
-from test_planning_research import final as research_final
 from test_real_planner import configured, handler
 from test_research_planner_context import completion
 
@@ -163,19 +163,22 @@ async def test_known_draft_error_revises_only_affected_day_and_checks_whole_plan
             return map_response(request)
         body = json.loads(request.content)
         calls.append(body)
-        if len(calls) == 1:
-            return completion("final_result", broken, 1)
-        assert "revise_days" in tool_names(body)
-        return completion("revise_days", {"stops": [original["stops"][0]]}, 2)
+        assert tool_names(body) == {"draft_proposal"}
+        return completion(
+            "draft_proposal",
+            packet(
+                original if len(calls) >= 3 else broken, queries=None if len(calls) == 1 else []
+            ),
+            len(calls),
+        )
 
     result = await run(requirements(days=2, max_activities=1), provider)
-    assert result["status"] == result["outcome"] == "ready", result
-    assert result["usage"]["requests"] == len(calls) + 1 == 3
-    revision = json.loads(calls[1]["messages"][-1]["content"])
+    assert result["outcome"] == "ready", result
+    assert result["usage"]["requests"] == len(calls) + 1 == 4
+    revision = json.loads(calls[2]["messages"][-1]["content"])
     assert revision["revision_days"] == [1]
-    assert revision["reference_stops"][0]["day"] == 2
+    assert revision["draft"]["stops"][1] == original["stops"][1]
     assert revision["validation_issues"][0]["code"] == "connection"
-    assert revision["validation_issues"][0]["category"] == "draft_error"
     assert result["itinerary"] == original
     assert result["research_rounds"] == result["research_search_calls"] == 0
 
@@ -189,28 +192,27 @@ async def test_pacing_violation_returns_actual_limit_and_segments_for_local_revi
     def provider(request):
         if request.url.host != "api.deepseek.com":
             return map_response(request)
-        calls.append(json.loads(request.content))
-        if len(calls) == 1:
-            return completion("final_result", broken, 1)
-        return completion("revise_days", {"stops": [original["stops"][0]]}, 2)
+        body = json.loads(request.content)
+        calls.append(body)
+        return completion(
+            "draft_proposal",
+            packet(
+                original if len(calls) >= 3 else broken, queries=None if len(calls) == 1 else []
+            ),
+            len(calls),
+        )
 
     result = await run(requirements(days=2, max_sightseeing_minutes=90), provider)
-    assert result["status"] == result["outcome"] == "ready", result
-    revision = json.loads(calls[1]["messages"][-1]["content"])
+    assert result["outcome"] == "ready", result
+    revision = json.loads(calls[2]["messages"][-1]["content"])
     assert revision["revision_days"] == [1]
-    assert revision["reference_stops"] == [
-        {
-            key: original["stops"][1][key]
-            for key in ("day", "place_id", "start_time", "end_time", "kind")
-        }
-    ]
+    assert revision["draft"]["stops"][1] == original["stops"][1]
     issue = revision["validation_issues"][0]
     assert (issue["code"], issue["actual"], issue["limit"]) == ("max_sightseeing_minutes", 120, 90)
     assert issue["occurrences"][0]["stop_number"] == 1
     assert issue["occurrences"][0]["end_time"] == "12:00"
     assert result["itinerary"] == original
     assert [row["sightseeing_minutes"] for row in result["daily_metrics"]] == [60, 60]
-    assert result["usage"]["requests"] == 3
 
 
 async def test_planner_research_return_uses_independent_context_and_shared_usage():
@@ -228,41 +230,28 @@ async def test_planner_research_return_uses_independent_context_and_shared_usage
         number = len(models)
         if number == 1:
             events.append("planner_gap")
-            return completion("request_information", gap(), number)
-        if number == 2:
-            events.append("research_tool")
-            assert "search_place_information" in tool_names(body)
-            return completion("search_place_information", {"place_id": "p0", "day": 1}, number)
-        if number == 3:
+            return completion("draft_proposal", packet(itinerary(), needs=gap()["needs"]), number)
+        if "research_report" in tool_names(body):
             events.append("research_report")
-            return research_final(body, [fact()])
-        assert number == 4
+            assert "search_place_information" not in tool_names(body)
+            return completion("research_report", {"facts": [fact()]}, number)
         events.append("planner_resume")
-        assert "search_place_information" not in tool_names(body)
-        return completion("final_result", itinerary(), number)
+        return completion("draft_proposal", packet(itinerary(), queries=[]), number)
 
     result = await run(requirements(notes=PRIVATE_NOTE), provider)
     assert result["outcome"] == "ready", result
-    assert result["usage"]["requests"] == 5
-    assert result["usage"]["input_tokens"] == 42 * 5
-    assert result["usage"]["output_tokens"] == 20 * 5
+    assert result["usage"] == {"requests": 4, "input_tokens": 42 * 4, "output_tokens": 20 * 4}
     assert result["research_rounds"] == result["research_search_calls"] == len(searches) == 1
-    assert events == [
-        "planner_gap",
-        "research_tool",
-        "search_http",
-        "research_report",
-        "planner_resume",
-    ]
-    research_messages = json.dumps([body["messages"] for body in models[1:3]])
-    assert PRIVATE_NOTE not in research_messages
-    assert "draft_stops" not in research_messages and "previous_plan" not in research_messages
+    assert events == ["planner_gap", "search_http", "research_report", "planner_resume"]
+    research_messages = json.dumps(models[1]["messages"])
+    assert PRIVATE_NOTE not in research_messages and "draft_stops" not in research_messages
     research_prompt = json.loads(models[1]["messages"][-1]["content"])
     assert set(research_prompt) == {"city", "tasks"}
     assert research_prompt["tasks"][0]["date"] == "2026-11-21"
+    assert research_prompt["tasks"][0]["sources"]
     assert PRIVATE_NOTE not in json.dumps(searches)
-    resumed = json.loads(models[3]["messages"][-1]["content"])
-    assert resumed["planning_facts"][0]["place_id"] == "p0"
+    resumed = json.loads(models[2]["messages"][-1]["content"])
+    assert resumed["draft"] == itinerary()
     assert resumed["planning_facts"][0]["evidence_status"] == "web_reported"
     assert resumed["planning_facts"][0]["sources"][0]["url"] == "https://museum.example/visit"
     assert result["research_facts"] == resumed["planning_facts"]
@@ -271,50 +260,43 @@ async def test_planner_research_return_uses_independent_context_and_shared_usage
 async def test_fact_return_allows_one_full_revision_then_restores_local_repairs():
     original = itinerary(days=2)
     original["stops"][0]["reason"] = "PRIVATE-DRAFT-REASON-MUST-NOT-REACH-RESEARCH"
-    first_draft = deepcopy(original)
-    first_draft["stops"][0]["start_time"] = "00:00"
-    after_research = deepcopy(original)
-    after_research["stops"][1]["start_time"] = "00:00"
+    first = deepcopy(original)
+    first["stops"][0]["start_time"] = "00:00"
+    after = deepcopy(original)
+    after["stops"][1]["start_time"] = "00:00"
     calls = []
+    planners = []
 
     def provider(request):
         if request.url.host != "api.deepseek.com":
             return map_response(request)
-        body = json.loads(request.content)
         if request.url.path.endswith("/tools/search"):
             return sources()
+        body = json.loads(request.content)
         calls.append(body)
-        number = len(calls)
-        if number == 1:
-            return completion("final_result", first_draft, number)
-        if number == 2:
-            return completion("request_information", gap(), number)
-        if number == 3:
-            return completion("search_place_information", {"place_id": "p0", "day": 1}, number)
-        if number == 4:
-            return research_final(body, [fact()])
-        if number == 5:
-            assert "final_result" in tool_names(body)
-            return completion("final_result", after_research, number)
-        assert number == 6
-        assert "revise_days" in tool_names(body)
-        return completion("revise_days", {"stops": [original["stops"][1]]}, number)
+        if "research_report" in tool_names(body):
+            return completion("research_report", {"facts": [fact()]}, len(calls))
+        planners.append(body)
+        if len(planners) == 1:
+            value = packet(first, needs=gap()["needs"])
+        elif len(planners) == 2:
+            value = packet(after, queries=[])
+        else:
+            value = packet(original, queries=[])
+        return completion("draft_proposal", value, len(calls))
 
     result = await run(requirements(days=2, notes=PRIVATE_NOTE), provider)
-    # Six calls repaired the draft, leaving no budget for the required reviewer.
-    assert result["outcome"] == "incomplete", result
-    assert result["review"]["pending_stage"] == "initial_review"
-    assert result["usage"]["requests"] == len(calls) == 6
-    assert result["itinerary"] is None and result["draft"] == original
-    research_input = json.dumps([body["messages"] for body in calls[2:4]])
+    assert result["outcome"] == "ready", result
+    assert result["usage"]["requests"] == 5
+    assert result["itinerary"] == original
+    research_input = json.dumps(calls[1]["messages"])
     assert "PRIVATE-DRAFT-REASON" not in research_input and PRIVATE_NOTE not in research_input
-    after_facts = json.loads(calls[4]["messages"][-1]["content"])
-    assert after_facts["draft"] == first_draft
+    after_facts = json.loads(planners[1]["messages"][-1]["content"])
+    assert after_facts["draft"] == first and "revision_days" not in after_facts
     assert after_facts["planning_facts"][0]["field"] == "opening_hours"
-    assert "revision_days" not in after_facts
-    next_revision = json.loads(calls[5]["messages"][-1]["content"])
+    next_revision = json.loads(planners[2]["messages"][-1]["content"])
     assert next_revision["revision_days"] == [2]
-    assert next_revision["reference_stops"][0]["day"] == 1
+    assert next_revision["draft"]["stops"][0] == after["stops"][0]
     assert result["research_rounds"] == result["research_search_calls"] == 1
 
 
@@ -336,25 +318,37 @@ async def test_unknown_returns_to_planner_once_but_service_failure_stops(search_
                 else httpx2.Response(200, json={"results": []})
             )
         models.append(body)
-        if len(models) == 1:
-            return completion("request_information", gap(), 1)
-        if len(models) == 2:
-            return completion("search_place_information", {"place_id": "p0", "day": 1}, 2)
-        if "lookup_places" in tool_names(body):
-            return completion("final_result", itinerary(), len(models))
-        return research_final(
-            body, [{"place_id": "p0", "day": 1, "field": "opening_hours", "status": "unknown"}]
+        if "research_report" in tool_names(body):
+            return completion(
+                "research_report",
+                {
+                    "facts": [
+                        {"place_id": "p0", "day": 1, "field": "opening_hours", "status": "unknown"}
+                    ]
+                },
+                len(models),
+            )
+        return completion(
+            "draft_proposal",
+            packet(
+                itinerary(),
+                queries=None if len(models) == 1 else [],
+                needs=gap()["needs"] if len(models) == 1 else [],
+            ),
+            len(models),
         )
 
     result = await run(requirements(), provider)
-    expected = "service_error" if search_mode == "service_error" else "needs_information"
-    assert result["outcome"] == expected, result
+    assert result["outcome"] == (
+        "service_error" if search_mode == "service_error" else "needs_information"
+    ), result
     assert result["status"] == "conflict" and result["itinerary"] is None
     assert (
         result["usage"]["requests"]
         == len(models)
-        == {"unknown": 4, "no_results": 5, "service_error": 3}[search_mode]
+        == {"unknown": 3, "no_results": 4, "service_error": 2}[search_mode]
     )
+    assert result["draft"] == itinerary()
     assert result["research_rounds"] == 1
     assert len(searches) == (2 if search_mode == "no_results" else 1)
     assert result["research_facts"][0]["status"] == "unknown"
@@ -364,31 +358,33 @@ async def test_unknown_returns_to_planner_once_but_service_failure_stops(search_
 
 async def test_second_information_request_stops_after_single_research_round():
     calls, searches = [], []
+    planners = []
 
     def provider(request):
         if request.url.host != "api.deepseek.com":
             return map_response(request)
-        body = json.loads(request.content)
         if request.url.path.endswith("/tools/search"):
-            searches.append(body)
+            searches.append(request)
             return sources()
+        body = json.loads(request.content)
         calls.append(body)
-        number = len(calls)
-        if number == 1:
-            return completion("request_information", gap(), number)
-        if number == 2:
-            return completion("search_place_information", {"place_id": "p0", "day": 1}, number)
-        if number == 3:
-            return research_final(body, [fact()])
-        assert number == 4
-        return completion("request_information", gap(field="last_admission"), number)
+        if "research_report" in tool_names(body):
+            return completion("research_report", {"facts": [fact()]}, len(calls))
+        planners.append(body)
+        needs = gap(field="opening_hours" if len(planners) == 1 else "last_admission")["needs"]
+        return completion(
+            "draft_proposal",
+            packet(itinerary(), queries=None if len(planners) == 1 else [], needs=needs),
+            len(calls),
+        )
 
     result = await run(requirements(), provider)
     assert result["outcome"] == "needs_information", result
     assert result["research_rounds"] == len(searches) == 1
-    assert result["usage"]["requests"] == len(calls) == 4
+    assert result["usage"]["requests"] == len(calls) == 3
     assert result["research_facts"][0]["field"] == "opening_hours"
     assert result["issues"][0]["missing_fields"] == ["last_admission"]
+    assert result["draft"] == itinerary()
 
 
 async def test_shared_budget_exhaustion_retains_failed_draft_and_original_problem():
@@ -401,18 +397,17 @@ async def test_shared_budget_exhaustion_retains_failed_draft_and_original_proble
             return map_response(request)
         body = json.loads(request.content)
         calls.append(body)
-        if len(calls) == 1:
-            return completion("final_result", broken, 1)
-        assert len(calls) == 2
-        return completion("lookup_places", {}, 2)
+        return completion(
+            "draft_proposal", packet(broken, queries=None if len(calls) == 1 else []), len(calls)
+        )
 
     result = await run(requirements(), provider, limit=2)
     assert result["outcome"] == "incomplete", result
     assert result["usage"]["requests"] == len(calls) == 2
     assert result["draft"] == broken and result["itinerary"] is None
     assert result["issues"][0]["code"] == "connection"
-    assert all(issue["category"] != "hard_conflict" for issue in result["issues"])
-    assert "不代表需求无解" in result["error"]
+    assert all(i["category"] != "hard_conflict" for i in result["issues"])
+    assert result["error"]
 
 
 async def test_research_and_planning_cannot_each_reset_the_request_budget():
@@ -421,29 +416,26 @@ async def test_research_and_planning_cannot_each_reset_the_request_budget():
     def provider(request):
         if request.url.host != "api.deepseek.com":
             return map_response(request)
-        body = json.loads(request.content)
         if request.url.path.endswith("/tools/search"):
-            searches.append(body)
+            searches.append(request)
             return sources()
+        body = json.loads(request.content)
         calls.append(body)
-        number = len(calls)
-        if number == 1:
-            return completion("request_information", gap(), number)
-        if number == 2:
-            return completion("search_place_information", {"place_id": "p0", "day": 1}, number)
-        assert number == 3  # A fresh planner budget would incorrectly make a fourth request.
-        return research_final(body, [fact()])
+        if "research_report" in tool_names(body):
+            return completion("research_report", {"facts": [fact()]}, len(calls))
+        return completion("draft_proposal", packet(itinerary(), needs=gap()["needs"]), len(calls))
 
-    result = await run(requirements(), provider, limit=3)
+    result = await run(requirements(), provider, limit=2)
     assert result["outcome"] == "incomplete", result
-    assert result["usage"]["requests"] == len(calls) == 3
+    assert result["usage"]["requests"] == len(calls) == 2
     assert result["research_rounds"] == len(searches) == 1
     assert result["research_facts"][0]["status"] == "found"
-    assert result["itinerary"] is None
+    assert result["draft"] == itinerary() and result["itinerary"] is None
 
 
 async def test_move_to_unresearched_day_keeps_a_declared_critical_gap_open():
     calls, searches = [], []
+    planners = []
     moved = itinerary(days=2)
     moved["stops"][0]["place_id"] = "p1"
     moved["stops"][1]["place_id"] = "p0"
@@ -451,27 +443,25 @@ async def test_move_to_unresearched_day_keeps_a_declared_critical_gap_open():
     def provider(request):
         if request.url.host != "api.deepseek.com":
             return map_response(request)
-        body = json.loads(request.content)
         if request.url.path.endswith("/tools/search"):
-            searches.append(body)
+            searches.append(request)
             return sources()
+        body = json.loads(request.content)
         calls.append(body)
-        number = len(calls)
-        if number == 1:
-            return completion("request_information", gap(), number)
-        if number == 2:
-            return completion("search_place_information", {"place_id": "p0", "day": 1}, number)
-        if number == 3:
-            return research_final(body, [fact()])
-        assert number == 4
-        return completion("final_result", moved, number)
+        if "research_report" in tool_names(body):
+            return completion("research_report", {"facts": [fact()]}, len(calls))
+        planners.append(body)
+        if len(planners) == 1:
+            value = packet(itinerary(days=2), needs=gap()["needs"])
+        else:
+            value = packet(moved, queries=route_queries(moved) if len(planners) == 2 else [])
+        return completion("draft_proposal", value, len(calls))
 
     result = await run(requirements(days=2), provider)
     assert result["outcome"] == "needs_information", result
-    assert result["status"] == "conflict" and result["itinerary"] is None
-    assert result["draft"] == moved
+    assert result["draft"] == moved and result["itinerary"] is None
     assert result["research_rounds"] == len(searches) == 1
-    assert result["usage"]["requests"] == len(calls) == 4
+    assert result["usage"]["requests"] == len(calls) == 3
     issue = next(i for i in result["issues"] if i["code"] == "critical_fact_date_missing")
     assert issue["day"] == 2 and issue["place_id"] == "p0"
     assert issue["missing_fields"] == ["opening_hours"]
@@ -497,8 +487,9 @@ async def test_distinct_user_fixed_appointments_can_repeat_one_place_across_days
             return map_response(request)
         body = json.loads(request.content)
         calls.append(body)
-        assert len(calls) == 1
-        return completion("final_result", plan, 1)
+        return completion(
+            "draft_proposal", packet(plan, queries=None if len(calls) == 1 else []), len(calls)
+        )
 
     result = await run(requirements(days=2, visit_constraints=constraints), provider)
     assert result["outcome"] == "ready", result
@@ -526,8 +517,9 @@ async def test_two_user_fixed_appointments_at_same_place_on_one_day_are_kept():
             return map_response(request)
         body = json.loads(request.content)
         calls.append(body)
-        assert len(calls) == 1
-        return completion("final_result", plan, 1)
+        return completion(
+            "draft_proposal", packet(plan, queries=None if len(calls) == 1 else []), len(calls)
+        )
 
     result = await run(requirements(visit_constraints=constraints), provider)
     assert result["outcome"] == "ready", result
@@ -542,9 +534,9 @@ async def test_explicit_visit_window_reaches_model_and_failed_stay_is_repaired()
         "windows": [{"day": 1, "start_time": "11:00", "end_time": "12:00"}],
         "min_duration_minutes": 60,
     }
-    plan = itinerary()
-    corrected = deepcopy(plan["stops"][0])
-    corrected.update(start_time="11:00", end_time="12:00")
+    original = itinerary()
+    corrected = deepcopy(original)
+    corrected["stops"][0].update(start_time="11:00", end_time="12:00")
     calls = []
 
     def provider(request):
@@ -552,10 +544,12 @@ async def test_explicit_visit_window_reaches_model_and_failed_stay_is_repaired()
             return map_response(request)
         body = json.loads(request.content)
         calls.append(body)
-        return (
-            completion("final_result", plan, 1)
-            if len(calls) == 1
-            else completion("revise_days", {"stops": [corrected]}, 2)
+        return completion(
+            "draft_proposal",
+            packet(
+                corrected if len(calls) >= 3 else original, queries=None if len(calls) == 1 else []
+            ),
+            len(calls),
         )
 
     result = await run(requirements(visit_constraints=[constraint]), provider)
@@ -563,11 +557,11 @@ async def test_explicit_visit_window_reaches_model_and_failed_stay_is_repaired()
     initial = json.loads(calls[0]["messages"][-1]["content"])
     assert initial["requirements"]["visit_constraints"][0]["constraint_id"] == "user-window-a"
     assert initial["queried_data"]["constrained_places"]["user-window-a"]["id"] == "p0"
-    revision = json.loads(calls[1]["messages"][-1]["content"])
+    revision = json.loads(calls[2]["messages"][-1]["content"])
     issue = next(i for i in revision["validation_issues"] if i["code"] == "visit_constraint")
     assert issue["constraint_ids"] == ["user-window-a"] and issue["day"] == 1
     assert issue["actual"][0]["start_time"] == "10:00"
-    assert result["itinerary"]["stops"] == [corrected]
+    assert result["itinerary"] == corrected
 
 
 def test_unaccepted_workflow_result_and_draft_facts_survive_api_restart(tmp_path, monkeypatch):

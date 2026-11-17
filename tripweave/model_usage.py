@@ -32,6 +32,15 @@ class ModelUsageRecorder:
         self.calls = []
         self._starts = {}
         self._role = ContextVar("tripweave_usage_role", default="planner")
+        self._stage = ContextVar("tripweave_usage_stage", default=None)
+
+    @contextmanager
+    def stage(self, stage):
+        token = self._stage.set(stage)
+        try:
+            yield
+        finally:
+            self._stage.reset(token)
 
     @contextmanager
     def role(self, role):
@@ -56,6 +65,7 @@ class ModelUsageRecorder:
             "started_at": datetime.now(UTC).isoformat(),
             "model": payload.get("model") if isinstance(payload.get("model"), str) else None,
             "role": self._role.get(),
+            "phase": self._stage.get(),
             "status": "pending",
             "max_output_tokens": count(
                 payload.get("max_completion_tokens", payload.get("max_tokens"))

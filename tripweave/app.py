@@ -1,5 +1,6 @@
 """Local HTTP workspace. Provider calls run outside short storage transactions."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -363,6 +364,10 @@ def create_app(database: str | None = None) -> FastAPI:
         history = store.history(trip_id)
         return {**history, "candidates": [candidate_cost_view(p) for p in history["candidates"]]}
 
+    @app.get("/api/trips/{trip_id}/planning-runs")
+    def planning_runs(trip_id: str):
+        return {"runs": store.list_planning_runs(trip_id)}
+
     class Revision(Requirements):
         expected_revision: int
 
@@ -417,6 +422,16 @@ def create_app(database: str | None = None) -> FastAPI:
         )
         if trip.get("research_evidence") is not None and evidence is None:
             raise HTTPException(409, "已确认的选景资料与当前需求不一致，请重新确认景点后再规划。")
+        run = await run_in_threadpool(
+            store.start_planning_run,
+            trip_id,
+            trip["requirements_revision"],
+            trip["accepted_version"],
+        )
+
+        async def persist_draft(progress: dict):
+            await run_in_threadpool(store.save_planning_draft, trip_id, run["id"], progress)
+
         candidate = {
             "source_plan_id": payload.source_plan_id,
             "revision_notes": revision,
@@ -428,15 +443,24 @@ def create_app(database: str | None = None) -> FastAPI:
             "research_evidence": evidence,
             "mode": payload.mode,
             "created_at": datetime.now(UTC).isoformat(),
-            **await run_plan(
+            "planning_run_id": run["id"],
+        }
+        try:
+            result = await run_plan(
                 Requirements.model_validate(trip["requirements"]),
                 mode=payload.mode,
                 settings=settings,
                 previous_plan=previous,
                 research_context=evidence,
-            ),
-        }
-        await run_in_threadpool(store.add_candidate, candidate)
+                on_draft=persist_draft,
+            )
+            candidate.update(result)
+            await run_in_threadpool(store.add_candidate, candidate)
+            await run_in_threadpool(store.finish_planning_run, trip_id, run["id"], candidate)
+        except Exception, asyncio.CancelledError:
+            # Keep provider/SQL exception details out of the saved record.
+            await run_in_threadpool(store.finish_planning_run, trip_id, run["id"])
+            raise
         return candidate
 
     @app.post("/api/trips/{trip_id}/candidates/{candidate_id}/accept")
