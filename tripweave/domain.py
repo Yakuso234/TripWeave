@@ -140,6 +140,38 @@ class Requirements(TravelPreferences):
         return self
 
 
+class RestPeriod(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    start_time: Clock
+    end_time: Clock
+
+    @model_validator(mode="after")
+    def ordered(self):
+        if self.end_time <= self.start_time:
+            raise ValueError("休息结束必须晚于开始")
+        return self
+
+
+class TransferTiming(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    departure_time: Clock = Field(description="从上一站地点实际出发的时间；首站从当日起点出发")
+    arrival_time: Clock = Field(
+        description="实际拟定到达本站地点的时间，须不早于出发加地图耗时；不等于本站活动开始"
+    )
+    rest_before: list[RestPeriod] = Field(
+        default_factory=list, max_length=8, description="出发前在上一站地点的休息，必须结束于出发前"
+    )
+    rest_after: list[RestPeriod] = Field(
+        default_factory=list, max_length=8, description="到达本站地点后、开始本站前的休息"
+    )
+    buffer_minutes: int = Field(
+        default=0,
+        ge=0,
+        le=180,
+        description="额外交通缓冲分钟，不含地图路程或休息；预留在到达及休息后至本站开始前",
+    )
+
+
 class Stop(BaseModel):
     day: int = Field(ge=1, le=7)
     place_id: str
@@ -155,6 +187,11 @@ class Stop(BaseModel):
     )
     reason: str = Field(max_length=1000)
     title: str = Field(default="", max_length=100)
+    transfer: TransferTiming | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="前往本站的实际出发、休息及缓冲；新规划应明确填写，旧记录缺失时仅能检查站间空档",
+    )
 
 
 class Itinerary(BaseModel):

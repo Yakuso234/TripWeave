@@ -1005,3 +1005,24 @@ test('profile submission retains multiple strict choices instead of the last che
   assert.equal(sent.values.max_transport_minutes,90);
   assert.equal(sent.values.max_sightseeing_minutes,null);
 });
+
+
+test('structured departure arrival rests and buffer are visible and escaped', () => {
+  const h=harness();
+  h.S.candidate.itinerary.stops[0].transfer={departure_time:'17:40',arrival_time:'18:16',buffer_minutes:10,
+    rest_before:[{start_time:'15:20',end_time:'17:40'}],rest_after:[{start_time:'18:16',end_time:'18:20<script>'}]};
+  const html=h.itinerary();
+  assert.match(html,/17:40 出发 → 18:16 到达/);
+  assert.match(html,/另留缓冲 10 分钟/);
+  assert.match(html,/出发前休息 15:20–17:40/);
+  assert.match(html,/18:20&lt;script&gt;/);
+  assert.doesNotMatch(html,/<script>/);
+});
+
+test('missing explicit transfer records are disclosed without inventing rest times', () => {
+  const h=harness();
+  h.S.candidate.timing_coverage={stop_count:2,explicit_count:1};
+  const html=h.itinerary();
+  assert.match(html,/已提供 1 \/ 2 站/);
+  assert.match(html,/备注中的休息尚不能视为已核对/);
+});
