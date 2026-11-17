@@ -70,6 +70,11 @@ class ModelUsageRecorder:
             "max_output_tokens": count(
                 payload.get("max_completion_tokens", payload.get("max_tokens"))
             ),
+            "output_limit_parameter": "max_tokens"
+            if "max_tokens" in payload
+            else "max_completion_tokens"
+            if "max_completion_tokens" in payload
+            else None,
             "input_tokens": None,
             "output_tokens": None,
             "reasoning_tokens": None,

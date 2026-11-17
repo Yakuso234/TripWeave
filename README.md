@@ -147,3 +147,6 @@ Get-Content tests/frontend_state.cjs -Raw | node
 
 
 分阶段提示词的一次真实同输入对照：首稿120.8秒，完整流程仍300秒超时，研究后修订未完整返回，尚无最终方案；[完整记录](docs/evaluations/STAGE_PROMPTS_LIVE_20261117.md)。
+
+
+DeepSeek官方端点显式使用max_tokens（不发送OpenAI默认的max_completion_tokens）；用量记录同时保存output_limit_parameter。配置值与供应商实际执行上限仍需实测核对，不能将SDK设置视为已生效证明。

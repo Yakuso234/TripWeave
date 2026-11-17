@@ -3,6 +3,7 @@
 import json
 
 import httpx2
+import pytest
 from draft_helpers import packet, reply, route_queries
 from test_planning_workflow import itinerary, map_response, requirements, tool_names
 from test_real_planner import configured
@@ -11,7 +12,8 @@ from tripweave.planning_prompts import planner_instructions
 from tripweave.real_planner import run_plan
 
 
-async def test_actual_requests_use_first_draft_then_evidence_revision_instructions():
+@pytest.mark.parametrize("base_url", ["https://api.deepseek.com", "https://api.deepseek.com/v1"])
+async def test_actual_requests_use_first_draft_then_evidence_revision_instructions(base_url):
     phases = []
 
     def provider(request):
@@ -36,12 +38,16 @@ async def test_actual_requests_use_first_draft_then_evidence_revision_instructio
             assert "提交前逐天自查计数" in system and "revision_days" in system
         assert body["reasoning_effort"] == "max"
         assert body["thinking"] == {"type": "enabled"}
-        assert body.get("max_tokens", body.get("max_completion_tokens")) == 6000
+        assert body["max_tokens"] == 6000
+        assert "max_completion_tokens" not in body
         draft = itinerary()
         return reply("draft_proposal", packet(draft, queries=route_queries(draft)))
 
     result = await run_plan(
-        requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
+        requirements(),
+        "deepseek",
+        configured().model_copy(update={"base_url": base_url}),
+        transport=httpx2.MockTransport(provider),
     )
     assert result["outcome"] == "ready", result
     assert phases == ["first_draft", "revision"]

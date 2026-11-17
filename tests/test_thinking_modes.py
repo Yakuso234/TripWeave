@@ -104,7 +104,8 @@ async def test_three_roles_think_at_configured_effort_and_only_explicit_context_
         "reviewer": {"enabled": True, "effort": "max"},
     }
     assert "PRIVATE-THINKING" not in json.dumps(result)
-    assert [b["max_completion_tokens"] for b in calls] == [6000, 4000, 6000, 6000]
+    assert [b["max_tokens"] for b in calls] == [6000, 4000, 6000, 6000]
+    assert all("max_completion_tokens" not in b for b in calls)
     assert [r["phase"] for r in result["usage_observation"]["model_calls"]] == [
         "first_draft",
         "research",

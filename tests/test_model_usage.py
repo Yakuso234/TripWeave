@@ -20,6 +20,47 @@ from tripweave.settings import Settings
 from tripweave.storage import Store
 
 
+async def test_exhausted_output_budget_is_incomplete_and_keeps_billable_usage():
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            return map_response(request)
+        body = json.loads(request.content)
+        assert body["max_tokens"] == 6000 and "max_completion_tokens" not in body
+        return httpx2.Response(
+            200,
+            json={
+                "id": "truncated-offline",
+                "model": "deepseek-flash",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "length",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": "PRIVATE-THINKING",
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 6000,
+                    "completion_tokens_details": {"reasoning_tokens": 6000},
+                },
+            },
+        )
+
+    result = await run_plan(
+        requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
+    )
+    assert result["outcome"] == "incomplete" and result["itinerary"] is None
+    calls = result["usage_observation"]["model_calls"]
+    assert calls and all(c["finish_reason"] == "length" for c in calls)
+    assert all(c["output_tokens"] == 6000 for c in calls)
+    assert all(c["output_limit_parameter"] == "max_tokens" for c in calls)
+    assert "PRIVATE-THINKING" not in json.dumps(result)
+
+
 async def test_role_requests_tokens_and_limits_match_supplier_without_double_counting(tmp_path):
     roles = {"planner": 0, "research": 0, "reviewer": 0}
     bodies = []
@@ -77,7 +118,9 @@ async def test_role_requests_tokens_and_limits_match_supplier_without_double_cou
     assert [r["role"] for r in rows] == ["planner", "research", "planner", "reviewer"]
     assert [r["input_tokens"] for r in rows] == [100, 200, 300, 400]
     assert [r["max_output_tokens"] for r in rows] == [7000, 5000, 7000, 6000]
-    assert [body["max_completion_tokens"] for body in bodies] == [7000, 5000, 7000, 6000]
+    assert [body["max_tokens"] for body in bodies] == [7000, 5000, 7000, 6000]
+    assert all("max_completion_tokens" not in body for body in bodies)
+    assert all(r["output_limit_parameter"] == "max_tokens" for r in rows)
     assert all(r["reasoning_tokens"] == 3 and r["cache_read_tokens"] == 20 for r in rows)
     assert [r["cache_miss_tokens"] for r in rows] == [80, 180, 280, 380]
     assert all(r["finish_reason"] == "tool_calls" and r["elapsed_ms"] >= 0 for r in rows)
@@ -92,6 +135,7 @@ async def test_role_requests_tokens_and_limits_match_supplier_without_double_cou
             "phase",
             "status",
             "max_output_tokens",
+            "output_limit_parameter",
             "input_tokens",
             "output_tokens",
             "reasoning_tokens",

@@ -104,7 +104,8 @@ async def test_clean_review_is_required_before_ready_and_recorded_as_max_role():
     ]
     assert reviews[0]["reasoning_effort"] == "max"
     assert reviews[0]["thinking"] == {"type": "enabled"}
-    assert reviews[0]["max_completion_tokens"] == 6000
+    assert reviews[0]["max_tokens"] == 6000
+    assert "max_completion_tokens" not in reviews[0]
     assert result["thinking_configuration"]["reviewer"] == {"enabled": True, "effort": "max"}
     context = json.loads(reviews[0]["messages"][-1]["content"])
     assert context["draft"] == itinerary()

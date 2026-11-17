@@ -1697,6 +1697,15 @@ async def run_plan(
                             settings.model,
                             provider=OpenAIProvider(openai_client=sdk),
                             profile=OpenAIModelProfile(
+                                # DeepSeek documents max_tokens; the OpenAI
+                                # default otherwise emits max_completion_tokens.
+                                openai_chat_supports_max_completion_tokens=(
+                                    settings.base_url.rstrip("/")
+                                    not in (
+                                        "https://api.deepseek.com",
+                                        "https://api.deepseek.com/v1",
+                                    )
+                                ),
                                 openai_supports_strict_tool_definition=False,
                                 supports_forced_tool_choice=False,
                                 openai_chat_thinking_field="reasoning_content",
