@@ -32,9 +32,11 @@ def assert_mode(body, effort):
             assert "PRIVATE-THINKING" not in (message.get("content") or "")
 
 
-@pytest.mark.parametrize("planner,research", [("max", "high"), ("high", "max")])
+@pytest.mark.parametrize(
+    "planner,research,reviewer", [("max", "high", "low"), ("high", "max", "max")]
+)
 async def test_three_roles_think_at_configured_effort_and_only_explicit_context_crosses_stages(
-    planner, research
+    planner, research, reviewer
 ):
     counters = {"planner": 0, "research": 0, "reviewer": 0}
     calls = []
@@ -62,9 +64,7 @@ async def test_three_roles_think_at_configured_effort_and_only_explicit_context_
                 "reviewer": "review_report",
             }[role]
         }
-        assert_mode(
-            body, research if role == "research" else "max" if role == "reviewer" else planner
-        )
+        assert_mode(body, {"planner": planner, "research": research, "reviewer": reviewer}[role])
         assert "PRIVATE-THINKING" not in json.dumps(body["messages"])
         calls.append(body)
         if role == "reviewer":
@@ -90,7 +90,7 @@ async def test_three_roles_think_at_configured_effort_and_only_explicit_context_
         return with_thinking(response, f"PRIVATE-THINKING-{role}-{number}")
 
     settings = configured().model_copy(
-        update={"planner_effort": planner, "research_effort": research}
+        update={"planner_effort": planner, "research_effort": research, "reviewer_effort": reviewer}
     )
     result = await run_plan(
         requirements(), "deepseek", settings, transport=httpx2.MockTransport(provider)
@@ -101,7 +101,7 @@ async def test_three_roles_think_at_configured_effort_and_only_explicit_context_
     assert result["thinking_configuration"] == {
         "planner": {"enabled": True, "effort": planner},
         "research": {"enabled": True, "effort": research},
-        "reviewer": {"enabled": True, "effort": "max"},
+        "reviewer": {"enabled": True, "effort": reviewer},
     }
     assert "PRIVATE-THINKING" not in json.dumps(result)
     assert [b["max_tokens"] for b in calls] == [6000, 4000, 6000, 6000]
@@ -127,7 +127,7 @@ async def test_planner_repair_uses_current_draft_and_validation_feedback_not_pri
             return map_response(request)
         body = json.loads(request.content)
         calls.append(body)
-        assert_mode(body, "max")
+        assert_mode(body, "high")
         assert "PRIVATE-THINKING" not in json.dumps(body["messages"])
         names = tool_names(body)
         if names == {"review_report"}:

@@ -36,7 +36,7 @@ async def test_actual_requests_use_first_draft_then_evidence_revision_instructio
             assert context["task"] == "revision" and context["draft"]
             assert "本阶段只提出" not in system
             assert "提交前逐天自查计数" in system and "revision_days" in system
-        assert body["reasoning_effort"] == "max"
+        assert body["reasoning_effort"] == "high"
         assert body["thinking"] == {"type": "enabled"}
         assert body["max_tokens"] == 6000
         assert "max_completion_tokens" not in body

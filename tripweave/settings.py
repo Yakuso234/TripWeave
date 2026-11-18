@@ -22,13 +22,13 @@ class Settings(BaseSettings):
     base_url: str = Field(default="https://api.deepseek.com", validation_alias="LLM_BASE_URL")
     model: str = Field(default="deepseek-flash", validation_alias="LLM_MODEL")
     planner_effort: Literal["low", "high", "max"] = Field(
-        default="max", validation_alias="TRIPWEAVE_PLANNER_EFFORT"
+        default="high", validation_alias="TRIPWEAVE_PLANNER_EFFORT"
     )
     research_effort: Literal["low", "high", "max"] = Field(
         default="high", validation_alias="TRIPWEAVE_RESEARCH_EFFORT"
     )
     reviewer_effort: Literal["low", "high", "max"] = Field(
-        default="max", validation_alias="TRIPWEAVE_REVIEWER_EFFORT"
+        default="high", validation_alias="TRIPWEAVE_REVIEWER_EFFORT"
     )
     run_timeout: int | None = Field(default=600, ge=5, validation_alias="TRIPWEAVE_RUN_TIMEOUT")
     max_requests: int | None = Field(default=None, ge=2, validation_alias="TRIPWEAVE_MAX_REQUESTS")

@@ -32,7 +32,7 @@ uv --cache-dir .runtime/uv-cache sync --locked
 | `AMAP_API_KEY` | 所有规划必需；高德 **Web 服务** Key，需具有 POI 搜索及路线权限 |
 | `DEEPSEEK_API_KEY` | DeepSeek 模式必需；可在本机接入设置或 `.env` 配置 |
 | `LLM_BASE_URL` / `LLM_MODEL` | 默认 DeepSeek 官方地址与 `deepseek-flash`；模型别名可修改 |
-| `TRIPWEAVE_PLANNER_EFFORT` / `TRIPWEAVE_RESEARCH_EFFORT` / `TRIPWEAVE_REVIEWER_EFFORT` | 三角色均开启思考，默认排程 `max`、研究 `high`、校验 `max`；可选 `low/high/max` |
+| `TRIPWEAVE_PLANNER_EFFORT` / `TRIPWEAVE_RESEARCH_EFFORT` / `TRIPWEAVE_REVIEWER_EFFORT` | 三角色均开启思考，默认三类角色均为 `high`；可选 `low/high/max` |
 | `TRIPWEAVE_DATABASE` | 默认 `.runtime/tripweave.sqlite3`，本地无需额外数据库服务 |
 | `DATABASE_URL` | 可选 PostgreSQL 连接串，优先于本地路径；详见部署说明 |
 | `TRIPWEAVE_MAX_REQUESTS` / `TRIPWEAVE_RUN_TIMEOUT` | 默认 8 轮模型调用 / 整次规划 300 秒 |
@@ -125,7 +125,7 @@ Get-Content tests/frontend_state.cjs -Raw | node
 
 ## 2026-11-15 思考配置
 
-排程、按需事实研究和独立校验均使用同一deepseek-flash配置，默认思考强度分别max/high/max。配置与候选的thinking_configuration可查实际设置；SDK工具调用历史按reasoning_content字段回传，不把原始思考内容放入候选或公开轨迹。角色间只传结构化结果与必要上下文。该配置针对官方DeepSeek，其他兼容服务需另行核对。
+排程、按需事实研究和独立校验均使用同一deepseek-flash配置，默认思考强度均为 `high`。配置与候选的thinking_configuration可查实际设置；SDK工具调用历史按reasoning_content字段回传，不把原始思考内容放入候选或公开轨迹。角色间只传结构化结果与必要上下文。该配置针对官方DeepSeek，其他兼容服务需另行核对。
 
 模型轮次上限8轮、整轮180秒及排程6000/研究4000输出token上限保留，校验每次6000；强度不代表无限计算，协商会占用原本的修订和研究额度。效果与产出一份可用方案的实际费用尚未对照比较。本单元只使用离线HTTP模拟，不新增真实调用；最终检查结果见[验证记录](docs/evaluations/V02_QA.md)。官方参数依据见[思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)。
 
@@ -155,7 +155,9 @@ DeepSeek官方端点显式使用max_tokens（不发送OpenAI默认的max_complet
 修正DeepSeek字段后一次真实请求证实max_tokens=6000生效：输出6000且全部为思考、finish_reason=length，未生成首稿；当前max强度下该样本预算不足，不能将38秒截断称规划提速。[实测记录](docs/evaluations/MAX_TOKENS_6000_LIVE_20261117.md)。
 
 
-当前按用户要求以完整方案为优先：本地总时限600秒，规划/研究/校验输出及模型轮次/候选检查次数默认不设本地上限（供应商默认仍适用）。.env可用数字恢复限额，null表示不设置；思考仍max/high/max，业务硬校验与一轮校验协商不变。页面和每轮预算快照如实显示。
+当前按用户要求以完整方案为优先：本地总时限600秒，规划/研究/校验输出及模型轮次/候选检查次数默认不设本地上限（供应商默认仍适用）。.env可用数字恢复限额，null表示不设置；三类角色的默认思考强度均为 `high`，业务硬校验与一轮校验协商不变。页面和每轮预算快照如实显示。
 
 
 600秒第一次实测拿到10站修订稿，冻结证据硬校验通过，但因旧一轮补查门禁仍未进入独立校验；已离线改为按剩余问题继续补查，保持600秒，真实效果待新授权测试。[记录](docs/evaluations/COMPLETION_600S_LIVE_20261117.md)。
+
+2026-11-18 三类 Agent 统一 `high` 的单次真实测试已记录，首稿 89.6 秒，完整方案仍因补查与修订循环而超时。见 [实测记录](docs/evaluations/ALL_HIGH_600S_LIVE_20261118.md)。

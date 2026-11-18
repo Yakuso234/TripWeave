@@ -89,7 +89,7 @@ async def negotiate(*, reports=None, response=None, req=None, limit=6, repair=No
     return result, calls, reviews
 
 
-async def test_clean_review_is_required_before_ready_and_recorded_as_max_role():
+async def test_clean_review_is_required_before_ready_and_uses_default_high_effort():
     result, calls, reviews = await negotiate()
     assert result["outcome"] == result["status"] == "ready", result
     assert result["review"]["status"] == "approved"
@@ -102,11 +102,11 @@ async def test_clean_review_is_required_before_ready_and_recorded_as_max_role():
         "planner",
         "reviewer",
     ]
-    assert reviews[0]["reasoning_effort"] == "max"
+    assert reviews[0]["reasoning_effort"] == "high"
     assert reviews[0]["thinking"] == {"type": "enabled"}
     assert reviews[0]["max_tokens"] == 6000
     assert "max_completion_tokens" not in reviews[0]
-    assert result["thinking_configuration"]["reviewer"] == {"enabled": True, "effort": "max"}
+    assert result["thinking_configuration"]["reviewer"] == {"enabled": True, "effort": "high"}
     context = json.loads(reviews[0]["messages"][-1]["content"])
     assert context["draft"] == itinerary()
     assert context["program_issues"] == []
@@ -327,7 +327,7 @@ async def test_research_planner_and_reviewer_keep_private_thinking_isolated():
         counters[role] += 1
         calls.append(body)
         assert "PRIVATE-THINKING" not in json.dumps(body["messages"])
-        assert body["reasoning_effort"] == ("high" if role == "research" else "max")
+        assert body["reasoning_effort"] == "high"
         if role == "research":
             reply = research_final(body, [fact()])
         elif role == "reviewer":
