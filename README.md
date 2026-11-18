@@ -163,3 +163,5 @@ DeepSeek官方端点显式使用max_tokens（不发送OpenAI默认的max_complet
 2026-11-18 三类 Agent 统一 `high` 的单次真实测试已记录，首稿 89.6 秒，完整方案仍因补查与修订循环而超时。见 [实测记录](docs/evaluations/ALL_HIGH_600S_LIVE_20261118.md)。
 
 补查按地点、旅行日期和字段计数，每个缺口最多实际搜索两次，含研究恢复。预约入口、当天是否必约和余票分开，余票请到官方渠道确认。前端可查看已停止补查的字段与待确认事项。见 [补查与证据边界](docs/RESEARCH_RECOVERY.md#2026-11-19-按字段限制定向搜索)。
+
+2026-11-19 的单次真实测试触发两次补查上限，以待确认预约资料结束，详情见 [逐字段限额实测](docs/evaluations/RESEARCH_FIELD_LIMIT_LIVE_20261119.md)。
