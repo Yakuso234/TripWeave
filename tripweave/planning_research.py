@@ -22,14 +22,25 @@ from pydantic_ai.usage import UsageLimits
 
 from .attraction_research import DEEPSEEK_API, read_sources
 from .planning_contracts import PlanningNeed, ResearchReport
-from .research_evidence import FIELD_NAMES, diagnostic, validate_evidence
+from .research_evidence import FIELD_NAMES, diagnostic, usable_research_fact, validate_evidence
 
 FIELD_LABELS = {
     "opening_hours": "开放时间 营业窗口 是否闭馆",
     "last_admission": "最晚入场 停止入场时间",
-    "reservation_rules": "预约规则 可选场次",
+    "reservation_channel": "官方预约入口 预约方式",
+    "reservation_requirement": "参观是否必须预约 免预约规则",
 }
 MAX_SEARCHES = 5
+MAX_SEARCHES_PER_FIELD = 2
+
+
+def research_limit(key, search_attempts):
+    _, _, field = key
+    if field == "ticket_availability":
+        return "live_availability_unverified"
+    if search_attempts.get(key, 0) >= MAX_SEARCHES_PER_FIELD:
+        return "search_limit_reached"
+    return None
 
 
 def _unknown(place_id, day, field, req):
@@ -53,14 +64,7 @@ def _unknown(place_id, day, field, req):
 def _missing_issues(facts, message=None, diagnostics=()):
     grouped = defaultdict(list)
     for fact in facts:
-        lacks_time = fact["status"] == "found" and (
-            fact["field"] == "opening_hours"
-            and not fact.get("windows")
-            and fact.get("closed") is not True
-            or fact["field"] == "last_admission"
-            and not fact.get("last_admission")
-        )
-        if fact["status"] == "unknown" or lacks_time:
+        if not usable_research_fact(fact):
             grouped[(fact["place_id"], fact["day"])].append(fact["field"])
     return [
         {
@@ -95,6 +99,7 @@ async def research_missing_information(
     prefetch=False,
     prior_facts=(),
     prior_diagnostics=(),
+    search_attempts=None,
 ) -> dict:
     """Resolve only explicit planning gaps, sharing the planning request budget.
 
@@ -117,13 +122,21 @@ async def research_missing_information(
             "error": None,
             "outcome": "needs_information",
         }
+    if search_attempts is None:
+        search_attempts = {}
     tasks = {}
     for need in normalized:
         key = (need.place_id, need.day)
+        eligible = [
+            field for field in need.fields if not research_limit((*key, field), search_attempts)
+        ]
+        if not eligible:
+            continue
         if key not in tasks:
             tasks[key] = {"fields": [], "questions": []}
-        tasks[key]["fields"] = list(dict.fromkeys(tasks[key]["fields"] + need.fields))
-        tasks[key]["questions"].append(need.question)
+        tasks[key]["fields"] = list(dict.fromkeys(tasks[key]["fields"] + eligible))
+        if eligible == need.fields:
+            tasks[key]["questions"].append(need.question)
     facts = [
         _unknown(pid, day, field, req)
         for (pid, day), task in tasks.items()
@@ -216,6 +229,8 @@ async def research_missing_information(
                 "开放结束或闭馆时间不等于最晚入场，钟点出现还须语义对应当前字段，不混用时间含义。"
                 "任务weekday为ISO星期1至7（周一至周日），据此核对常规规则与日期例外，不把常规规则当当天保证。"
                 "结构化钟点须出现在引文中，无法明确则留空。不要承诺已预约、实时余票或未来一定开放。"
+                "reservation_channel只回答通过哪里或怎样预约；reservation_requirement只回答"
+                "该馆区在计划日期是否必须预约，预约入口存在不能证明必约；余票留给官方渠道确认。"
                 "这些是带来源的网页报告，不能声称已完成官方核验或据此替用户放宽硬要求。"
             ),
         )
@@ -231,24 +246,36 @@ async def research_missing_information(
                 raise ModelRetry("本轮定向搜索次数已用完，请根据已有来源返回，未知保持unknown。")
             place = places[place_id]
             date = (req.date + timedelta(days=day - 1)).isoformat()
-            fields = " ".join(
-                FIELD_LABELS[field] for field in (refresh_fields or tasks[key]["fields"])
-            )
+            search_fields = [
+                field
+                for field in (refresh_fields or tasks[key]["fields"])
+                if not research_limit((*key, field), search_attempts)
+            ]
+            if not search_fields:
+                raise ModelRetry("这些资料字段已达到两次搜索上限，请根据已有证据返回。")
+            fields = " ".join(FIELD_LABELS[field] for field in search_fields)
             query = f"{date} {req.city} {place['name'][:60]} {fields} 官方 {place.get('address', '')[:40]}"
             if prior_facts or prior_diagnostics:
-                question = " ".join(tasks[key]["questions"])[-65:]
-                query = f"{req.city} {place['name'][:35]} {fields} {question} 官方 {date}"
+                query = f"{date} {req.city} {place['name'][:60]} 官网 公告 {fields}"
             if refresh_fields is not None:
-                query = f"{req.city} {place['name'][:60]} 官网 参观须知 {fields} {place.get('address', '')[:40]}"
-                if prior_facts or prior_diagnostics:
-                    query = f"{req.city} {place['name'][:35]} {fields} {' '.join(tasks[key]['questions'])[-65:]} 官网 参观须知"
+                query = f"{date} {req.city} {place['name'][:60]} 官网 参观须知 {fields}"
             search_calls += 1
+            for field in search_fields:
+                attempt_key = (*key, field)
+                search_attempts[attempt_key] = search_attempts.get(attempt_key, 0) + 1
             queried_at = datetime.now(UTC).isoformat()
             sources = []
             error = None
             billable = None
             http_status = None
-            trace.append({"event": "research_search_attempt", "place_id": place_id, "day": day})
+            trace.append(
+                {
+                    "event": "research_search_attempt",
+                    "place_id": place_id,
+                    "day": day,
+                    "fields": search_fields,
+                }
+            )
             try:
                 response = await client.post(
                     f"{DEEPSEEK_API}/tools/search",
@@ -412,7 +439,11 @@ async def research_missing_information(
         repair_keys = {
             (d["place_id"], d["day"], d["field"])
             for d in diagnostics
-            if d["code"] in search_codes | extract_codes
+            if d["code"] in extract_codes
+            or (
+                d["code"] in search_codes
+                and not research_limit((d["place_id"], d["day"], d["field"]), search_attempts)
+            )
         } & missing
         if repair_keys:
             # Reserve the minimum one planner call + one initial review call.

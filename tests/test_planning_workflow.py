@@ -420,8 +420,8 @@ async def test_second_information_request_can_research_and_reach_approved_plan()
     assert result["issues"] == [] and result["review"]["status"] == "approved"
 
 
-async def test_identical_research_question_with_unchanged_evidence_stops_as_no_progress():
-    searches = []
+async def test_research_limit_includes_recovery_and_filters_mixed_requests():
+    searches, planners, research_tasks = [], [], []
 
     def provider(request):
         if request.url.host != "api.deepseek.com":
@@ -430,16 +430,113 @@ async def test_identical_research_question_with_unchanged_evidence_stops_as_no_p
             searches.append(json.loads(request.content))
             return sources()
         body = json.loads(request.content)
+        prompt = json.loads(body["messages"][-1]["content"])
         if "research_report" in tool_names(body):
-            return completion("research_report", {"facts": [fact()]}, 1)
-        return completion("draft_proposal", packet(itinerary(), needs=gap()["needs"]), 1)
+            tasks = prompt.get("tasks") or prompt["recovery_tasks"]
+            fields = tasks[0].get("fields") or [tasks[0]["field"]]
+            research_tasks.append(fields)
+            if fields == ["last_admission"]:
+                answer = fact(field="last_admission", windows=[], last_admission="16:00")
+            else:
+                answer = {
+                    "place_id": "p0",
+                    "day": 1,
+                    "field": "opening_hours",
+                    "status": "unknown",
+                    "unknown_reason": "field_not_stated",
+                    "unknown_detail": "摘要未说明该场馆当天的开放时间。",
+                }
+            return completion("research_report", {"facts": [answer]}, 1)
+        planners.append(prompt)
+        needs = gap()["needs"]
+        if len(planners) == 2:
+            needs[0]["fields"].append("last_admission")
+            needs[0]["question"] = "是否白天开放？另外几点停止入场？"
+        elif len(planners) == 3:
+            needs[0]["question"] = "换一个来源再核实白天能否参观。"
+        return completion(
+            "draft_proposal",
+            packet(itinerary(), queries=None if len(planners) == 1 else [], needs=needs),
+            1,
+        )
 
     result = await run(requirements(), provider, limit=None)
     assert result["outcome"] == "needs_information", result
-    assert result["research_rounds"] == len(searches) == 2
+    assert result["research_rounds"] == 2 and len(searches) == len(planners) == 3
+    assert research_tasks == [["opening_hours"], ["opening_hours"], ["last_admission"]]
+    assert "开放" not in searches[-1]["query"]
+    assert [
+        event["fields"] for event in result["trace"] if event["event"] == "research_search_attempt"
+    ] == research_tasks
+    assert planners[1]["research_limits"][0]["search_attempts"] == 2
+    assert "已查过2次" in planners[1]["research_limits"][0]["message"]
+    assert planners[1]["planning_facts"][0]["status"] == "unknown"
     assert result["issues"][0]["code"] == "research_no_progress"
     assert result["draft"] == itinerary() and result["itinerary"] is None
     assert any(t["event"] == "research_no_progress" for t in result["trace"])
+
+
+async def test_reservation_channel_does_not_resolve_requirement_or_availability():
+    searches, planners = [], []
+
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            return map_response(request)
+        if request.url.path.endswith("/tools/search"):
+            searches.append(json.loads(request.content)["query"])
+            return httpx2.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "url": "https://example.com/booking",
+                            "title": "参观预约",
+                            "snippet": "请从官方小程序预约。",
+                            "content": "请从官方小程序预约。",
+                        }
+                    ]
+                },
+            )
+        body = json.loads(request.content)
+        prompt = json.loads(body["messages"][-1]["content"])
+        if "research_report" in tool_names(body):
+            assert prompt["tasks"][0]["fields"] == ["reservation_channel"]
+            return completion(
+                "research_report",
+                {
+                    "facts": [
+                        {
+                            "place_id": "p0",
+                            "day": 1,
+                            "field": "reservation_channel",
+                            "status": "found",
+                            "source_ids": [1],
+                            "value": "官方小程序",
+                            "quote": "请从官方小程序预约。",
+                        }
+                    ]
+                },
+                1,
+            )
+        planners.append(prompt)
+        needs = gap(field="reservation_channel")["needs"] if len(planners) == 1 else []
+        if needs:
+            needs[0]["fields"].append("ticket_availability")
+        return completion(
+            "draft_proposal",
+            packet(itinerary(), queries=None if needs else [], needs=needs),
+            1,
+        )
+
+    result = await run(requirements(), provider, limit=None)
+    assert len(searches) == 1 and "余票" not in searches[0]
+    assert [(fact["field"], fact["status"]) for fact in planners[1]["planning_facts"]] == [
+        ("reservation_channel", "found"),
+    ]
+    assert result["research_limits"][0]["code"] == "live_availability_unverified"
+    assert result["research_limits"][0]["search_attempts"] == 0
+    assert result["outcome"] == "needs_information"
+    assert result["issues"][0]["missing_fields"] == ["ticket_availability"]
 
 
 async def test_shared_budget_exhaustion_retains_failed_draft_and_original_problem():

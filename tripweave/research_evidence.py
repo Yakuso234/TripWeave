@@ -8,7 +8,20 @@ FIELD_NAMES = {
     "opening_hours": "开放时段",
     "last_admission": "最晚入场时间",
     "reservation_rules": "预约规则",
+    "reservation_channel": "预约入口",
+    "reservation_requirement": "当天是否必须预约",
+    "ticket_availability": "当日余票或可预约名额",
 }
+
+
+def usable_research_fact(fact):
+    if fact["status"] != "found" or fact["field"] == "ticket_availability":
+        return False
+    if fact["field"] == "opening_hours":
+        return bool(fact.get("windows") or fact.get("closed") is True)
+    if fact["field"] == "last_admission":
+        return bool(fact.get("last_admission"))
+    return True
 
 
 def date_in_explicit_range(target: str, text: str) -> bool:

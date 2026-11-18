@@ -96,8 +96,13 @@ function planningOutcomeMessage(plan) {
     incomplete:'本次尚未找到通过校验的方案，不代表你的旅行需求无解。',
     service_error:'接口请求未正常完成，请检查接入状态后重试。'})[plan.outcome] || '';
 }
+const researchFieldLabels = {
+  opening_hours:'开放时段',last_admission:'最晚入场时间',reservation_rules:'预约规则',
+  reservation_channel:'预约入口',reservation_requirement:'当天是否必须预约',
+  ticket_availability:'当日余票或可预约名额',
+};
 function planningIssueText(issue, plan) {
-  const labels = {opening_hours:'开放时段',last_admission:'最晚入场时间',reservation_rules:'预约规则'};
+  const labels = researchFieldLabels;
   const place = (plan.places || []).find(item=>item.id === issue.place_id);
   const position = [issue.day ? '第 '+issue.day+' 天' : '',issue.stop_number ? '第 '+issue.stop_number+' 站' : '', place?.name || ''].filter(Boolean);
   const missing = (issue.missing_fields || []).map(field=>labels[field] || '所需资料');
@@ -459,10 +464,13 @@ function reviewPanel(plan) {
 }
 function researchPanel(plan) {
   const requests = plan.research_requests || [], diagnostics = plan.research_diagnostics || [];
-  if (!requests.length && !diagnostics.length) return '';
-  const names = {opening_hours:'开放时段',last_admission:'最晚入场时间',reservation_rules:'预约规则'};
+  const limits = plan.research_limits || [];
+  if (!requests.length && !diagnostics.length && !limits.length) return '';
+  const names = researchFieldLabels;
   const places = new Map((plan.places || []).map(p=>[p.id,p.name]));
-  return `<section class="card usage-panel"><h2>资料补查记录</h2><details><summary>查看补查原因与逐字段诊断（${diagnostics.length}条）</summary>
+  return `<section class="card usage-panel"><h2>资料补查记录</h2>
+    ${limits.length ? `<details><summary>查看已停止补查的资料（${limits.length}项）</summary><ul>${limits.map(item=>`<li>${esc(item.message)}${item.fact_available ? '已有可用资料。' : ''}</li>`).join('')}</ul></details>` : ''}
+    <details><summary>查看补查原因与逐字段诊断（${diagnostics.length}条）</summary>
     ${requests.map((request,index)=>`<h3>补查请求 ${index+1}</h3><p>${esc(request.reason)}</p><ul>${(request.needs || []).map(need=>`<li>第 ${esc(need.day)} 天 · ${esc(places.get(need.place_id) || need.place_id)} · ${(need.fields || []).map(field=>esc(names[field] || field)).join('、')}<p>${esc(need.question)}</p></li>`).join('')}</ul>`).join('')}
     ${diagnostics.length ? `<ol>${diagnostics.map(d=>`<li><strong>第 ${esc(d.day)} 天 · ${esc(places.get(d.place_id) || d.place_id)} · ${esc(names[d.field] || d.field)}</strong><p>${esc(d.origin === 'model' ? '研究 Agent 判断（待核实）' : '程序检测')}${d.attempt ? ' · 第 '+esc(d.attempt)+' 次核检' : ''}${d.resolved ? ' · 已解决' : d.severity === 'warning' ? ' · 提示' : ''}</p><p>${esc(d.message)}</p>${d.actual == null ? '' : `<p class="small">提取/返回值：${esc(Array.isArray(d.actual)?d.actual.join('、'):String(d.actual))}</p>`}</li>`).join('')}</ol>` : '<p class="muted small">尚无逐字段诊断记录。</p>'}
     <p class="muted small">来源可追溯不等于现实已核实；研究判断不当作程序已确认的事实。预算耗尽与资料未知分别显示。</p></details></section>`;
@@ -500,7 +508,7 @@ function draftUncertainties(record) {
   const needs=Array.isArray(record.pending_information)?record.pending_information:record.pending_information?.needs || [];
   const assumptions=record.assumptions || [];
   if (!needs.length && !assumptions.length) return '';
-  const names={opening_hours:'开放时段',last_admission:'最晚入场',reservation_rules:'预约规则'};
+  const names=researchFieldLabels;
   return `<div class="small"><h4>待确认事项</h4><ul>${needs.map(need=>`<li>第 ${esc(need.day)} 天 · ${(need.fields || []).map(field=>esc(names[field] || field)).join('、')}<p>${esc(need.question)}</p></li>`).join('')}${assumptions.map(text=>`<li>${esc(text)}</li>`).join('')}</ul></div>`;
 }
 function draftQueryPanel(plan) {

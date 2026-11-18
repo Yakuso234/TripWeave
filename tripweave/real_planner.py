@@ -4,7 +4,7 @@ import asyncio
 import json
 import math
 from contextlib import nullcontext
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TypedDict
 
 import httpx2
@@ -38,7 +38,7 @@ from .planning_contracts import (
     validate_visit_constraints,
 )
 from .planning_prompts import planner_instructions
-from .planning_research import research_missing_information
+from .planning_research import research_limit, research_missing_information
 from .planning_review import (
     ReviewContractError,
     ReviewReport,
@@ -47,6 +47,7 @@ from .planning_review import (
     validate_response,
 )
 from .query_executor import QueryExecutor, query_key
+from .research_evidence import FIELD_NAMES, usable_research_fact
 from .settings import Settings
 
 
@@ -793,6 +794,7 @@ class PlanningState(TypedDict, total=False):
     research_diagnostics: list[dict]
     research_requests: list[dict]
     research_search_calls: int
+    research_limits: list[dict]
     facts_updated: bool
     review: dict
     query_requests: list
@@ -804,12 +806,20 @@ class PlanningState(TypedDict, total=False):
 
 
 def model_context(value):
-    """Project model input without images, raw web text or duplicate snapshots."""
+    """Project shared input without images, raw web text or duplicated research."""
     if isinstance(value, dict):
         return {
             key: model_context(item)
             for key, item in value.items()
-            if key not in {"photos", "excerpt", "experience_groups", "research_evidence"}
+            if key
+            not in {
+                "photos",
+                "excerpt",
+                "experience_groups",
+                "research_evidence",
+                "research_history",
+                "research_feedback",
+            }
         }
     if isinstance(value, list):
         return [model_context(item) for item in value]
@@ -840,14 +850,7 @@ def unresolved_critical_facts(
     available = {
         (fact["place_id"], fact["day"], fact["field"])
         for fact in facts
-        if fact.get("status") == "found"
-        and (
-            fact["field"] == "reservation_rules"
-            or fact["field"] == "opening_hours"
-            and (fact.get("windows") or fact.get("closed") is True)
-            or fact["field"] == "last_admission"
-            and fact.get("last_admission")
-        )
+        if usable_research_fact(fact)
     }
     issues, counters = [], {}
     for stop in output.stops:
@@ -868,7 +871,8 @@ def unresolved_critical_facts(
                     "stop_number": counters[stop.day],
                     "place_id": stop.place_id,
                     "missing_fields": missing,
-                    "message": f"第{stop.day}天第{counters[stop.day]}站仍缺当日关键资料：{'、'.join(missing)}。"
+                    "message": f"第{stop.day}天第{counters[stop.day]}站仍缺当日关键资料："
+                    f"{'、'.join(FIELD_NAMES[field] for field in missing)}。"
                     "其他日期的资料不能沿用；本轮不再自动补查，请核对信息或调整要求。",
                 }
             )
@@ -967,7 +971,8 @@ async def run_planning_graph(
     executor = None
     repeated = {}
     checked = set()
-    research_repeated = {}
+    research_attempts = {}
+    informed_limits = {}
 
     def draft_identity(draft):
         return {
@@ -1083,14 +1088,19 @@ async def run_planning_graph(
         prompt = {
             "task": phase,
             "requirements": {**req.model_dump(mode="json"), "hotel_nights": req.hotel_nights},
-            "queried_data": packet_context(model_context(data)),
+            "queried_data": packet_context(
+                model_context(
+                    {key: value for key, value in data.items() if key != "planning_facts"}
+                )
+            ),
             "known_places": packet_context(list(known_places().values())),
             "revision_request": (previous_plan or {}).get("revision_request"),
             "previous_plan": model_context(previous_plan) if phase == "first_draft" else None,
             "draft": state["candidate"].model_dump(mode="json") if state.get("candidate") else None,
             "evidence_results": state.get("evidence_results", []),
-            "planning_facts": state.get("research_facts", []),
+            "planning_facts": data.get("planning_facts", []),
             "research_feedback": state.get("research_diagnostics", []),
+            "research_limits": state.get("research_limits", []),
             "validation_issues": state.get("issues", []),
             "instruction": "提交完整当前草稿、结构化查询清单、关键补查需求和暂定假设。"
             "仅根据已提供证据修订；普通工具不可直接调用。查询用明确起点/终点/交通方式，"
@@ -1352,50 +1362,96 @@ async def run_planning_graph(
                 }
             )
         critical = {(n["place_id"], n["day"]): n for n in data.get("critical_needs", [])}
+        requested_keys = []
+        eligible = []
         for need in request.needs:
             item = need.model_dump(mode="json")
             key = (need.place_id, need.day)
+            requested_keys.extend((*key, field) for field in need.fields)
+            fields = [
+                field
+                for field in need.fields
+                if not research_limit((*key, field), research_attempts)
+            ]
+            if fields:
+                updates = {"fields": fields}
+                if fields != need.fields:
+                    updates["question"] = "确认" + "、".join(FIELD_NAMES[field] for field in fields)
+                eligible.append(need.model_copy(update=updates))
             item["fields"] = list(
                 dict.fromkeys(critical.get(key, {}).get("fields", []) + need.fields)
             )
             critical[key] = item
         data["critical_needs"] = list(critical.values())
-        data["research_history"] = state["research_facts"]
-        data["research_feedback"] = state.get("research_diagnostics", [])
-        record({"research_rounds": state["research_rounds"] + 1})
-        report = await researcher(request.needs)
+        rounds = state["research_rounds"]
+        report = {"outcome": "complete"}
+        if eligible:
+            data["research_history"] = state["research_facts"]
+            data["research_feedback"] = state.get("research_diagnostics", [])
+            rounds += 1
+            record({"research_rounds": rounds})
+            report = await researcher(eligible, research_attempts)
         facts = state["research_facts"] + report.get("facts", [])
         # Keep history for audit/context; business checks use the latest version
         # of each field so superseded opening windows cannot contradict repairs.
-        data["planning_facts"] = list(
-            {(f["place_id"], f["day"], f["field"]): f for f in facts}.values()
-        )
+        latest = {(f["place_id"], f["day"], f["field"]): f for f in facts}
+        data["planning_facts"] = list(latest.values())
         outcome = report.get("outcome", "needs_information")
-        signature = json.dumps(
-            {
-                "questions": request.model_dump(mode="json")["needs"],
-                "facts": [
-                    {k: v for k, v in f.items() if k != "queried_at"}
-                    for f in report.get("facts", [])
-                ],
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        research_repeated[signature] = research_repeated.get(signature, 0) + 1
-        no_progress = research_repeated[signature] >= 2
-        # Unknown is feedback, not automatically END: give the planner one
-        # budgeted chance to avoid optional dependencies or preserve a draft.
-        can_return = outcome in {"complete", "needs_information"}
-        if no_progress:
-            outcome, can_return = "needs_information", False
-            report["error"] = (
-                "同一具体问题重复补查未带来新证据，已保留草稿与历次资料；不代表用户需求无解。"
+        limit_feedback = []
+        for key in dict.fromkeys(requested_keys):
+            code = research_limit(key, research_attempts)
+            if not code:
+                continue
+            place_id, day, field = key
+            place_name = known_places()[place_id]["name"]
+            label = FIELD_NAMES[field]
+            attempts = research_attempts.get(key, 0)
+            fact_available = key in latest and usable_research_fact(latest[key])
+            detail = (
+                f"已查过{attempts}次，本轮不会继续查。"
+                if code == "search_limit_reached"
+                else "当前没有实时库存接口，请到官方渠道确认；已跳过网页检索。"
             )
-            report["issues"] = information_issues(request)
-            for issue in report["issues"]:
-                issue["code"] = "research_no_progress"
+            limit_feedback.append(
+                {
+                    "place_id": place_id,
+                    "day": day,
+                    "field": field,
+                    "date": (req.date + timedelta(days=day - 1)).isoformat(),
+                    "code": code,
+                    "search_attempts": attempts,
+                    "fact_available": fact_available,
+                    "message": f"第{day}天 {place_name}的{label}：{detail}",
+                }
+            )
+        newly_limited = [
+            item
+            for item in limit_feedback
+            if (item["place_id"], item["day"], item["field"]) not in informed_limits
+        ]
+        for item in newly_limited:
+            informed_limits[(item["place_id"], item["day"], item["field"])] = item
+            trace.append({"event": "research_field_limited", **item})
+        issues = report.get("issues", [])
+        can_return = outcome in {"complete", "needs_information"}
+        if not eligible and not newly_limited:
+            outcome, can_return = "needs_information", False
+            report["error"] = "规划仍在请求已拦截的资料，已停止本轮补查并保留草稿与历次证据。"
+            issues = [
+                {
+                    **item,
+                    "category": "missing_fact",
+                    "code": "research_no_progress",
+                    "missing_fields": [item["field"]],
+                }
+                for item in limit_feedback
+            ]
             trace.append({"event": "research_no_progress", "detail": report["error"]})
+        elif newly_limited and not eligible:
+            issues = [
+                {**item, "category": "missing_fact", "missing_fields": [item["field"]]}
+                for item in newly_limited
+            ]
         if (
             can_return
             and settings.max_requests is not None
@@ -1406,18 +1462,17 @@ async def run_planning_graph(
             report["error"] = "资料处理后模型轮次已耗尽，已保留草稿、事实与缺口。"
         return record(
             {
-                "research_rounds": state["research_rounds"] + 1,
+                "research_rounds": rounds,
                 "research_search_calls": state["research_search_calls"]
                 + report.get("search_calls", 0),
                 "research_facts": facts,
                 "research_diagnostics": state.get("research_diagnostics", [])
                 + report.get("diagnostics", []),
+                "research_limits": list(informed_limits.values()),
                 "facts_updated": can_return,
                 "information_request": None,
                 "outcome": None if can_return else outcome,
-                "issues": state["issues"]
-                if outcome == "complete"
-                else state["issues"] + report.get("issues", information_issues(request)),
+                "issues": state["issues"] + issues,
                 "error": report.get("error"),
             }
         )
@@ -1439,7 +1494,7 @@ async def run_planning_graph(
         identities = check_draft_identity(req, state["candidate"], known_places(), data["hotels"])
         issues = identities or await validate(req, state["candidate"], data, maps)
         critical = unresolved_critical_facts(
-            state["candidate"], data.get("critical_needs", []), state.get("research_facts", [])
+            state["candidate"], data.get("critical_needs", []), data.get("planning_facts", [])
         )
         for issue in critical:
             issue["diagnostics"] = [
@@ -1775,7 +1830,7 @@ async def run_plan(
                             instructions=None,
                         )
 
-                        async def research(needs):
+                        async def research(needs, search_attempts):
                             with recorder.role("research"), recorder.stage("research"):
                                 return await research_missing_information(
                                     model,
@@ -1789,6 +1844,7 @@ async def run_plan(
                                     prefetch=True,
                                     prior_facts=data.get("research_history", []),
                                     prior_diagnostics=data.get("research_feedback", []),
+                                    search_attempts=search_attempts,
                                     on_progress=lambda facts, diagnostics: progress.update(
                                         {
                                             "research_facts": data.get("research_history", [])
@@ -1907,6 +1963,7 @@ async def run_plan(
             "assumptions": progress.get("assumptions", []),
             "research_diagnostics": progress.get("research_diagnostics", []),
             "research_requests": progress.get("research_requests", []),
+            "research_limits": progress.get("research_limits", []),
             "review": progress.get("review") if mode == "deepseek" else None,
             "pending_information": progress["information_request"].model_dump(mode="json")
             if progress.get("information_request")

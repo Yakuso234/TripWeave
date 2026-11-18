@@ -4,6 +4,10 @@ from typing import Literal
 
 from .pacing import REQUIREMENT_POLICY
 
+RESEARCH_RULES = """【查询取舍】仅当资料影响拟定时段、真实可行性或用户硬要求时才补查。开放时段只有影响安排时才查；已有开放资料足以覆盖拟时段时，不为更换来源而反复查。是否必约（reservation_requirement）和怎么约（reservation_channel）是不同字段。余票（ticket_availability）留给用户到官方渠道确认；价格等普通未知写入assumptions。
+同一地点、旅行day和字段最多实际搜索两次，研究恢复也计入。收到research_limits后结合planning_facts和现有草稿，不再请求被拦截的字段。与可行性无关的未知写明哪站、什么资料待确认；实质影响可行性时可替换可选景点，必去景点保留并列明日期、待确认条件及影响，不能宣称条件已满足。
+"""
+
 FIRST_DRAFT_INSTRUCTIONS = """你是旅行规划Agent。本阶段只提出一份供证据核验的完整初稿，不执行预约、订房或支付。
 【完成标准】先确定每天景点组合、顺序、拟定时段、正餐和住宿收尾；输出draft_proposal的完整draft、query_requests、information_needs、assumptions。不是空泛大纲，也不是已经核验的最终方案。说明简短，只解释关键取舍和未知；完成上述内容后提交，不为软目标的小幅偏离反复优化。
 【已知硬要求】只引用已知地点ID，day为1至旅行天数；保留must_visit和selected_attractions为activity/booking。visit_constraints任选一个窗口完整停留且满足min_duration_minutes；fixed=true精确按唯一窗口排booking。原booking保留地点、day/start/end和类型，不冒称新增预约。手选酒店不可换；连续住宿hotel_nights晚，过夜日末站为所选hotel_id且kind=hotel，备注「过夜当天返回酒店」；次日从酒店，其余日从origin出发。
@@ -38,9 +42,9 @@ REVIEW_RESPONSE_INSTRUCTIONS = """使用respond_to_review输出合同逐项修�
 def planner_instructions(phase: Literal["first_draft", "revision", "review_response"]) -> str:
     """Share authority rules, expose only the current stage's work."""
     if phase == "first_draft":
-        return REQUIREMENT_POLICY + FIRST_DRAFT_INSTRUCTIONS
+        return REQUIREMENT_POLICY + FIRST_DRAFT_INSTRUCTIONS + RESEARCH_RULES
     if phase == "revision":
-        return REQUIREMENT_POLICY + REVISION_INSTRUCTIONS
+        return REQUIREMENT_POLICY + REVISION_INSTRUCTIONS + RESEARCH_RULES
     if phase == "review_response":
         # Negotiation has a different output contract; don't present both.
         rules = REVISION_INSTRUCTIONS.replace(

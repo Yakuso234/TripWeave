@@ -13,7 +13,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 Clock = Annotated[str, Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")]
 PlaceId = Annotated[str, Field(min_length=1, max_length=64)]
-ResearchField = Literal["opening_hours", "last_admission", "reservation_rules"]
+ResearchField = Literal[
+    "opening_hours",
+    "last_admission",
+    "reservation_channel",
+    "reservation_requirement",
+    "ticket_availability",
+]
 
 
 def _minutes(value: str) -> int:
@@ -64,7 +70,12 @@ class PlanningNeed(Contract):
     @classmethod
     def unique_fields(cls, values):
         return (
-            list(dict.fromkeys(values))
+            list(
+                dict.fromkeys(
+                    "reservation_requirement" if value == "reservation_rules" else value
+                    for value in values
+                )
+            )
             if isinstance(values, list) and all(isinstance(value, str) for value in values)
             else values
         )

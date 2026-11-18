@@ -182,7 +182,12 @@ async def test_found_facts_bind_citations_and_parallel_repeated_search_reuses_on
     ]
     assert trace[-1]["event"] == "research_complete"
     assert [event for event in trace if event["event"] == "research_search_attempt"] == [
-        {"event": "research_search_attempt", "place_id": "p0", "day": 1}
+        {
+            "event": "research_search_attempt",
+            "place_id": "p0",
+            "day": 1,
+            "fields": ["opening_hours", "last_admission"],
+        }
     ]
 
 
@@ -329,7 +334,12 @@ async def test_cancelled_search_leaves_an_attempt_without_private_query_or_crede
         with pytest.raises(asyncio.CancelledError):
             await task
     assert [event for event in trace if event["event"] == "research_search_attempt"] == [
-        {"event": "research_search_attempt", "place_id": "p0", "day": 1}
+        {
+            "event": "research_search_attempt",
+            "place_id": "p0",
+            "day": 1,
+            "fields": ["opening_hours"],
+        }
     ]
 
 
