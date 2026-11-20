@@ -327,10 +327,18 @@ def test_full_api_versions_restore_and_pages(tmp_path, monkeypatch):
     previous_inputs = []
 
     async def tested_planner(
-        req, *, mode, settings, previous_plan, research_context=None, on_draft=None
+        req,
+        *,
+        mode,
+        settings,
+        previous_plan,
+        research_context=None,
+        on_draft=None,
+        continuation=None,
     ):
         previous_inputs.append(previous_plan)
         assert mode == "deepseek"
+        assert continuation is None
         return await run_plan(
             req, "basic", settings, previous_plan, transport=httpx2.MockTransport(handler)
         )

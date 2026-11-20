@@ -30,6 +30,7 @@ from .evidence import load_evidence
 from .maps import MapClient, MapError, cached_route, distance
 from .model_usage import ModelUsageRecorder
 from .pacing import daily_metrics, pacing_issues
+from .planning_continuation import PlanningContinuation, fact_key
 from .planning_contracts import (
     PlanningInformationRequest,
     TimeWindow,
@@ -959,6 +960,7 @@ async def run_planning_graph(
     progress: dict | None = None,
     on_draft=None,
     recorder=None,
+    continuation: PlanningContinuation | None = None,
 ) -> PlanningState:
     # This in-process snapshot survives a node exception so a failed draft can
     # be stored with the candidate result. It is not a LangGraph checkpoint.
@@ -971,8 +973,22 @@ async def run_planning_graph(
     executor = None
     repeated = {}
     checked = set()
-    research_attempts = {}
-    informed_limits = {}
+    research_attempts = dict(continuation.search_attempts) if continuation else {}
+    informed_limits = {fact_key(item): item for item in continuation.limits} if continuation else {}
+    supplied_keys = (
+        {
+            fact_key(fact)
+            for fact in continuation.facts
+            if fact.get("evidence_status") == "user_reported"
+        }
+        if continuation
+        else set()
+    )
+
+    def limit_for(key):
+        return (
+            "user_fact_supplied" if key in supplied_keys else research_limit(key, research_attempts)
+        )
 
     def draft_identity(draft):
         return {
@@ -1020,25 +1036,35 @@ async def run_planning_graph(
                 or "已声明硬条件预检通过，继续核实地点",
             }
         )
-        return record(
-            {
-                "attempts": 0,
-                "query_requests": [],
-                "query_log": [],
-                "evidence_results": [],
-                "planning_phase": "first_draft",
-                "assumptions": [],
-                "research_rounds": 0,
-                "research_facts": [],
-                "research_diagnostics": [],
-                "research_requests": [],
-                "research_search_calls": 0,
-                "facts_updated": False,
-                "review": {"version": 1, "status": "pending"},
-                "issues": issues,
-                "outcome": "needs_user_decision" if issues else None,
-            }
-        )
+        initial = {
+            "attempts": 0,
+            "query_requests": [],
+            "query_log": [],
+            "evidence_results": [],
+            "planning_phase": "first_draft",
+            "assumptions": [],
+            "research_rounds": 0,
+            "research_facts": [],
+            "research_diagnostics": [],
+            "research_requests": [],
+            "research_search_calls": 0,
+            "facts_updated": False,
+            "review": {"version": 1, "status": "pending"},
+            "issues": issues,
+            "outcome": "needs_user_decision" if issues else None,
+        }
+        if continuation and not issues:
+            initial.update(
+                candidate=continuation.draft,
+                planning_phase="revision",
+                facts_updated=True,
+                research_facts=continuation.facts,
+                research_requests=continuation.requests,
+                research_diagnostics=continuation.diagnostics,
+                research_limits=continuation.limits,
+                evidence_results=list(continuation.query_results.values()),
+            )
+        return record(initial)
 
     async def prepare_evidence(_: PlanningState) -> dict:
         nonlocal executor
@@ -1070,7 +1096,20 @@ async def run_planning_graph(
         if previous_plan and previous_plan.get("revision_request"):
             for place in previous_plan["places"]:
                 maps.places.setdefault(place["id"], place)
+        if continuation:
+            for place in continuation.places:
+                maps.places.setdefault(place["id"], place)
+            for key, entry in continuation.query_results.items():
+                if key[0] == "route":
+                    maps.cache.setdefault(key[1:], entry["data"])
+            data["planning_facts"] = continuation.facts
+            data["critical_needs"] = continuation.critical_needs
+            trace.append(
+                {"event": "user_facts", "detail": "从已保存草稿继续，使用用户补充的资料。"}
+            )
         executor = QueryExecutor(req, maps, trace)
+        if continuation:
+            executor.cache.update(continuation.query_results)
         resolved = {**data.get("constrained_places", {}), "booking": data.get("booking")}
         issues = preflight_requirements(req, resolved)
         if not issues:
@@ -1113,6 +1152,13 @@ async def run_planning_graph(
                 "使用已有证据，未知路线可暂估并列查询，不声称已核实。"
                 "检查已知硬要求、地点身份、日期和基础时间结构后提交；"
                 "不为软目标小幅偏离反复优化，说明简短。"
+            )
+        elif continuation:
+            prompt["instruction"] += (
+                "从当前候选草稿接续。planning_facts中user_reported是用户对指定地点及日期提供的资料，"
+                "直接用于相应字段，不重复补查，优先保留未受影响的安排。"
+                "若当天必须预约，注明预约入口（已知时）、拟定入场时段、预约成功后才执行；"
+                "余票与预约完成情况仍未知，不能写成用户已预约。"
             )
         # Preserve local-repair scope for known draft errors. New evidence can
         # affect the whole trip, in which case the model receives all days.
@@ -1368,11 +1414,7 @@ async def run_planning_graph(
             item = need.model_dump(mode="json")
             key = (need.place_id, need.day)
             requested_keys.extend((*key, field) for field in need.fields)
-            fields = [
-                field
-                for field in need.fields
-                if not research_limit((*key, field), research_attempts)
-            ]
+            fields = [field for field in need.fields if not limit_for((*key, field))]
             if fields:
                 updates = {"fields": fields}
                 if fields != need.fields:
@@ -1399,7 +1441,7 @@ async def run_planning_graph(
         outcome = report.get("outcome", "needs_information")
         limit_feedback = []
         for key in dict.fromkeys(requested_keys):
-            code = research_limit(key, research_attempts)
+            code = limit_for(key)
             if not code:
                 continue
             place_id, day, field = key
@@ -1407,11 +1449,11 @@ async def run_planning_graph(
             label = FIELD_NAMES[field]
             attempts = research_attempts.get(key, 0)
             fact_available = key in latest and usable_research_fact(latest[key])
-            detail = (
-                f"已查过{attempts}次，本轮不会继续查。"
-                if code == "search_limit_reached"
-                else "当前没有实时库存接口，请到官方渠道确认；已跳过网页检索。"
-            )
+            detail = {
+                "search_limit_reached": f"已查过{attempts}次，本轮不会继续查。",
+                "live_availability_unverified": "当前没有实时库存接口，请到官方渠道确认；已跳过网页检索。",
+                "user_fact_supplied": "用户已补充资料，请直接使用，不再执行搜索。",
+            }[code]
             limit_feedback.append(
                 {
                     "place_id": place_id,
@@ -1740,6 +1782,7 @@ async def run_plan(
     transport=None,
     research_context: dict | None = None,
     on_draft=None,
+    continuation: PlanningContinuation | None = None,
 ) -> dict:
     if not map_configured(settings):
         raise MapError("请先配置AMAP_API_KEY（高德Web服务Key），才能使用真实地点与路线规划")
@@ -1874,6 +1917,7 @@ async def run_plan(
                             progress=progress,
                             on_draft=on_draft,
                             recorder=recorder,
+                            continuation=continuation,
                         )
                         issues = state.get("issues", [])
                         error = state.get("error")
@@ -1960,6 +2004,23 @@ async def run_plan(
             "research_facts": progress.get("research_facts", []),
             "planning_protocol": "draft_first",
             "query_log": progress.get("query_log", []),
+            **(
+                {
+                    "user_supplied_facts": continuation.new_facts,
+                    "carried_query_results": list(continuation.query_results.values()),
+                    "carried_research_attempts": [
+                        {
+                            "place_id": key[0],
+                            "day": key[1],
+                            "field": key[2],
+                            "search_attempts": attempts,
+                        }
+                        for key, attempts in continuation.search_attempts.items()
+                    ],
+                }
+                if continuation
+                else {}
+            ),
             "assumptions": progress.get("assumptions", []),
             "research_diagnostics": progress.get("research_diagnostics", []),
             "research_requests": progress.get("research_requests", []),

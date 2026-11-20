@@ -356,7 +356,7 @@ def validate_visit_constraints(req, output, resolved_by_constraint: Mapping) -> 
 
 
 def validate_research_facts(output, facts: list[dict]) -> list[dict]:
-    """Check only explicit web-reported structures, never infer windows from prose."""
+    """Check only explicitly structured visit times."""
     issues = []
     for stop, number in _numbered_stops(output):
         if stop.kind not in ("activity", "booking"):
@@ -369,24 +369,26 @@ def validate_research_facts(output, facts: list[dict]) -> list[dict]:
             ):
                 continue
             field = fact.get("field")
+            evidence_status = fact.get("evidence_status", "web_reported")
+            source = "用户补充资料" if evidence_status == "user_reported" else "网页资料"
             windows = fact.get("windows") or []
             code = None
             if field == "opening_hours":
                 if fact.get("closed") is True:
-                    code, detail = "reported_closed", "网页来源显示该日关闭"
+                    code, detail = "reported_closed", f"{source}显示该日关闭"
                 elif windows and not any(
                     window.get("day") == stop.day
                     and window["start_time"] <= stop.start_time
                     and stop.end_time <= window["end_time"]
                     for window in windows
                 ):
-                    code, detail = "reported_opening_window", "完整停留未落在网页报告的开放窗口内"
+                    code, detail = "reported_opening_window", f"完整停留未落在{source}的开放窗口内"
             elif field == "last_admission":
                 latest = fact.get("last_admission")
                 if latest and stop.start_time > latest:
                     code, detail = (
                         "reported_last_admission",
-                        f"开始时刻晚于网页报告的{latest}最晚入场",
+                        f"开始时刻晚于{source}的最晚入场时间{latest}",
                     )
             if code:
                 issues.append(
@@ -401,7 +403,7 @@ def validate_research_facts(output, facts: list[dict]) -> list[dict]:
                             key: fact.get(key) for key in ("windows", "closed", "last_admission")
                         },
                         "actual": {"start_time": stop.start_time, "end_time": stop.end_time},
-                        "evidence_status": "web_reported",
+                        "evidence_status": evidence_status,
                         "source_ids": fact.get("source_ids", []),
                         "sources": fact.get("sources", []),
                         "queried_at": fact.get("queried_at"),

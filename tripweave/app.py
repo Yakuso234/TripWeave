@@ -27,6 +27,7 @@ from .evidence import load_evidence
 from .identity import WORKSPACE_ID
 from .maps import MapClient, MapError
 from .model_usage import planning_budget
+from .planning_continuation import PlanningContinuation, UserFact
 from .real_planner import map_configured, prepare, run_plan
 from .settings import Settings
 from .storage import Store, StoreError
@@ -384,6 +385,7 @@ def create_app(database: str | None = None) -> FastAPI:
         source_plan_id: str | None = Field(default=None, max_length=64)
         revision_notes: str = Field(default="", max_length=1500)
         expected_requirements_revision: int | None = Field(default=None, ge=1)
+        supplied_facts: list[UserFact] = Field(default_factory=list, max_length=25)
 
     @app.post("/api/trips/{trip_id}/plan")
     async def generate(trip_id: str, payload: PlanRequest):
@@ -401,8 +403,27 @@ def create_app(database: str | None = None) -> FastAPI:
         if expected is not None and trip["requirements_revision"] != expected:
             raise HTTPException(409, "旅行偏好已经更新，请核对后重新生成。")
         previous = trip["accepted_plan"]
+        req = Requirements.model_validate(trip["requirements"])
         revision = payload.revision_notes.strip()
-        if payload.source_plan_id:
+        continuation = None
+        if payload.supplied_facts:
+            if not payload.source_plan_id or expected is None or revision:
+                raise HTTPException(422, "补充资料时须指定草稿和当前需求版本")
+            source = await run_in_threadpool(store.get_candidate, trip_id, payload.source_plan_id)
+            if (source["requirements_revision"], source["base_version"]) != (
+                trip["requirements_revision"],
+                trip["accepted_version"],
+            ):
+                raise HTTPException(409, "这份草稿依据的需求或行程版本已过时，请重新规划")
+            try:
+                continuation = PlanningContinuation.from_candidate(
+                    req, source, payload.supplied_facts
+                )
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from None
+            revision = source.get("revision_notes", "")
+            previous = {"revision_request": revision, "places": []} if revision else None
+        elif payload.source_plan_id:
             source = await run_in_threadpool(store.get_candidate, trip_id, payload.source_plan_id)
             if source["status"] != "ready" or not revision:
                 raise HTTPException(422, "请选择已通过检查的原方案并填写修改要求")
@@ -447,12 +468,13 @@ def create_app(database: str | None = None) -> FastAPI:
         }
         try:
             result = await run_plan(
-                Requirements.model_validate(trip["requirements"]),
+                req,
                 mode=payload.mode,
                 settings=settings,
                 previous_plan=previous,
                 research_context=evidence,
                 on_draft=persist_draft,
+                continuation=continuation,
             )
             candidate.update(result)
             await run_in_threadpool(store.add_candidate, candidate)

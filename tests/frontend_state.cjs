@@ -104,6 +104,38 @@ test('legacy candidates without their old input snapshot never borrow a new draf
   assert.doesNotMatch(h.itinerary(), /杭州/);
 });
 
+test('pending candidate accepts scoped booking details from the form and resumes without saving preferences', async () => {
+  const h = harness();
+  Object.assign(h.S.candidate,{mode:'deepseek',status:'conflict',outcome:'needs_information',
+    draft:h.S.candidate.itinerary,itinerary:null,issues:[
+      {category:'missing_fact',place_id:'p',day:1,missing_fields:['reservation_requirement']},
+    ]});
+  assert.match(h.itinerary(), /补充资料并继续规划/);
+  assert.match(h.itinerary(), /预约渠道与选时段方式/);
+  assert.match(h.itinerary(), /data-action="accept"[^>]*disabled/);
+
+  h.context.FormData = class {
+    [Symbol.iterator]() { return [['gap-0','yes'],['gap-0-channel','官方小程序选时段']][Symbol.iterator](); }
+  };
+  const calls = [];
+  h.context.fetch = async (url, options) => {
+    calls.push({url,body:JSON.parse(options.body)});
+    return {ok:true,json:async()=>({...h.S.candidate,id:'continued',status:'ready',outcome:'ready',
+      review:{status:'approved'},itinerary:h.S.candidate.draft})};
+  };
+  await h.listeners.submit({preventDefault() {},target:{
+    id:'supplement-planning',dataset:{candidateId:h.S.candidate.id},
+  }});
+  assert.deepEqual(calls,[{url:'/api/trips/trip-1/plan',body:{
+    mode:'deepseek',source_plan_id:'candidate-1',expected_requirements_revision:1,
+    supplied_facts:[{place_id:'p',day:1,field:'reservation_requirement',required:true,channel:'官方小程序选时段'}],
+  }}]);
+  assert.equal(h.S.candidate.id,'continued');
+  const original = {...h.S.candidate,status:'conflict',outcome:'needs_information',base_version:1};
+  h.S.candidate = original;
+  assert.doesNotMatch(h.itinerary(), /补充资料并继续规划/);
+});
+
 test('changing destination invalidates hotel results, fixed place and manual hotel', () => {
   const h = harness();
   h.S.hotels = [{id:'h2', name:'查询缓存的上海酒店'}];

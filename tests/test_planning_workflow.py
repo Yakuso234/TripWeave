@@ -749,3 +749,104 @@ def test_unaccepted_workflow_result_and_draft_facts_survive_api_restart(tmp_path
         assert restored["research_facts"] == fixture["research_facts"]
         assert restarted.get(base).json()["accepted_version"] == 0
         assert restarted.post(base + f"/candidates/{candidate['id']}/accept").status_code == 409
+
+
+def test_user_reservation_information_resumes_saved_draft_through_review(tmp_path, monkeypatch):
+    monkeypatch.setenv("AMAP_API_KEY", "fixture-map-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fixture-model-key")
+    model_roles, searches, routes = [], [], []
+    original = itinerary()
+    updated = deepcopy(original)
+    updated["stops"][0]["reason"] = "先在官方小程序约到时段，再按拟定时间入场。"
+
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            if "/direction/" in request.url.path:
+                routes.append(request.url.path)
+            return map_response(request)
+        if request.url.path.endswith("/tools/search"):
+            searches.append(request.url.path)
+            return sources()
+        body = json.loads(request.content)
+        prompt = json.loads(body["messages"][-1]["content"])
+        if "research_report" in tool_names(body):
+            model_roles.append("research")
+            return completion(
+                "research_report",
+                {
+                    "facts": [
+                        {
+                            "place_id": "p0",
+                            "day": 1,
+                            "field": "reservation_requirement",
+                            "status": "unknown",
+                        }
+                    ]
+                },
+                1,
+            )
+        if "review_report" in tool_names(body):
+            model_roles.append("reviewer")
+            assert prompt["program_issues"] == []
+            assert prompt["draft"] == updated
+            assert prompt["queried_data"]["planning_facts"][0]["evidence_status"] == "user_reported"
+            return completion("review_report", {"summary": "通过", "suggestions": []}, 1)
+        model_roles.append(prompt["task"])
+        user_facts = [
+            fact
+            for fact in prompt["planning_facts"]
+            if fact.get("evidence_status") == "user_reported"
+        ]
+        if user_facts:
+            assert prompt["task"] == "revision" and prompt["draft"] == original
+            assert [(fact["field"], fact["value"]) for fact in user_facts] == [
+                ("reservation_requirement", "当天必须提前预约"),
+                ("reservation_channel", "官方微信小程序"),
+            ]
+            return completion("draft_proposal", packet(updated, queries=[]), 1)
+        needs = (
+            gap(field="reservation_requirement")["needs"] if prompt["task"] == "first_draft" else []
+        )
+        return completion(
+            "draft_proposal", packet(original, queries=None if needs else [], needs=needs), 1
+        )
+
+    async def simulate_suppliers(*args, **kwargs):
+        return await run_plan(*args, **kwargs, transport=httpx2.MockTransport(provider))
+
+    monkeypatch.setattr(application, "run_plan", simulate_suppliers)
+    with TestClient(application.create_app(str(tmp_path / "resume.sqlite3"))) as client:
+        trip = client.post("/api/trips", json=requirements().model_dump(mode="json")).json()
+        base = f"/api/trips/{trip['id']}"
+        source = client.post(base + "/plan", json={}).json()
+        assert source["outcome"] == "needs_information"
+        assert len(searches) == len(routes) == 1
+        payload = {
+            "source_plan_id": source["id"],
+            "expected_requirements_revision": 1,
+            "supplied_facts": [
+                {
+                    "day": 1,
+                    "place_id": "p0",
+                    "field": "reservation_requirement",
+                    "required": True,
+                    "channel": "官方微信小程序",
+                }
+            ],
+        }
+        wrong_place = deepcopy(payload)
+        wrong_place["supplied_facts"][0]["place_id"] = "p1"
+        assert client.post(base + "/plan", json=wrong_place).status_code == 422
+        response = client.post(base + "/plan", json=payload)
+        assert response.status_code == 200, response.text
+        candidate = response.json()
+        assert candidate["outcome"] == "ready" and candidate["review"]["status"] == "approved"
+        assert candidate["source_plan_id"] == source["id"] and candidate["itinerary"] == updated
+        assert model_roles == ["first_draft", "research", "revision", "revision", "reviewer"]
+        assert len(searches) == len(routes) == 1
+        assert client.get(base).json()["accepted_version"] == 0
+        history = client.get(base + "/history").json()["candidates"]
+        assert [item["id"] for item in history] == [candidate["id"], source["id"]]
+        assert history[1]["outcome"] == "needs_information" and history[1]["draft"] == original
+        assert client.post(base + f"/candidates/{candidate['id']}/accept").status_code == 200
+        assert client.post(base + "/plan", json=payload).status_code == 409
