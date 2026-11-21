@@ -20,10 +20,12 @@ async def test_actual_requests_use_first_draft_then_evidence_revision_instructio
         if request.url.host != "api.deepseek.com":
             return map_response(request)
         body = json.loads(request.content)
+        system = "\n".join(m.get("content", "") for m in body["messages"] if m["role"] == "system")
         if tool_names(body) == {"review_report"}:
+            assert "全天交通明显超过期望并伴有多段实际缓冲偏紧" in system
+            assert "普通交通缓冲不足5分钟仅作轻量建议" in system
             return reply("review_report", {"summary": "合成通过", "suggestions": []})
         context = json.loads(body["messages"][-1]["content"])
-        system = "\n".join(m.get("content", "") for m in body["messages"] if m["role"] == "system")
         phases.append(context["task"])
         assert "需求分为三类" in system and "strict_preferences" in system
         assert "respond_to_review" not in system
@@ -31,11 +33,13 @@ async def test_actual_requests_use_first_draft_then_evidence_revision_instructio
             assert "本阶段只提出一份供证据核验的完整初稿" in system
             assert "revision_days" not in system
             assert "提交前逐天自查计数" not in system
+            assert "可少排可选景点，不必填满每天" in system
             assert "未知路线可暂估并列查询" in context["instruction"]
         else:
             assert context["task"] == "revision" and context["draft"]
             assert "本阶段只提出" not in system
             assert "提交前逐天自查计数" in system and "revision_days" in system
+            assert "把较晚的非必要等待前移给更紧的路段" in system
         assert body["reasoning_effort"] == "high"
         assert body["thinking"] == {"type": "enabled"}
         assert body["max_tokens"] == 6000
@@ -60,3 +64,4 @@ def test_review_response_keeps_authority_rules_and_uses_its_own_contract():
     assert "提交前逐天自查计数" in instructions
     assert "本阶段只提出" not in instructions
     assert "需求分为三类" in instructions
+    assert "保留必去景点、必要停留、正餐和明确休息" in instructions
