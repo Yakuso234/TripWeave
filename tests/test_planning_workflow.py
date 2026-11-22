@@ -5,7 +5,7 @@ from copy import deepcopy
 
 import httpx2
 import pytest
-from draft_helpers import packet, route_queries
+from draft_helpers import packet, phase_packet, route_queries
 from fastapi.testclient import TestClient
 from review_mock import with_approved_review
 from test_planning_research import fact, sources
@@ -171,8 +171,10 @@ async def test_known_draft_error_revises_only_affected_day_and_checks_whole_plan
         assert tool_names(body) == {"draft_proposal"}
         return completion(
             "draft_proposal",
-            packet(
-                original if len(calls) >= 3 else broken, queries=None if len(calls) == 1 else []
+            phase_packet(
+                json.loads(body["messages"][-1]["content"]),
+                original if len(calls) >= 3 else broken,
+                queries=None if len(calls) == 1 else [],
             ),
             len(calls),
         )
@@ -201,8 +203,10 @@ async def test_pacing_violation_returns_actual_limit_and_segments_for_local_revi
         calls.append(body)
         return completion(
             "draft_proposal",
-            packet(
-                original if len(calls) >= 3 else broken, queries=None if len(calls) == 1 else []
+            phase_packet(
+                json.loads(body["messages"][-1]["content"]),
+                original if len(calls) >= 3 else broken,
+                queries=None if len(calls) == 1 else [],
             ),
             len(calls),
         )
@@ -299,7 +303,7 @@ async def test_fact_return_allows_one_full_revision_then_restores_local_repairs(
         elif len(planners) == 2:
             value = packet(after, queries=[])
         else:
-            value = packet(original, queries=[])
+            value = phase_packet(json.loads(body["messages"][-1]["content"]), original, queries=[])
         return completion("draft_proposal", value, len(calls))
 
     result = await run(requirements(days=2, notes=PRIVATE_NOTE), provider)
@@ -698,8 +702,10 @@ async def test_explicit_visit_window_reaches_model_and_failed_stay_is_repaired()
         calls.append(body)
         return completion(
             "draft_proposal",
-            packet(
-                corrected if len(calls) >= 3 else original, queries=None if len(calls) == 1 else []
+            phase_packet(
+                json.loads(body["messages"][-1]["content"]),
+                corrected if len(calls) >= 3 else original,
+                queries=None if len(calls) == 1 else [],
             ),
             len(calls),
         )
@@ -842,6 +848,9 @@ def test_user_reservation_information_resumes_saved_draft_through_review(tmp_pat
         candidate = response.json()
         assert candidate["outcome"] == "ready" and candidate["review"]["status"] == "approved"
         assert candidate["source_plan_id"] == source["id"] and candidate["itinerary"] == updated
+        assert candidate["route_table"][0]["status"] == "map_estimate"
+        saved_run = client.get(base + "/planning-runs").json()["runs"][0]
+        assert saved_run["route_table"] == candidate["route_table"]
         assert model_roles == ["first_draft", "research", "revision", "revision", "reviewer"]
         assert len(searches) == len(routes) == 1
         assert client.get(base).json()["accepted_version"] == 0

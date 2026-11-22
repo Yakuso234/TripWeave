@@ -4,7 +4,7 @@ import json
 
 import httpx2
 import pytest
-from draft_helpers import packet
+from draft_helpers import packet, phase_packet
 from review_mock import with_approved_review
 from test_real_planner import configured, handler
 
@@ -242,7 +242,11 @@ async def test_local_revision_reuses_research_history_without_searching_again():
         assert {t["function"]["name"] for t in body["tools"]} == {"draft_proposal"}
         return completion(
             "draft_proposal",
-            packet(plan if len(calls) >= 3 else broken, queries=None if len(calls) == 1 else []),
+            phase_packet(
+                json.loads(body["messages"][-1]["content"]),
+                plan if len(calls) >= 3 else broken,
+                queries=None if len(calls) == 1 else [],
+            ),
             len(calls),
         )
 

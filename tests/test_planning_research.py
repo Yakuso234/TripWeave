@@ -13,7 +13,9 @@ from pydantic_ai.usage import RunUsage
 from test_real_planner import configured
 
 from tripweave.domain import Requirements
+from tripweave.planning_contracts import ResearchFact
 from tripweave.planning_research import research_missing_information
+from tripweave.research_evidence import carry_research_fact, usable_research_fact, validate_evidence
 
 QUOTE = "2026-11-21开放时间09:00至17:00，16:00停止入场。"
 PLACES = {
@@ -290,6 +292,152 @@ async def test_quote_explicitly_about_another_date_is_not_bound_to_the_requested
     assert result["outcome"] == "needs_information"
     assert result["facts"][0]["date"] == "2026-11-21"
     assert result["facts"][0]["status"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("field", "excerpt", "quote", "value", "error"),
+    [
+        (
+            "reservation_required",
+            "可通过官方小程序预约。",
+            None,
+            True,
+            "reservation_requirement_not_supported",
+        ),
+        (
+            "reservation_required",
+            "团队必须预约。",
+            "必须预约",
+            True,
+            "reservation_requirement_not_supported",
+        ),
+        (
+            "reservation_required",
+            "散客免预约；节假日需预约。",
+            "散客免预约",
+            False,
+            "reservation_requirement_not_supported",
+        ),
+        (
+            "reservation_required",
+            "预约入口为官方小程序。",
+            None,
+            True,
+            "reservation_requirement_not_supported",
+        ),
+        ("reservation_required", "2026-11-21散客必须提前预约。", None, True, None),
+        ("reservation_required", "散客无需提前预约，团队须预约。", "散客无需提前预约", False, None),
+        ("reservation_required", "散客不再需要预约。", None, False, None),
+        (
+            "reservation_required",
+            "散客必须预约。",
+            None,
+            False,
+            "reservation_requirement_conflicts_with_quote",
+        ),
+        (
+            "reservation_required",
+            "2026-11-20散客必须提前预约。",
+            None,
+            True,
+            "explicit_date_mismatch",
+        ),
+        (
+            "reservation_required",
+            "2026-11-20散客必须提前预约。",
+            "散客必须提前预约",
+            True,
+            "reservation_requirement_not_supported",
+        ),
+        (
+            "last_admission",
+            "开放时间为09:00至17:00。",
+            None,
+            "17:00",
+            "admission_meaning_not_supported",
+        ),
+        ("last_admission", "17:00停止售票。", None, "17:00", "admission_meaning_not_supported"),
+        ("last_admission", "16:00停止入场，17:00闭馆。", None, "16:00", None),
+        (
+            "last_admission",
+            "16:00停止入场，17:00闭馆。",
+            None,
+            "17:00",
+            "admission_meaning_not_supported",
+        ),
+        (
+            "last_admission",
+            "16:00停止入场，17:00闭馆。",
+            None,
+            "18:00",
+            "admission_time_not_in_quote",
+        ),
+        (
+            "last_admission",
+            "夜场17:00停止入场。",
+            "17:00停止入场",
+            "17:00",
+            "admission_meaning_not_supported",
+        ),
+        (
+            "last_admission",
+            "最晚入场16:00。最晚入场17:00。",
+            "最晚入场16:00",
+            "16:00",
+            "admission_meaning_not_supported",
+        ),
+    ],
+)
+def test_critical_booking_and_admission_require_semantically_matching_evidence(
+    field, excerpt, quote, value, error
+):
+    research_field = "reservation_requirement" if field == "reservation_required" else field
+    empty = {
+        "place_id": "p0",
+        "day": 1,
+        "field": research_field,
+        "date": "2026-11-21",
+        "status": "unknown",
+    }
+    proposal = ResearchFact.model_validate(
+        fact(**{"field": research_field, "quote": quote or excerpt, "windows": [], field: value})
+    )
+    searches = {
+        ("p0", 1): {
+            "error": None,
+            "sources": [
+                {
+                    "id": 1,
+                    "title": "模拟公告",
+                    "url": "https://museum.example/visit",
+                    "excerpt": excerpt,
+                }
+            ],
+            "queried_at": "2026-11-20T00:00:00+00:00",
+        }
+    }
+    facts, diagnostics = validate_evidence([empty], [proposal], searches)
+    if error:
+        assert facts == [empty] and diagnostics[0]["code"] == error
+        assert not usable_research_fact(facts[0])
+    else:
+        assert diagnostics == [] and usable_research_fact(facts[0])
+        assert facts[0][field] == value and facts[0]["evidence_status"] == "web_reported"
+
+
+def test_continuation_rechecks_old_web_evidence_without_changing_user_supplied_facts():
+    legacy = {
+        "field": "reservation_requirement",
+        "status": "found",
+        "evidence_status": "web_reported",
+        "quote": "官方小程序可预约。",
+    }
+    assert carry_research_fact(legacy)["status"] == "unknown"
+    assert (
+        carry_research_fact({**legacy, "quote": "散客无需预约。"})["reservation_required"] is False
+    )
+    reported = {**legacy, "evidence_status": "user_reported", "reservation_required": True}
+    assert carry_research_fact(reported) == reported
 
 
 async def test_cancelled_search_leaves_an_attempt_without_private_query_or_credentials():

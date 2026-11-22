@@ -5,7 +5,7 @@ from copy import deepcopy
 
 import httpx2
 import pytest
-from draft_helpers import packet
+from draft_helpers import packet, phase_packet
 from pydantic import ValidationError
 from test_planning_research import fact, sources
 from test_planning_research import final as research_final
@@ -148,7 +148,7 @@ async def test_planner_repair_uses_current_draft_and_validation_feedback_not_pri
                 assert context["draft"] == broken
                 assert context["validation_issues"][0]["code"] == "connection"
                 assert context["revision_days"] == [1]
-                answer = packet(original, queries=[])
+                answer = phase_packet(context, original, queries=[])
             reply = completion("draft_proposal", answer, len(calls))
         return with_thinking(reply, f"PRIVATE-THINKING-stage-{len(calls)}")
 

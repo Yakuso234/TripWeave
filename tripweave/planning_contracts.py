@@ -99,6 +99,9 @@ class ResearchFact(Contract):
     windows: list[TimeWindow] = Field(default_factory=list, max_length=14)
     closed: bool | None = None
     last_admission: Clock | None = None
+    reservation_required: bool | None = Field(
+        default=None, strict=True, exclude_if=lambda value: value is None
+    )
     unknown_reason: (
         Literal[
             "field_not_stated",
@@ -131,6 +134,7 @@ class ResearchFact(Contract):
                 or self.windows
                 or self.closed is not None
                 or self.last_admission is not None
+                or self.reservation_required is not None
             ):
                 raise ValueError("未知事实不能附带推定值、证据引用或已知时间结构")
             return self
@@ -142,6 +146,8 @@ class ResearchFact(Contract):
             raise ValueError("开放窗口和闭馆标识只能用于opening_hours")
         if self.field != "last_admission" and self.last_admission is not None:
             raise ValueError("最晚入场时刻只能用于last_admission")
+        if self.field != "reservation_requirement" and self.reservation_required is not None:
+            raise ValueError("是否必约只能用于reservation_requirement")
         if any(window.day != self.day for window in self.windows):
             raise ValueError("开放窗口必须对应本事实的日期")
         if self.closed is True and self.windows:

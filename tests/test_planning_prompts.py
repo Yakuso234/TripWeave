@@ -38,7 +38,7 @@ async def test_actual_requests_use_first_draft_then_evidence_revision_instructio
         else:
             assert context["task"] == "revision" and context["draft"]
             assert "本阶段只提出" not in system
-            assert "提交前逐天自查计数" in system and "revision_days" in system
+            assert "提交前逐天自查计数" in system and "route_table" in system
             assert "把较晚的非必要等待前移给更紧的路段" in system
         assert body["reasoning_effort"] == "high"
         assert body["thinking"] == {"type": "enabled"}
@@ -55,6 +55,12 @@ async def test_actual_requests_use_first_draft_then_evidence_revision_instructio
     )
     assert result["outcome"] == "ready", result
     assert phases == ["first_draft", "revision"]
+
+
+def test_local_planning_instructions_only_expose_the_patch_output_contract():
+    instructions = planner_instructions("revision", scoped=True)
+    assert "revision_days" in instructions and "patch.days" in instructions
+    assert "修订阶段输出DraftProposal" not in instructions
 
 
 def test_review_response_keeps_authority_rules_and_uses_its_own_contract():

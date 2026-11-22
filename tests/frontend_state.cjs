@@ -1060,6 +1060,31 @@ test('missing explicit transfer records are disclosed without inventing rest tim
 });
 
 
+test('the route table provides route status independently of legacy route rows and model notes', () => {
+  const h=harness();
+  const candidate=h.S.candidate;
+  const first=candidate.itinerary.stops[0];
+  first.reason='保留提醒：是否需要预约仍待确认。';
+  candidate.itinerary.stops.push({...first,start_time:'11:00',end_time:'12:00',kind:'meal'},
+    {...first,place_id:'q',start_time:'13:00',end_time:'14:00'});
+  candidate.routes=[{day:1,stop_index:0,duration_minutes:99,mode:'步行'}];
+  candidate.route_table=[
+    {day:1,stop_number:1,status:'map_estimate',mode:'步行',duration_minutes:2,
+      buffer_minutes:3,buffer_basis:'upper_bound'},
+    {day:1,stop_number:2,status:'same_place',duration_minutes:0},
+    {day:1,stop_number:3,status:'unknown',duration_minutes:null},
+  ];
+  const html=h.itinerary();
+  assert.match(html,/已取得高德估算：步行约 2 分钟 · 站间最多余 3 分钟/);
+  assert.match(html,/同一地点 · 无跨地点路线/);
+  assert.match(html,/路线 · 待查询/);
+  assert.match(html,/是否需要预约仍待确认/);
+  assert.doesNotMatch(html,/99分钟|按当前安排余 3 分钟/);
+  delete candidate.route_table;
+  assert.match(h.itinerary(),/99分钟/);
+});
+
+
 test('low-buffer advisory is visible but never blocks an otherwise acceptable plan', () => {
   const h=harness();
   h.S.candidate.buffer_advisories=[{message:'第1天缓冲约3分钟，可酌情多留一点。'}];

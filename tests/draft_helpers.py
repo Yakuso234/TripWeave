@@ -58,6 +58,40 @@ def packet(plan=None, *, queries=None, needs=None, assumptions=()):
     }
 
 
+def day_patch(context, plan):
+    """Turn a test's intended itinerary into the wire format for a local edit."""
+    current = context["draft"]
+    before_days = {stop["day"] for stop in current["stops"]}
+    days = before_days | {stop["day"] for stop in plan["stops"]}
+    hotel_change = plan["hotel_id"] != current["hotel_id"]
+    hotel_days = before_days.intersection(context.get("hotel_revision_days", []))
+    patch = {"days": []}
+    for day in sorted(days):
+        before = [stop for stop in current["stops"] if stop["day"] == day]
+        after = [stop for stop in plan["stops"] if stop["day"] == day]
+        if before != after or (hotel_change and day in hotel_days):
+            patch["days"].append({"day": day, "stops": deepcopy(after)})
+    if hotel_change:
+        patch["hotel_id"] = plan["hotel_id"]
+    if plan["summary"] != current["summary"]:
+        patch["summary"] = plan["summary"]
+    return patch
+
+
+def phase_packet(context, plan, **kwargs):
+    payload = packet(plan, **kwargs)
+    if "revision_days" in context:
+        payload["patch"] = day_patch(context, payload.pop("draft"))
+    return payload
+
+
+def negotiation_packet(context, response):
+    payload = dict(response)
+    if "revised_itinerary" in payload:
+        payload["patch"] = day_patch(context, payload.pop("revised_itinerary"))
+    return payload
+
+
 def reply(name, arguments, number=1):
     return httpx2.Response(
         200,

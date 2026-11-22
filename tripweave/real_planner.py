@@ -25,7 +25,15 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 
 from .api_cost import estimate_cost
 from .domain import Itinerary, Requirements, Stop, clock, minutes
-from .draft_contracts import DraftProposal, check_draft_identity, packet_context
+from .draft_contracts import (
+    DraftPatchError,
+    DraftProposal,
+    ScopedRevision,
+    apply_itinerary_patch,
+    check_draft_identity,
+    hotel_revision_days,
+    packet_context,
+)
 from .evidence import load_evidence
 from .maps import MapClient, MapError, cached_route, distance
 from .model_usage import ModelUsageRecorder
@@ -49,6 +57,7 @@ from .planning_review import (
 )
 from .query_executor import QueryExecutor, query_key
 from .research_evidence import FIELD_NAMES, usable_research_fact
+from .route_evidence import hotel_comparisons, planned_legs, route_table
 from .settings import Settings
 
 
@@ -228,49 +237,35 @@ def costs(req: Requirements, itinerary: Itinerary) -> dict:
     }
 
 
-def buffer_advisories(req, output, data, maps):
+def buffer_advisories(req, output, data, maps, *, routes=None):
     """Cached evidence only. Low spare time never blocks or starts model repair."""
+    if routes is None:
+        routes = route_table(req, output, data["origin"]["id"], maps.cache)
     warnings = []
-    for day in range(1, req.days + 1):
-        previous = output.hotel_id if 2 <= day <= req.hotel_nights + 1 else data["origin"]["id"]
-        previous_end = None
-        for number, stop in enumerate((s for s in output.stops if s.day == day), 1):
-            timing = stop.transfer
-            leg = cached_route(maps.cache, previous, stop.place_id, req.transport)
-            if timing and leg is not None and previous != stop.place_id:
-                departure, arrival = minutes(timing.departure_time), minutes(timing.arrival_time)
-                rests = sorted(
-                    (minutes(r.start_time), minutes(r.end_time)) for r in timing.rest_after
-                )
-                valid = arrival >= departure + leg["duration_minutes"] and arrival <= minutes(
-                    stop.start_time
-                )
-                end = arrival
-                for start, finish in rests:
-                    valid = valid and start >= end and finish <= minutes(stop.start_time)
-                    end = max(end, finish)
-                valid = valid and (previous_end is None or departure >= previous_end)
-                margin = (
-                    minutes(stop.start_time)
-                    - departure
-                    - leg["duration_minutes"]
-                    - sum(b - a for a, b in rests)
-                )
-                if valid and 0 <= margin < 5:
-                    warnings.append(
-                        {
-                            "category": "advisory",
-                            "severity": "warning",
-                            "code": "low_travel_buffer",
-                            "day": day,
-                            "stop_number": number,
-                            "place_id": stop.place_id,
-                            "actual_minutes": margin,
-                            "suggested_minutes": 5,
-                            "message": f"第{day}天第{number}站：扣除地图路程和已安排的休息后，缓冲约{margin}分钟，可酌情多留一点；此项仅提醒。",
-                        }
-                    )
-            previous, previous_end = stop.place_id, minutes(stop.end_time)
+    for row in routes:
+        margin = row["buffer_minutes"]
+        if margin is None or not 0 <= margin < 5:
+            continue
+        upper_bound = row["buffer_basis"] == "upper_bound"
+        detail = (
+            f"站间最多余{margin}分钟，实际出发或休息时间待核对。"
+            if upper_bound
+            else f"扣除地图路程和已安排的休息后，缓冲约{margin}分钟，可酌情多留一点；此项仅提醒。"
+        )
+        day, number = row["day"], row["stop_number"]
+        warnings.append(
+            {
+                "category": "advisory",
+                "severity": "warning",
+                "code": "low_travel_buffer",
+                "day": day,
+                "stop_number": number,
+                "place_id": row["destination_id"],
+                "maximum_minutes" if upper_bound else "actual_minutes": margin,
+                "suggested_minutes": 5,
+                "message": f"第{day}天第{number}站：{detail}",
+            }
+        )
     return warnings
 
 
@@ -797,6 +792,7 @@ class PlanningState(TypedDict, total=False):
     research_search_calls: int
     research_limits: list[dict]
     facts_updated: bool
+    evidence_revision_days: list[int] | None
     review: dict
     query_requests: list
     query_log: list[dict]
@@ -973,6 +969,7 @@ async def run_planning_graph(
     executor = None
     repeated = {}
     checked = set()
+    delivered_meal_decisions = set()
     research_attempts = dict(continuation.search_attempts) if continuation else {}
     informed_limits = {fact_key(item): item for item in continuation.limits} if continuation else {}
     supplied_keys = (
@@ -1015,6 +1012,9 @@ async def run_planning_graph(
                     "draft": state["candidate"].model_dump(mode="json"),
                     "phase": phase,
                     "places": list(known_places().values()),
+                    "route_table": route_table(
+                        req, state["candidate"], data["origin"]["id"], maps.cache
+                    ),
                     "query_log": state.get("query_log", []),
                     "query_requests": [
                         q.model_dump(mode="json") if hasattr(q, "model_dump") else q
@@ -1141,7 +1141,7 @@ async def run_planning_graph(
             "research_feedback": state.get("research_diagnostics", []),
             "research_limits": state.get("research_limits", []),
             "validation_issues": state.get("issues", []),
-            "instruction": "提交完整当前草稿、结构化查询清单、关键补查需求和暂定假设。"
+            "instruction": "按本轮输出合同提交行程、结构化查询清单、关键补查需求和暂定假设。"
             "仅根据已提供证据修订；普通工具不可直接调用。查询用明确起点/终点/交通方式，"
             "资料问题关联具体用户要求。纯介绍性未知放assumptions。"
             "已查询结果不要反复索取。首稿允许拟定时刻，营业和预订未知必须保留未知。",
@@ -1173,34 +1173,41 @@ async def run_planning_graph(
                 for (origin_id, destination_id, transport), route in maps.cache.items()
                 if origin_id in hotel_ids or destination_id in hotel_ids
             ]
-        # Preserve local-repair scope for known draft errors. New evidence can
-        # affect the whole trip, in which case the model receives all days.
+            prompt["hotel_comparisons"] = hotel_comparisons(
+                req, state["candidate"], data["hotels"], maps.cache
+            )
+        if phase == "revision":
+            prompt["route_table"] = route_table(
+                req, state["candidate"], data["origin"]["id"], maps.cache
+            )
+        # Local repairs use day replacements. When the scope is unknown, the
+        # model can still return a new complete draft.
         issues = state.get("issues", [])
+        affected = [
+            set(
+                ([issue["day"]] if "day" in issue else [])
+                + issue.get("related_days", [])
+                + issue.get("required_days", [])
+            )
+            for issue in issues
+        ]
+        evidence_days = state.get("evidence_revision_days")
         days = set()
         if (
-            issues
-            and not state.get("facts_updated")
-            and all("day" in i or "related_days" in i for i in issues)
-            and all(
-                1 <= day <= req.days
-                for i in issues
-                for day in ([i["day"]] if "day" in i else [])
-                + i.get("related_days", [])
-                + i.get("required_days", [])
-            )
+            phase == "revision"
+            and all(group and group <= set(range(1, req.days + 1)) for group in affected)
+            and (not state.get("facts_updated") or evidence_days is not None)
         ):
-            days = {i["day"] for i in issues if "day" in i}
-            days.update(day for i in issues for day in i.get("related_days", []))
-            days.update(day for i in issues for day in i.get("required_days", []))
+            days = set(evidence_days or ()).union(*affected)
+        if days:
             prompt["revision_days"] = sorted(days)
-            prompt["instruction"] += (
-                "已指定revision_days时，仅改这些日期，仍返回完整草稿；其他日期的地点、时段和类型保持原样，说明文字可更新。自动酒店若需调整可联动其他日期，并在summary解释原因；用户手选酒店不得替换。"
-            )
+            prompt["hotel_revision_days"] = sorted(hotel_revision_days(req))
         trace.append(
             {
                 "event": "agent",
                 "role": "planner",
                 "phase": phase,
+                **({"revision_days": sorted(days)} if days else {}),
                 "detail": "规划Agent先交草稿和查询清单"
                 if phase == "first_draft"
                 else "规划Agent根据最新草稿、证据和具体问题修订",
@@ -1210,8 +1217,12 @@ async def run_planning_graph(
             with recorder.stage(phase) if recorder else nullcontext():
                 response = await agent.run(
                     json.dumps(prompt, ensure_ascii=False),
-                    instructions=planner_instructions(phase),
-                    output_type=ToolOutput(DraftProposal, name="draft_proposal", strict=False),
+                    instructions=planner_instructions(phase, scoped=bool(days)),
+                    output_type=ToolOutput(
+                        ScopedRevision if days else DraftProposal,
+                        name="draft_proposal",
+                        strict=False,
+                    ),
                     usage=usage,
                     usage_limits=UsageLimits(request_limit=settings.max_requests),
                     model_settings=settings.generation_settings("planner"),
@@ -1221,29 +1232,13 @@ async def run_planning_graph(
                 {"outcome": "incomplete", "error": "模型轮次预算已用完，当前草稿未通过完整流程。"}
             )
         output = response.output
-        if days and state.get("candidate"):
-            before = [
-                x.model_dump(exclude={"reason", "title"})
-                for x in state["candidate"].stops
-                if x.day not in days
-            ]
-            after = [
-                x.model_dump(exclude={"reason", "title"})
-                for x in output.draft.stops
-                if x.day not in days
-            ]
-            automatic_hotel_changed = (
-                not req.hotel_id and output.draft.hotel_id != state["candidate"].hotel_id
-            )
-            if not automatic_hotel_changed and (
-                before != after or output.draft.hotel_id != state["candidate"].hotel_id
-            ):
-                return record(
-                    {
-                        "outcome": "incomplete",
-                        "error": "模型修改了本次局部修订范围之外的安排，原草稿已保留。",
-                    }
-                )
+        if isinstance(output, ScopedRevision):
+            try:
+                candidate = apply_itinerary_patch(req, state["candidate"], output.patch, days)
+            except DraftPatchError as exc:
+                return record({"outcome": "incomplete", "error": str(exc)})
+        else:
+            candidate = output.draft
         request = (
             PlanningInformationRequest(
                 needs=output.information_needs,
@@ -1253,12 +1248,13 @@ async def run_planning_graph(
             else None
         )
         update = {
-            "candidate": output.draft,
+            "candidate": candidate,
             "query_requests": output.query_requests,
             "assumptions": output.assumptions,
             "information_request": request,
-            "issues": check_draft_identity(req, output.draft, known_places(), data["hotels"]),
+            "issues": check_draft_identity(req, candidate, known_places(), data["hotels"]),
             "facts_updated": False,
+            "evidence_revision_days": None,
             "outcome": None,
             "planning_phase": phase,
         }
@@ -1266,7 +1262,7 @@ async def run_planning_graph(
             state.get("candidate")
             and state.get("issues")
             and not state.get("facts_updated")
-            and draft_identity(output.draft) == draft_identity(state["candidate"])
+            and draft_identity(candidate) == draft_identity(state["candidate"])
         ):
             update["issues"] = update["issues"] + [
                 i
@@ -1299,29 +1295,25 @@ async def run_planning_graph(
         return update
 
     def required_routes(draft):
-        routes = []
-        for day in range(1, req.days + 1):
-            origin = draft.hotel_id if 2 <= day <= req.hotel_nights + 1 else data["origin"]["id"]
-            for stop in (s for s in draft.stops if s.day == day):
-                if (
-                    origin in maps.places
-                    and stop.place_id in maps.places
-                    # Same POI is local identity evidence, not a missing map route.
-                    # MapClient.route already returns zero without any HTTP call.
-                    and origin != stop.place_id
-                    and cached_route(maps.cache, origin, stop.place_id, req.transport) is None
-                ):
-                    routes.append(
-                        {
-                            "kind": "route",
-                            "origin_id": origin,
-                            "destination_id": stop.place_id,
-                            "transport": req.transport,
-                            "reason": f"核实第{day}天到下一站的交通",
-                        }
-                    )
-                origin = stop.place_id
-        return routes
+        routes, days = [], set()
+        for day, _, origin, _, stop in planned_legs(req, draft, data["origin"]["id"]):
+            if (
+                origin in maps.places
+                and stop.place_id in maps.places
+                and origin != stop.place_id
+                and cached_route(maps.cache, origin, stop.place_id, req.transport) is None
+            ):
+                routes.append(
+                    {
+                        "kind": "route",
+                        "origin_id": origin,
+                        "destination_id": stop.place_id,
+                        "transport": req.transport,
+                        "reason": f"核实第{day}天到下一站的交通",
+                    }
+                )
+                days.add(day)
+        return routes, sorted(days)
 
     async def collect_queries(state):
         revision = (previous_plan or {}).get("revision_request", "")
@@ -1332,7 +1324,14 @@ async def run_planning_graph(
                 if getattr(q, "kind", None) == "place_search" and q.query in revision
             ]
         )
-        light_issues = check_draft_identity(req, state["candidate"], known_places(), data["hotels"])
+        draft = state["candidate"]
+        light_issues = check_draft_identity(req, draft, known_places(), data["hotels"])
+        initial_missing = (
+            required_routes(draft)[0]
+            if state["planning_phase"] == "first_draft" and not light_issues
+            else []
+        )
+        comparison_before = hotel_comparisons(req, draft, data["hotels"], maps.cache)
         if light_issues:
             result = {
                 "results": [
@@ -1357,21 +1356,70 @@ async def run_planning_graph(
             )
         results = result["results"]
         log = state.get("query_log", []) + results
-        missing = [] if light_issues else required_routes(state["candidate"])
-        issues = (
-            state["issues"]
-            + [i for i in light_issues if i not in state["issues"]]
-            + [
+        missing, missing_days = ([], []) if light_issues else required_routes(draft)
+        issues = state["issues"] + [i for i in light_issues if i not in state["issues"]]
+        comparison_after = hotel_comparisons(req, draft, data["hotels"], maps.cache)
+        decision_days = {
+            leg["day"]
+            for key, legs in comparison_after.items()
+            if not light_issues
+            and comparison_before.get(key) != legs
+            and any(leg["delta_minutes"] < 0 for leg in legs)
+            for leg in legs
+        }
+        remaining_route_keys = {query_key(query) for query in missing}
+        # A first draft may have built the trip around unverified links. Give it
+        # a first evidence pass when any required link is actually resolved,
+        # but do not repeat this on subsequent deliveries of the same estimates.
+        trip_wide_decision = any(
+            query_key(query) not in remaining_route_keys for query in initial_missing
+        )
+        for item in results if not light_issues else []:
+            query = item["query"]
+            kind = query["kind"]
+            required_meal = (
+                kind == "nearby_restaurants" and query.get("purpose") == "required_for_plan"
+            )
+            meal_days = (
+                {
+                    stop.day
+                    for stop in draft.stops
+                    if stop.kind == "meal" and stop.place_id == query["place_id"]
+                }
+                if required_meal
+                else set()
+            )
+            if item["status"] == "ok":
+                if kind == "place_search" and item["new_information"]:
+                    trip_wide_decision = True
+                if required_meal and item["data"]:
+                    key = query_key(query)
+                    if key not in delivered_meal_decisions:
+                        delivered_meal_decisions.add(key)
+                        if meal_days:
+                            decision_days.update(meal_days)
+                        else:
+                            trip_wide_decision = True
+                if not required_meal or item["data"]:
+                    continue
+            elif not (
+                required_meal
+                or kind == "place_search"
+                or (item["status"] == "not_executed" and item.get("code") != "map_budget_exhausted")
+            ):
+                # Missing routes needed by the draft are reported below. A failed
+                # optional comparison or dining suggestion can be read in the log.
+                continue
+            issues.append(
                 {
                     "category": "draft_error",
                     "code": "query_failed",
-                    "message": r["error"] or "查询未完成",
-                    "query": r["query"],
+                    "message": item["error"]
+                    or "当前用餐要求所依赖的查询没有返回候选，请调整安排。",
+                    "query": query,
+                    **({"related_days": sorted(meal_days)} if meal_days else {}),
                 }
-                for r in results
-                if r["status"] != "ok" and not light_issues
-            ]
-        )
+            )
         if missing:
             issues.append(
                 {
@@ -1379,6 +1427,7 @@ async def run_planning_graph(
                     "code": "route_queries_missing",
                     "message": "草稿仍有未核实路段，请用起点和终点提交查询清单。",
                     "required_queries": missing,
+                    "related_days": missing_days,
                 }
             )
         fingerprint = json.dumps(
@@ -1396,7 +1445,8 @@ async def run_planning_graph(
             "evidence_results": results,
             "query_log": log,
             "issues": issues,
-            "facts_updated": result["new_information"],
+            "facts_updated": trip_wide_decision or bool(decision_days),
+            "evidence_revision_days": None if trip_wide_decision else sorted(decision_days),
             "outcome": None,
             "light_check_failed": bool(light_issues),
         }
@@ -1525,6 +1575,7 @@ async def run_planning_graph(
                 + report.get("diagnostics", []),
                 "research_limits": list(informed_limits.values()),
                 "facts_updated": can_return,
+                "evidence_revision_days": None,
                 "information_request": None,
                 "outcome": None if can_return else outcome,
                 "issues": state["issues"] + issues,
@@ -1580,12 +1631,29 @@ async def run_planning_graph(
         return record({"issues": issues, "outcome": outcome, "attempts": len(checked)})
 
     def review_context(state):
+        routes = route_table(req, state["candidate"], data["origin"]["id"], maps.cache)
+        current_pairs = {(row["origin_id"], row["destination_id"]) for row in routes}
         return {
             "requirements": {**req.model_dump(mode="json"), "hotel_nights": req.hotel_nights},
             "revision_request": (previous_plan or {}).get("revision_request"),
             "queried_data": packet_context(model_context(data)),
             "known_places": packet_context(list(known_places().values())),
-            "verified_routes": list(maps.cache.values()),
+            "route_table": routes,
+            "alternative_routes": [
+                route
+                for (origin_id, destination_id, _), route in maps.cache.items()
+                if (origin_id, destination_id) not in current_pairs
+            ],
+            "meal_query_results": [
+                {"place_id": key[1], "options": entry["data"]}
+                for key, entry in executor.cache.items()
+                if key[0] == "nearby_restaurants"
+                and entry["status"] == "ok"
+                and any(
+                    stop.kind == "meal" and stop.place_id == key[1]
+                    for stop in state["candidate"].stops
+                )
+            ],
             "draft": state["candidate"].model_dump(mode="json"),
             "program_issues": state["issues"],
             "preference_deviations": preference_deviations(req, state["candidate"], data, maps),
@@ -1638,8 +1706,25 @@ async def run_planning_graph(
     async def respond_to_review(state):
         if stopped := review_budget("planner_response"):
             return stopped
-        response = await review_session.respond(review_context(state))
-        validate_response(response, ReviewReport.model_validate(state["review"]["initial"]))
+        report = ReviewReport.model_validate(state["review"]["initial"])
+        response = await review_session.respond(
+            {
+                **review_context(state),
+                "revision_days": sorted({p.day for s in report.suggestions for p in s.positions}),
+                "hotel_revision_days": sorted(hotel_revision_days(req)),
+            }
+        )
+        validate_response(response, report)
+        revised = None
+        if response.patch is not None:
+            adopted = {d.suggestion_id for d in response.decisions if d.action == "revise"}
+            days = {
+                p.day for s in report.suggestions if s.suggestion_id in adopted for p in s.positions
+            }
+            try:
+                revised = apply_itinerary_patch(req, state["candidate"], response.patch, days)
+            except DraftPatchError as exc:
+                raise ReviewContractError(str(exc)) from None
         trace.append(
             {
                 "event": "review_response",
@@ -1650,10 +1735,15 @@ async def run_planning_graph(
         updated = {
             **state["review"],
             "status": "awaiting_adjudication",
-            "planner_response": response.model_dump(mode="json"),
+            "planner_response": {
+                **response.model_dump(mode="json", exclude={"patch"}),
+                "revised_itinerary": revised.model_dump(mode="json")
+                if revised is not None
+                else None,
+            },
         }
         if (
-            response.revised_itinerary is not None
+            revised is not None
             and settings.max_candidates is not None
             and state["attempts"] >= settings.max_candidates
         ):
@@ -1670,7 +1760,7 @@ async def run_planning_graph(
             )
         update = {
             "review": updated,
-            "candidate": response.revised_itinerary or state["candidate"],
+            "candidate": revised or state["candidate"],
             "query_requests": response.query_requests,
             "information_request": None,
             "planning_phase": "review_revision",
@@ -1742,8 +1832,6 @@ async def run_planning_graph(
             return "propose"
         if state.get("information_request"):
             return "research_information"
-        if state.get("planning_phase") == "review_revision" and not state["issues"]:
-            return "check_candidate"
         return "propose" if state["issues"] or state.get("facts_updated") else "check_candidate"
 
     def after_research(state):
@@ -1958,42 +2046,26 @@ async def run_plan(
                 if isinstance(exc, (MapError, ReviewContractError))
                 else f"本次规划未完成（{type(exc).__name__}），请检查接口配置或减少活动后重试；没有改用固定数据。"
             )
-        routes = []
-        if result:
-            for day in range(1, req.days + 1):
-                previous = (
-                    data["origin"]
-                    if not 2 <= day <= req.hotel_nights + 1
-                    else next(
-                        (h for h in data["hotels"] if h["id"] == result.hotel_id), data["origin"]
-                    )
-                )
-                for stop_index, stop in enumerate(s for s in result.stops if s.day == day):
-                    if stop.place_id not in maps.places:
-                        continue
-                    leg = cached_route(maps.cache, previous["id"], stop.place_id, req.transport)
-                    if leg:
-                        routes.append({**leg, "day": day, "stop_index": stop_index})
-                    previous = maps.places[stop.place_id]
         measured = result or progress.get("candidate")
         metrics = []
+        itinerary_routes, route_rows = [], []
         if measured and data.get("origin"):
-            travel = {}
-            for day in range(1, req.days + 1):
-                previous_id = data["origin"]["id"]
-                if 2 <= day <= req.hotel_nights + 1:
-                    previous_id = measured.hotel_id
-                duration, complete = 0, True
-                for stop in (s for s in measured.stops if s.day == day):
-                    leg = cached_route(maps.cache, previous_id, stop.place_id, req.transport)
-                    if previous_id == stop.place_id:
-                        pass  # Same POI adds no inter-POI travel, even before full validation.
-                    elif leg is None:
-                        complete = False
-                    else:
-                        duration += leg["duration_minutes"]
-                    previous_id = stop.place_id
-                travel[day] = duration if complete else None
+            route_rows = route_table(req, measured, data["origin"]["id"], maps.cache)
+            travel = dict.fromkeys(range(1, req.days + 1), 0)
+            for row in route_rows:
+                day = row["day"]
+                duration = row["duration_minutes"]
+                travel[day] = (
+                    None if duration is None or travel[day] is None else travel[day] + duration
+                )
+                if result:
+                    leg = cached_route(
+                        maps.cache, row["origin_id"], row["destination_id"], req.transport
+                    )
+                    if leg:
+                        itinerary_routes.append(
+                            {**leg, "day": day, "stop_index": row["stop_number"] - 1}
+                        )
             metrics = daily_metrics(req, measured, data.get("experience_groups", []), travel)
         hotel = next((h for h in data["hotels"] if result and h["id"] == result.hotel_id), None)
         observation = recorder.snapshot(settings)
@@ -2051,7 +2123,8 @@ async def run_plan(
             "hotel_options": data["hotels"],
             "places": list(maps.places.values()),
             "must_visit_ids": [place["id"] for place in data.get("must_visit", [])],
-            "routes": routes,
+            "routes": itinerary_routes,
+            "route_table": route_rows,
             "daily_metrics": metrics,
             "timing_coverage": {
                 "stop_count": len(measured.stops),
@@ -2059,7 +2132,7 @@ async def run_plan(
             }
             if measured
             else None,
-            "buffer_advisories": buffer_advisories(req, measured, data, maps)
+            "buffer_advisories": buffer_advisories(req, measured, data, maps, routes=route_rows)
             if measured and data.get("origin")
             else [],
             "preference_policy": "soft_targets_v1",

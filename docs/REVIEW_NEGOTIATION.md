@@ -39,10 +39,12 @@ flowchart TD
 | --- | --- |
 | `ReviewReport` | `summary` 和必填的 `suggestions`（最多5条）；显式空列表表示认同，漏字段不能自动批准。意见ID须唯一。 |
 | `ReviewSuggestion` | 稳定 `suggestion_id`，具体日期/当天从1开始站序/地点ID，问题 `concern`、实际需求或证据依据 `requirement_basis`、建议 `proposed_change`。引用位置必须存在于本轮草稿；复核可引用原草稿中已删除的位置并说明。 |
-| `PlannerReviewResponse` | 对初审的每个意见ID恰好回应一次；`action=revise/decline`，必须有 `reason`。有采纳修订时提交完整 `revised_itinerary`；全部拒绝时不能夹带替换行程。 |
+| `PlannerReviewResponse` | 对初审的每个意见 ID 恰好回应一次，填写 `action=revise/decline` 和 `reason`。有采纳修订时提交 `patch`，只替换对应日期，确需换自动酒店时涵盖受影响的住宿日及次日。全拒绝时省略补丁。候选记录中的 `revised_itinerary` 仍保留程序合并后的完整修订结果。 |
 | 复核报告 | 同样为 `ReviewReport`；已解决意见不再列出，未解决沿用原ID；修订引入的具体新问题也可列出。非空就转用户协调，不擅自放行。 |
 
 校验获得完整多天草稿、当前需求、本次用户修订说明 `revision_request`、已知地点、路线与已有事实，以免只看单天产生新的冲突。排程回应也获得这些上下文及结构化初审报告，不接收校验 Agent 的原始思考。本次修订要求优先于旧安排；协商后清空旧消息再做程序反馈修复时，仍显式补回这条要求，避免新意图丢失。研究上下文仍独立，仅接收定向补查所需信息。校验内部的初审与复核消息可延续，不混入其他角色的私有思考。
+
+`route_table` 提供当前草稿每段的高德估算、待查询状态或同地点标志，另给按结构化时间计算的缓冲。其他已查路线以 `alternative_routes` 提供。程序合并排程补丁后再检查所有日期。
 
 ## 结果、前端与持久化
 

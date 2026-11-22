@@ -225,12 +225,14 @@ async def research_missing_information(
                 "found不填写未知原因；引文只允许空格和换行差异，不改字、数字或标点。"
                 "只有引文明示完整开放时段时才填opening_hours的windows，每项day等于任务day；"
                 "只写最晚入场不能推定整个开放窗口。闭馆有明确依据才填closed=true。"
-                "last_admission仅填引文明示的最晚入场钟点，不猜测。"
-                "开放结束或闭馆时间不等于最晚入场，钟点出现还须语义对应当前字段，不混用时间含义。"
+                "last_admission仅填引文明示为最晚入场或停止入场的对应钟点，不猜测。"
+                "开放结束、闭馆或停止售票时间不能作为最晚入场。"
                 "任务weekday为ISO星期1至7（周一至周日），据此核对常规规则与日期例外，不把常规规则当当天保证。"
                 "结构化钟点须出现在引文中，无法明确则留空。不要承诺已预约、实时余票或未来一定开放。"
                 "reservation_channel只回答通过哪里或怎样预约；reservation_requirement只回答"
-                "该馆区在计划日期是否必须预约，预约入口存在不能证明必约；余票留给官方渠道确认。"
+                "该馆区在计划日期普通游客是否必须预约。找到针对该日期和人群的明确必约或免约时，"
+                "reservation_required分别填true或false；预约入口、团体规则或无法对应日期的特殊时段规则保持unknown。"
+                "余票留给官方渠道确认。"
                 "这些是带来源的网页报告，不能声称已完成官方核验或据此替用户放宽硬要求。"
             ),
         )
@@ -422,6 +424,8 @@ async def research_missing_information(
             "sources_conflict",
             "date_not_applicable",
             "explicit_date_mismatch",
+            "admission_meaning_not_supported",
+            "reservation_requirement_not_supported",
             "search_timeout",
             "search_connection_error",
         }
@@ -435,6 +439,7 @@ async def research_missing_information(
             "closure_not_in_quote",
             "opening_structure_missing",
             "admission_structure_missing",
+            "reservation_requirement_conflicts_with_quote",
         }
         repair_keys = {
             (d["place_id"], d["day"], d["field"])

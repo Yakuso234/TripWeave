@@ -3,7 +3,7 @@
 import json
 
 import httpx2
-from draft_helpers import packet, reply, route_queries
+from draft_helpers import phase_packet, reply, route_queries
 from test_planning_workflow import itinerary, map_response, requirements, tool_names
 from test_real_planner import configured
 
@@ -46,7 +46,7 @@ async def test_uncapped_model_output_and_candidates_can_finish_after_four_bad_dr
                 "departure_time": "09:40",
                 "arrival_time": "09:45",
             }
-        return reply("draft_proposal", packet(draft, queries=route_queries(draft)))
+        return reply("draft_proposal", phase_packet(context, draft, queries=route_queries(draft)))
 
     result = await run_plan(
         requirements(), "deepseek", settings, transport=httpx2.MockTransport(provider)

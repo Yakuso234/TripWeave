@@ -5,7 +5,7 @@ from copy import deepcopy
 
 import httpx2
 import pytest
-from draft_helpers import packet, reply, route_queries
+from draft_helpers import packet, phase_packet, reply, route_queries
 from test_planning_research import fact, sources
 from test_planning_workflow import gap, itinerary, map_response, requirements, tool_names
 from test_real_planner import configured, poi
@@ -13,7 +13,10 @@ from test_real_planner import configured, poi
 from tripweave.real_planner import run_plan
 
 
-async def test_automatic_hotel_comparisons_keep_verified_routes_across_batches():
+@pytest.mark.parametrize("first_alternative_morning", [10, 16])
+async def test_automatic_hotel_comparisons_reopen_planning_only_for_useful_alternatives(
+    first_alternative_morning,
+):
     draft = itinerary(days=2)
     draft["hotel_id"] = "h0"
     draft["stops"].insert(
@@ -31,9 +34,12 @@ async def test_automatic_hotel_comparisons_keep_verified_routes_across_batches()
     alternative = deepcopy(draft)
     alternative["hotel_id"] = alternative["stops"][1]["place_id"] = "h2"
     alternative["summary"] = "合成行程，比较后使用备选住宿。"
+    can_improve = first_alternative_morning < 12
+    expected = alternative if can_improve else draft
     planner_calls, map_routes = [], []
     hotel_positions = {
-        f"{121.47 + x / 1000},31.23": duration for x, duration in [(10, 12), (11, 16), (12, 5)]
+        f"{121.47 + x / 1000},31.23": durations
+        for x, durations in [(10, (12, 12)), (11, (16, first_alternative_morning)), (12, (5, 5))]
     }
 
     def comparison(hotel_id):
@@ -69,7 +75,11 @@ async def test_automatic_hotel_comparisons_keep_verified_routes_across_batches()
             if "/direction/" in path:
                 a, b = request.url.params["origin"], request.url.params["destination"]
                 map_routes.append((a, b))
-                duration = hotel_positions.get(a, hotel_positions.get(b, 5))
+                duration = (
+                    hotel_positions[a][1]
+                    if a in hotel_positions
+                    else hotel_positions.get(b, (5, 5))[0]
+                )
                 return httpx2.Response(
                     200,
                     json={
@@ -81,7 +91,7 @@ async def test_automatic_hotel_comparisons_keep_verified_routes_across_batches()
         body = json.loads(request.content)
         prompt = json.loads(body["messages"][-1]["content"])
         if tool_names(body) == {"review_report"}:
-            assert prompt["draft"]["hotel_id"] == "h2"
+            assert prompt["draft"] == expected
             return reply("review_report", {"summary": "合成校验通过。", "suggestions": []})
         planner_calls.append(prompt)
         step = len(planner_calls)
@@ -94,11 +104,14 @@ async def test_automatic_hotel_comparisons_keep_verified_routes_across_batches()
         assert routes["p0", "h0"] == routes["h0", "p1"] == 12
         if step == 2:
             return reply("draft_proposal", packet(draft, queries=comparison("h1")))
-        assert routes["p0", "h1"] == routes["h1", "p1"] == 16
+        assert can_improve
+        assert (routes["p0", "h1"], routes["h1", "p1"]) == (16, first_alternative_morning)
         if step == 3:
-            return reply("draft_proposal", packet(draft, queries=comparison("h2")))
+            assert prompt["revision_days"] == [1, 2]
+            return reply("draft_proposal", phase_packet(prompt, draft, queries=comparison("h2")))
         assert step == 4 and routes["p0", "h2"] == routes["h2", "p1"] == 5
-        return reply("draft_proposal", packet(alternative, queries=[]))
+        assert prompt["revision_days"] == prompt["hotel_revision_days"] == [1, 2]
+        return reply("draft_proposal", phase_packet(prompt, alternative, queries=[]))
 
     result = await run_plan(
         requirements(days=2, nights=1, pace="relaxed"),
@@ -107,8 +120,9 @@ async def test_automatic_hotel_comparisons_keep_verified_routes_across_batches()
         transport=httpx2.MockTransport(provider),
     )
     assert result["outcome"] == "ready", result
-    assert result["review"]["status"] == "approved" and result["itinerary"] == alternative
-    assert len(map_routes) == len(set(map_routes)) == 7
+    assert result["review"]["status"] == "approved" and result["itinerary"] == expected
+    assert len(planner_calls) == (4 if can_improve else 2)
+    assert len(map_routes) == len(set(map_routes)) == (7 if can_improve else 5)
 
 
 async def test_first_model_response_is_saved_before_any_declared_map_query_and_has_no_tools():
@@ -141,6 +155,8 @@ async def test_first_model_response_is_saved_before_any_declared_map_query_and_h
     assert result["outcome"] == "ready", result
     assert len(calls) == 3 and len(directions) == 1
     assert saved[0]["draft"] == itinerary()
+    assert saved[0]["route_table"][0]["status"] == "unknown"
+    assert any(s["route_table"][0]["status"] == "map_estimate" for s in saved[1:])
     assert saved[0]["query_requests"][0]["origin_id"] == "o"
     assert result["query_log"][0]["model_round"] == 1
     assert result["query_log"][0]["query"]["destination_id"] == "p0"
@@ -190,6 +206,74 @@ async def test_cache_reuse_is_normal_and_does_not_trigger_false_no_progress():
     )
     assert result["outcome"] == "ready" and len(directions) == 1
     assert len(result["query_log"]) == 2 and result["query_log"][1]["cache_hit"]
+
+
+@pytest.mark.parametrize("mode", ["ordinary", "empty", "failed", "required", "hard_overlap"])
+async def test_restaurant_results_skip_replanning_except_when_decisive_or_draft_is_invalid(mode):
+    plan = itinerary()
+    plan["stops"].append(
+        {**plan["stops"][0], "start_time": "11:30", "end_time": "12:30", "kind": "meal"}
+    )
+    meal_query = {"kind": "nearby_restaurants", "place_id": "p0", "reason": "查询午餐选择。"}
+    if mode == "required":
+        meal_query["purpose"] = "required_for_plan"
+    planning, reviews, search_calls = [], [], []
+
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            if request.url.path.endswith("/place/around"):
+                search_calls.append(request)
+                if mode == "failed":
+                    return httpx2.Response(200, json={"status": "0", "info": "模拟周边查询故障"})
+                places = (
+                    []
+                    if mode == "empty"
+                    else [
+                        {
+                            **poi("r", "合成餐厅", "餐饮服务"),
+                            "citycode": "021",
+                            "cityname": "上海市",
+                        }
+                    ]
+                )
+                return httpx2.Response(200, json={"status": "1", "pois": places})
+            return map_response(request)
+        body = json.loads(request.content)
+        prompt = json.loads(body["messages"][-1]["content"])
+        if tool_names(body) == {"review_report"}:
+            reviews.append(prompt)
+            return reply("review_report", {"summary": "合成复核通过。", "suggestions": []})
+        planning.append(prompt)
+        if len(planning) == 1:
+            return reply("draft_proposal", packet(plan))
+        if len(planning) == 2:
+            current = deepcopy(plan)
+            if mode == "hard_overlap":
+                current["stops"][1]["start_time"] = "10:30"
+            return reply("draft_proposal", packet(current, queries=[meal_query]))
+        assert mode in {"required", "hard_overlap"} and len(planning) == 3
+        assert prompt["revision_days"] == [1]
+        if mode == "required":
+            assert prompt["evidence_results"][0]["data"][0]["id"] == "r"
+        else:
+            assert {issue["code"] for issue in prompt["validation_issues"]} == {"connection"}
+        return reply("draft_proposal", phase_packet(prompt, plan, queries=[]))
+
+    result = await run_plan(
+        requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
+    )
+    assert result["outcome"] == "ready" and result["itinerary"] == plan, result
+    assert len(planning) == (3 if mode in {"required", "hard_overlap"} else 2)
+    assert len(search_calls) == len(reviews) == 1 and reviews[0]["program_issues"] == []
+    assert reviews[0]["route_table"] == result["route_table"]
+    assert [r["status"] for r in result["route_table"]] == ["map_estimate", "same_place"]
+    meal_evidence = reviews[0]["meal_query_results"]
+    if mode == "failed":
+        assert meal_evidence == [] and result["query_log"][-1]["status"] == "error"
+    else:
+        assert [item["id"] for item in meal_evidence[0]["options"]] == (
+            [] if mode == "empty" else ["r"]
+        )
 
 
 @pytest.mark.parametrize("limit, outcome", [(2, "incomplete"), (6, "ready")])
@@ -399,7 +483,10 @@ async def test_walking_evidence_covers_mixed_graph_validation_metrics_and_output
     assert len(result["routes"]) == 1
 
 
-async def test_local_repair_allows_unaffected_day_annotation_change_but_rechecks_full_plan():
+@pytest.mark.parametrize("changes_outside_scope", [False, True])
+async def test_local_repair_keeps_unaffected_day_exactly_and_rejects_out_of_scope_changes(
+    changes_outside_scope,
+):
     calls = []
     plan = itinerary(days=2)
     broken = deepcopy(plan)
@@ -411,14 +498,19 @@ async def test_local_repair_allows_unaffected_day_annotation_change_but_rechecks
         body = json.loads(request.content)
         calls.append(body)
         if tool_names(body) == {"review_report"}:
+            context = json.loads(body["messages"][-1]["content"])
+            assert context["draft"] == plan and context["program_issues"] == []
             return reply("review_report", {"summary": "合成通过", "suggestions": []})
         context = json.loads(body["messages"][-1]["content"])
         current = deepcopy(broken)
         if any(i["code"] == "connection" for i in context.get("validation_issues", [])):
             assert context["revision_days"] == [1]
             current = deepcopy(plan)
-            current["stops"][1]["reason"] = "说明更新，实际地点和时间未变"
-        return reply("draft_proposal", packet(current, queries=route_queries(current)))
+            if changes_outside_scope:
+                current["stops"][1]["reason"] = "越界修改说明，实际地点和时间未变"
+        return reply(
+            "draft_proposal", phase_packet(context, current, queries=route_queries(current))
+        )
 
     result = await run_plan(
         requirements(days=2, strict_preferences=["start_time"]),
@@ -426,5 +518,11 @@ async def test_local_repair_allows_unaffected_day_annotation_change_but_rechecks
         configured(),
         transport=httpx2.MockTransport(provider),
     )
-    assert result["outcome"] == "ready", result
-    assert result["itinerary"]["stops"][1]["reason"] == "说明更新，实际地点和时间未变"
+    if changes_outside_scope:
+        assert result["outcome"] == "incomplete", result
+        assert "修订范围之外" in result["error"]
+        assert result["draft"] == broken
+        assert all(tool_names(call) != {"review_report"} for call in calls)
+    else:
+        assert result["outcome"] == "ready", result
+        assert result["itinerary"] == plan

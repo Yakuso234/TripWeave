@@ -5,7 +5,7 @@ from copy import deepcopy
 
 import httpx2
 import pytest
-from draft_helpers import packet
+from draft_helpers import negotiation_packet, packet, phase_packet
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from test_planning_research import fact, sources
@@ -65,7 +65,9 @@ async def negotiate(*, reports=None, response=None, req=None, limit=6, repair=No
             assert "使用respond_to_review输出合同" in system
             assert "修订阶段输出DraftProposal" not in system
             assert "只输出计划或资料请求" not in system
-            return completion("respond_to_review", response, len(calls))
+            return completion(
+                "respond_to_review", negotiation_packet(context, response), len(calls)
+            )
         assert names == {"draft_proposal"}
         context = json.loads(body["messages"][-1]["content"])
         plan = repair if repair and context["validation_issues"] else itinerary()
@@ -78,7 +80,9 @@ async def negotiate(*, reports=None, response=None, req=None, limit=6, repair=No
                 for q in issue.get("required_queries", [])
             ]
         )
-        return completion("draft_proposal", packet(plan, queries=queries), len(calls))
+        return completion(
+            "draft_proposal", phase_packet(context, plan, queries=queries), len(calls)
+        )
 
     result = await run_plan(
         req or requirements(notes="用户希望轻松慢游。"),
@@ -111,7 +115,8 @@ async def test_clean_review_is_required_before_ready_and_uses_default_high_effor
     assert context["draft"] == itinerary()
     assert context["program_issues"] == []
     assert context["requirements"]["notes"] == "用户希望轻松慢游。"
-    assert context["verified_routes"]
+    assert context["route_table"][0]["status"] == "map_estimate"
+    assert context["alternative_routes"] == []
     assert result["api_cost_estimate"]["models"]["status"] != "unavailable"
 
 
@@ -418,20 +423,26 @@ async def test_review_revision_does_not_create_fourth_candidate_after_three_chec
         body = json.loads(request.content)
         calls.append(body)
         names = tool_names(body)
+        context = json.loads(body["messages"][-1]["content"])
         if names == {"review_report"}:
             reviews.append(body)
             return completion("review_report", report(suggestion()), len(calls))
         if names == {"respond_to_review"}:
             return completion(
                 "respond_to_review",
-                {"decisions": [decision(action="revise")], "revised_itinerary": revised},
+                negotiation_packet(
+                    context,
+                    {"decisions": [decision(action="revise")], "revised_itinerary": revised},
+                ),
                 len(calls),
             )
         assert names == {"draft_proposal"}
         planner_calls += 1
         plan = broken if planner_calls <= 2 else another if planner_calls == 3 else itinerary()
         return completion(
-            "draft_proposal", packet(plan, queries=None if planner_calls == 1 else []), len(calls)
+            "draft_proposal",
+            phase_packet(context, plan, queries=None if planner_calls == 1 else []),
+            len(calls),
         )
 
     result = await run_plan(
@@ -636,7 +647,9 @@ async def test_program_repair_after_review_revision_is_the_plan_seen_by_final_re
         if names == {"respond_to_review"}:
             return completion(
                 "respond_to_review",
-                {"decisions": [decision(action="revise")], "revised_itinerary": broken},
+                negotiation_packet(
+                    context, {"decisions": [decision(action="revise")], "revised_itinerary": broken}
+                ),
                 len(calls),
             )
         assert names == {"draft_proposal"}
@@ -651,7 +664,7 @@ async def test_program_repair_after_review_revision_is_the_plan_seen_by_final_re
             assert context["requirements"]["notes"] == "轻松慢游。"
             assert context["draft"]["stops"][0]["start_time"] == "00:00"
             assert context["revision_days"] == [1]
-            answer = packet(fixed, queries=[])
+            answer = phase_packet(context, fixed, queries=[])
         return completion("draft_proposal", answer, len(calls))
 
     result = await run_plan(

@@ -3,6 +3,7 @@
 import re
 from collections import defaultdict
 from datetime import date
+from unicodedata import normalize
 
 FIELD_NAMES = {
     "opening_hours": "开放时段",
@@ -13,6 +14,100 @@ FIELD_NAMES = {
     "ticket_availability": "当日余票或可预约名额",
 }
 
+_ENTRY = r"(?:入场|入馆|入园|进馆|入内|检票)"
+_CLOCK = r"((?<!\d)(?:[01]?\d|2[0-3])(?::[0-5]\d|[点时](?:[0-5]?\d分?)?)(?!\d))"
+_ADMISSION_PATTERNS = (
+    re.compile(
+        rf"(?:最晚{_ENTRY}|(?:停止|截止){_ENTRY}|{_ENTRY}(?:时间)?截止|"
+        rf"last\s+(?:entry|admission))(?:时间)?\s*(?:[:：为是]|(?:is|at)\b)?\s*{_CLOCK}",
+        re.IGNORECASE,
+    ),
+    re.compile(rf"{_CLOCK}\s*(?:后|以后|起)?(?:停止|截止|不再(?:允许)?)\s*{_ENTRY}"),
+)
+_RESERVATION_EXEMPT = re.compile(
+    r"(?:无需|无须|不用|不必|不再需要|不再要求|不需要|不需|不强制)(?:提前|事先|实名|线上)*预约|"
+    r"免(?:提前)?预约|取消(?:了)?(?:实名|提前)?预约(?:制|要求)|预约(?:不是|并非)必须|"
+    r"(?:no\s+(?:advance\s+)?(?:reservation|booking)"
+    r"\s+(?:is\s+)?required|(?:reservation|booking)\s+(?:is\s+)?not\s+required)",
+    re.IGNORECASE,
+)
+_RESERVATION_REQUIRED = re.compile(
+    r"(?:必须|务必|需要|须|需)\s*(?:事先|提前(?:[0-9一二三四五六七八九十]+天)?|实名|线上|进行|"
+    r"(?:通过|在)[^，,。；;]{1,18})*\s*预约|"
+    r"实行预约制|(?:仅限|限)已预约(?:的)?(?:观众|游客|人员)?(?:入场|入馆|参观)|"
+    r"(?:advance\s+)?(?:reservation|booking)\s+(?:is\s+)?required",
+    re.IGNORECASE,
+)
+_CONDITIONAL_SCOPE = re.compile(
+    r"仅部分|特殊情况|除外|平日|工作日|周末|周[一二三四五六日天]|星期[一二三四五六日天]|"
+    r"节假日|假期|寒暑假|特展|高峰|视情况|如遇|若遇|(?:如|若)\s*(?:需|须)"
+)
+_GROUP_ONLY = re.compile(r"团队|团体|旅行团|group\s+(?:visits?|tours?|bookings?)", re.IGNORECASE)
+_CLAUSE_BREAK = re.compile(r"[，,。！？!?；;\n]+")
+
+
+def admission_supported(value: str, quote: str, target_date: str | None = None) -> bool:
+    clocks = []
+    for clause in _CLAUSE_BREAK.split(normalize("NFKC", quote)):
+        stated = [match[1] for pattern in _ADMISSION_PATTERNS for match in pattern.finditer(clause)]
+        if not stated or _GROUP_ONLY.search(clause) or conflicting_dates(target_date, clause):
+            continue
+        if _CONDITIONAL_SCOPE.search(clause) or re.search(r"夜场|夜游|night\s+session", clause):
+            return False
+        clocks.extend(stated)
+    return bool(clocks) and all(clock_in_quote(value, clock) for clock in clocks)
+
+
+def reservation_in_quote(quote: str, target_date: str | None = None) -> bool | None:
+    """Recognize explicit visitor rules and leave conditional wording unresolved."""
+    rules = set()
+    for clause in _CLAUSE_BREAK.split(normalize("NFKC", quote)):
+        if _GROUP_ONLY.search(clause) or conflicting_dates(target_date, clause):
+            continue
+        exempt = _RESERVATION_EXEMPT.search(clause)
+        required = _RESERVATION_REQUIRED.search(_RESERVATION_EXEMPT.sub("", clause))
+        if (exempt or required) and _CONDITIONAL_SCOPE.search(clause):
+            return None
+        if exempt:
+            rules.add(False)
+        if required:
+            rules.add(True)
+    return next(iter(rules)) if len(rules) == 1 else None
+
+
+def reservation_value(required: bool) -> str:
+    return "当天必须提前预约" if required else "当天不要求提前预约"
+
+
+def carry_research_fact(fact: dict) -> dict:
+    """Check legacy web claims again when restarting from a saved draft."""
+    if fact.get("evidence_status") != "web_reported" or fact.get("status") != "found":
+        return fact
+    quote = fact.get("quote") or ""
+    field = fact["field"]
+    if field == "reservation_requirement":
+        stated = reservation_in_quote(quote, fact.get("date"))
+        reported = fact.get("reservation_required", stated)
+        if stated is not None and reported is stated:
+            return {**fact, "reservation_required": stated, "value": reservation_value(stated)}
+    elif field == "last_admission":
+        time = fact.get("last_admission")
+        if time and admission_supported(time, quote, fact.get("date")):
+            return fact
+    else:
+        return fact
+    return {
+        **fact,
+        "status": "unknown",
+        "evidence_status": "unknown",
+        "value": "",
+        "quote": "",
+        "sources": [],
+        "queried_at": None,
+        "reservation_required": None,
+        "last_admission": None,
+    }
+
 
 def usable_research_fact(fact):
     if fact["status"] != "found" or fact["field"] == "ticket_availability":
@@ -21,6 +116,8 @@ def usable_research_fact(fact):
         return bool(fact.get("windows") or fact.get("closed") is True)
     if fact["field"] == "last_admission":
         return bool(fact.get("last_admission"))
+    if fact["field"] == "reservation_requirement":
+        return isinstance(fact.get("reservation_required"), bool)
     return True
 
 
@@ -37,6 +134,21 @@ def date_in_explicit_range(target: str, text: str) -> bool:
         except ValueError:
             continue
     return False
+
+
+def conflicting_dates(target: str | None, text: str) -> list[str]:
+    if not target:
+        return []
+    compact = "".join(ch for ch in text if not ch.isspace())
+    dates = {
+        f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+        for year, month, day in re.findall(
+            r"(\d{4})(?:-|年)(\d{1,2})(?:-|月)(\d{1,2})(?:日)?", compact
+        )
+    }
+    if target in dates or date_in_explicit_range(target, compact):
+        return []
+    return sorted(dates)
 
 
 def clock_in_quote(value: str, quote: str) -> bool:
@@ -187,27 +299,44 @@ def validate_evidence(empty_facts, proposals, searches):
         spans = supported
         # Use actual source wording, with whitespace removed only for date detection.
         source_quote = next(iter(spans.values()))[0]
-        explicit_dates = {
-            f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
-            for year, month, day in re.findall(
-                r"(\d{4})(?:-|年)(\d{1,2})(?:-|月)(\d{1,2})(?:日)?",
-                "".join(ch for ch in source_quote if not ch.isspace()),
-            )
-        }
-        if (
-            explicit_dates
-            and empty["date"] not in explicit_dates
-            and not date_in_explicit_range(empty["date"], source_quote)
-        ):
+        target_date = empty["date"]
+        if other_dates := conflicting_dates(target_date, source_quote):
             reject(
                 "evidence",
                 "explicit_date_mismatch",
                 "引文明示日期或直接给出的完整日期范围不包含旅行日期；不能据此确认适用性。",
-                expected=empty["date"],
-                actual=sorted(explicit_dates),
+                expected=target_date,
+                actual=other_dates,
             )
             continue
         item = fact.model_dump(mode="json", exclude={"unknown_reason", "unknown_detail"})
+        if fact.field == "reservation_requirement":
+            stated = reservation_in_quote(source_quote, target_date)
+            supporting = {
+                sid: span
+                for sid, span in spans.items()
+                if stated is not None
+                and reservation_in_quote(by_id[sid]["excerpt"], target_date) is stated
+            }
+            if not supporting:
+                reject(
+                    "evidence",
+                    "reservation_requirement_not_supported",
+                    "引文及其上下文没有针对本次普通游客明确说明必约或免约；预约入口、团体和特殊时段规则不能替代。",
+                )
+                continue
+            if fact.reservation_required is not stated:
+                reject(
+                    "extraction",
+                    "reservation_requirement_conflicts_with_quote",
+                    "须填写reservation_required并与引文的必约或免约结论一致。",
+                    actual=fact.reservation_required,
+                    expected=stated,
+                )
+                continue
+            item["value"] = reservation_value(stated)
+            spans = supporting
+            source_quote = next(iter(spans.values()))[0]
         windows = item.get("windows", [])
         invalid_times = [
             value
@@ -223,14 +352,36 @@ def validate_evidence(empty_facts, proposals, searches):
                 "开放窗口中的钟点没有对应原文依据，未采用该时间结构。",
                 actual=invalid_times,
             )
-        if item.get("last_admission") and not clock_in_quote(item["last_admission"], source_quote):
-            reject(
-                "evidence",
-                "admission_time_not_in_quote",
-                "最晚入场钟点没有对应原文依据，未采用该钟点。",
-                actual=item["last_admission"],
-            )
-            item["last_admission"] = None
+        if item["field"] == "last_admission":
+            cutoff = item.get("last_admission")
+            if not cutoff:
+                reject("extraction", "admission_structure_missing", "缺少明确的最晚入场钟点。")
+                continue
+            if not clock_in_quote(cutoff, normalize("NFKC", source_quote)):
+                reject(
+                    "evidence",
+                    "admission_time_not_in_quote",
+                    "最晚入场钟点没有对应原文依据。",
+                    actual=cutoff,
+                )
+                continue
+            supporting = {
+                sid: span
+                for sid, span in spans.items()
+                if admission_supported(cutoff, span[0], target_date)
+                and admission_supported(cutoff, by_id[sid]["excerpt"], target_date)
+            }
+            if not supporting:
+                reject(
+                    "evidence",
+                    "admission_meaning_not_supported",
+                    "引文及其上下文未明确给出适用的最晚入场；闭馆、停止售票和冲突钟点不能用。",
+                    actual=cutoff,
+                )
+                continue
+            spans = supporting
+            source_quote = next(iter(spans.values()))[0]
+            item["value"] = f"最晚 {cutoff} 入场"
         if item.get("closed") is True and not any(
             word in source_quote for word in ("闭馆", "关闭", "暂停开放", "不开放", "休馆")
         ):
@@ -246,16 +397,6 @@ def validate_evidence(empty_facts, proposals, searches):
                 "extraction",
                 "opening_structure_missing",
                 "有带来源的描述，但缺少完整开放窗口或明确闭馆标识，无法计算可用时段。",
-            )
-        if (
-            item["field"] == "last_admission"
-            and not item.get("last_admission")
-            and not fact.last_admission
-        ):
-            reject(
-                "extraction",
-                "admission_structure_missing",
-                "有带来源的描述，但没有明确最晚入场钟点。",
             )
         item.pop("source_ids", None)
         item.update(

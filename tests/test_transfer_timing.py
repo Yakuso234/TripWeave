@@ -182,7 +182,7 @@ async def test_real_graph_returns_precise_transfer_error_for_model_revision():
     import json
 
     import httpx2
-    from draft_helpers import packet, reply, route_queries
+    from draft_helpers import phase_packet, reply, route_queries
     from test_planning_workflow import itinerary, map_response, requirements, tool_names
     from test_real_planner import configured
 
@@ -211,7 +211,9 @@ async def test_real_graph_returns_precise_transfer_error_for_model_revision():
                 "arrival_time": "09:45",
                 "buffer_minutes": 10,
             }
-        return reply("draft_proposal", packet(current, queries=route_queries(current)))
+        return reply(
+            "draft_proposal", phase_packet(context, current, queries=route_queries(current))
+        )
 
     result = await run_plan(
         requirements(), "deepseek", configured(), transport=httpx2.MockTransport(provider)
@@ -254,6 +256,21 @@ async def test_actual_rest_is_deducted_from_advisory_margin_and_short_route_stil
     short = plan(timing(), next_start="18:10")
     assert any(i["code"] == "connection" for i in await issues(short))
     assert buffer_advisories(req(), short, data(maps), maps) == []
+
+
+async def test_legacy_stops_report_the_maximum_gap_instead_of_a_scheduled_buffer():
+    from tripweave.real_planner import buffer_advisories
+    from tripweave.route_evidence import route_table
+
+    maps = Routes()
+    maps.cache = {("p", "q", "mixed"): {"duration_minutes": 36}}
+    output = plan(next_start="15:59")
+    queried = data(maps)
+    assert await validate(req(), output, queried, maps) == []
+    rows = route_table(req(), output, queried["origin"]["id"], maps.cache)
+    assert rows[1]["buffer_minutes"] == 3 and rows[1]["buffer_basis"] == "upper_bound"
+    warnings = buffer_advisories(req(), output, queried, maps, routes=rows)
+    assert warnings[0]["maximum_minutes"] == 3 and "actual_minutes" not in warnings[0]
 
 
 async def test_low_buffer_never_starts_extra_planner_repair():

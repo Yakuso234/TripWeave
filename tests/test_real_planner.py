@@ -5,7 +5,7 @@ from copy import deepcopy
 
 import httpx2
 import pytest
-from draft_helpers import packet, reply, route_queries
+from draft_helpers import packet, phase_packet, reply, route_queries
 from review_mock import with_approved_review
 
 from tripweave.domain import Requirements
@@ -193,11 +193,17 @@ async def test_deepseek_contract_feedback_and_usage(
                     "10:01"
                 )
             return reply(
-                "draft_proposal", packet(corrected, queries=route_queries(corrected)), len(calls)
+                "draft_proposal",
+                phase_packet(prompt, corrected, queries=route_queries(corrected)),
+                len(calls),
             )
         if prompt["task"] == "first_draft":
             return reply("draft_proposal", packet(original), len(calls))
-        return reply("draft_proposal", packet(broken, queries=route_queries(broken)), len(calls))
+        return reply(
+            "draft_proposal",
+            phase_packet(prompt, broken, queries=route_queries(broken)),
+            len(calls),
+        )
 
     settings = configured().model_copy(update={"max_requests": request_limit})
     output = await run_plan(

@@ -9,9 +9,9 @@ from collections.abc import Iterable, Mapping
 from typing import Annotated, Literal
 from unicodedata import normalize
 
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_validator
 
-from .domain import Itinerary, Requirements
+from .domain import Itinerary, Requirements, Stop
 from .maps import transport_allowed
 from .planning_contracts import Contract, PlaceId, PlanningNeed
 
@@ -30,6 +30,11 @@ class RestaurantQuery(Contract):
     kind: Literal["nearby_restaurants"]
     place_id: PlaceId
     reason: Reason
+    purpose: Literal["required_for_plan"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="仅当餐厅结果决定能否满足当前明确用餐要求时填写；普通备选建议留空",
+    )
 
 
 class PlaceQuery(Contract):
@@ -42,11 +47,84 @@ QueryRequest = Annotated[RouteQuery | RestaurantQuery | PlaceQuery, Field(discri
 QUERY_ADAPTER = TypeAdapter(QueryRequest)
 
 
-class DraftProposal(Contract):
-    draft: Itinerary
+class EvidenceRequests(Contract):
     query_requests: list[QueryRequest] = Field(max_length=24)
     information_needs: list[PlanningNeed] = Field(max_length=5)
     assumptions: list[Annotated[str, Field(min_length=1, max_length=300)]] = Field(max_length=10)
+
+
+class DraftProposal(EvidenceRequests):
+    draft: Itinerary
+
+
+class DayReplacement(Contract):
+    day: int = Field(ge=1, le=7)
+    stops: list[Stop] = Field(
+        max_length=56, description="替换该日期的全体站点；空列表表示明确清空当天"
+    )
+
+    @model_validator(mode="after")
+    def matching_days(self):
+        if any(stop.day != self.day for stop in self.stops):
+            raise ValueError("替换站点的day必须等于所替换日期")
+        return self
+
+
+class ItineraryPatch(Contract):
+    days: list[DayReplacement] = Field(max_length=7)
+    hotel_id: PlaceId | None = Field(default=None, description="只在确需更换自动酒店时填写新ID")
+    summary: str | None = Field(default=None, max_length=1500, description="可选的更新摘要")
+
+    @model_validator(mode="after")
+    def unique_days(self):
+        if len({item.day for item in self.days}) != len(self.days):
+            raise ValueError("同一日期只能替换一次")
+        return self
+
+
+class ScopedRevision(EvidenceRequests):
+    patch: ItineraryPatch
+
+
+class DraftPatchError(ValueError):
+    """A safe message about an output that could not be merged."""
+
+
+def hotel_revision_days(req: Requirements) -> set[int]:
+    if req.hotel_id or not req.hotel_nights:
+        return set()
+    return set(range(1, req.hotel_nights + 2))
+
+
+def apply_itinerary_patch(
+    req: Requirements, original: Itinerary, patch: ItineraryPatch, allowed_days: set[int]
+) -> Itinerary:
+    replaced = {item.day: item.stops for item in patch.days}
+    hotel_id = patch.hotel_id if patch.hotel_id is not None else original.hotel_id
+    if hotel_id != original.hotel_id:
+        hotel_days = hotel_revision_days(req)
+        if not hotel_days:
+            raise DraftPatchError("本次修订不能更换手选酒店或新增住宿，原草稿已保留。")
+        active_hotel_days = hotel_days & {stop.day for stop in original.stops}
+        if not active_hotel_days.issubset(replaced):
+            raise DraftPatchError(
+                "自动住宿更换须同时返回受影响的过夜和次日起点日期，原草稿已保留。"
+            )
+        allowed_days = allowed_days | hotel_days
+    if replaced.keys() - allowed_days:
+        raise DraftPatchError("模型修改了本次局部修订范围之外的安排，原草稿已保留。")
+
+    remaining = [stop for stop in original.stops if stop.day not in replaced] + [
+        stop for stops in replaced.values() for stop in stops
+    ]
+    try:
+        return Itinerary(
+            summary=original.summary if patch.summary is None else patch.summary,
+            hotel_id=hotel_id,
+            stops=sorted(remaining, key=lambda stop: stop.day),
+        )
+    except ValidationError:
+        raise DraftPatchError("合并后的站点数或行程结构超出范围，原草稿已保留。") from None
 
 
 def _query_name(value: str) -> str:

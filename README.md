@@ -35,8 +35,8 @@ uv --cache-dir .runtime/uv-cache sync --locked
 | `TRIPWEAVE_PLANNER_EFFORT` / `TRIPWEAVE_RESEARCH_EFFORT` / `TRIPWEAVE_REVIEWER_EFFORT` | 三角色均开启思考，默认三类角色均为 `high`；可选 `low/high/max` |
 | `TRIPWEAVE_DATABASE` | 默认 `.runtime/tripweave.sqlite3`，本地无需额外数据库服务 |
 | `DATABASE_URL` | 可选 PostgreSQL 连接串，优先于本地路径；详见部署说明 |
-| `TRIPWEAVE_MAX_REQUESTS` / `TRIPWEAVE_RUN_TIMEOUT` | 默认 8 轮模型调用 / 整次规划 300 秒 |
-| `TRIPWEAVE_PLANNER_MAX_TOKENS` / `TRIPWEAVE_RESEARCH_MAX_TOKENS` / `TRIPWEAVE_REVIEWER_MAX_TOKENS` | 单次输出上限默认6000 / 4000 / 6000；共用上述请求数与时限 |
+| `TRIPWEAVE_MAX_REQUESTS` / `TRIPWEAVE_RUN_TIMEOUT` | 默认由三角色共享 600 秒，模型轮次可配置 |
+| `TRIPWEAVE_PLANNER_MAX_TOKENS` / `TRIPWEAVE_RESEARCH_MAX_TOKENS` / `TRIPWEAVE_REVIEWER_MAX_TOKENS` | 单次输出上限可配置，留空时使用供应商默认值 |
 
 页面设置中的“已配置”只代表存在 Key，不代表权限、额度或连通性已验证。修改 API 配置后刷新页面配置状态；修改数据库连接后重启服务。
 
@@ -73,6 +73,7 @@ uv --cache-dir .runtime/uv-cache sync --locked
 
 - `domain.py`：结构化需求与行程合同。
 - `maps.py`：高德 HTTP 适配、来源时间、单次运行路线缓存、超时及响应校验。
+- `route_evidence.py` 将当前草稿与地图缓存对齐，生成逐站路线表和自动住宿的早晚路线对照。
 - `attraction_picker.py` / `attraction_research.py`：兴趣与热门景点召回、模型排序与同一游玩内容分组、每批 5 个的网页摘要和可恢复选景状态。
 - `evidence.py`：服务端确认后的精简资料合同、来源核验、需求版本绑定；不传图片和网页原文给排程。
 - `real_planner.py`：LangGraph 规划图、草稿修订和约束校验。旧规则排程用于内部回归。
@@ -88,7 +89,9 @@ uv --cache-dir .runtime/uv-cache sync --locked
 
 校招版目标与开源参考见 [Agent 架构与技术栈](docs/AGENT_ARCHITECTURE.md)。历史选型依据见 [Agent 运行时](docs/adr/ADR-001-prototype-stack.md)、[真实接口与数据库](docs/adr/ADR-002-real-planning-storage.md)。[后续部署要求](docs/DEPLOYMENT.md)。
 
-当前代码的带备注说明见[核心链路](docs/CORE_FLOW.md)：选景函数流水线、可信交接、排程/按需研究/校验三个Agent、分类结果与SQLite记录。单次规划三角色共享8轮模型调用/300秒/最多检查3份草稿；定向研究仅进入一个阶段，含最多一次恢复、合计最多5次搜索，校验协商最多一轮；初始选景请求不包含在这个跨角色预算内。预算耗尽时保留未完成结果，不把未复核方案当可接受。尚无图checkpoint或任意步骤续跑，失败记录持久化不等于自动恢复。质量/成本评估工具暂缓接入。
+排程、定向研究与校验共享一次规划的预算。定向研究按地点、日期和字段累计实际搜索，同一缺口最多两次。每轮最多一次提取恢复，校验协商最多一轮。初始选景独立计量。预算耗尽时保留待核实草稿。选景交接、分类结果与 SQLite 记录见 [核心链路](docs/CORE_FLOW.md)。
+
+普通餐厅推荐和重复交付的路线由当前草稿继续走全程硬校验，通过再进入独立校验。缺少必要路线、实际衔接不足、具备早晚对照且至少一段更短的酒店备选，以及影响安排的餐饮或关键事实会交回排程。能定位到日期时，模型只返回受影响日期的替换站点，程序合并后重新检查全程。修订、审查和页面共用路线表，区分地图估算、同一地点、待查询与缓冲上限。详见 [草稿优先流程](docs/DRAFT_FIRST_FLOW.md)。
 
 每日节奏四项数值默认是期望目标：景点数量、累计游玩分钟、占原始期望窗口的比例、累计地图交通分钟；可勾选「此项不可调整」成为程序上限。金额改为期望金额，三步偏好页都有额外要求框；明确必去、预约、手选酒店及不可突破条件优先。普通偏离单独展示并交Reviewer评估，不直接判失败；实际衔接仍须可行，程序不自动搬景点。自由文本硬要求仍由规划与Reviewer语义检查，未实现任意文本全部程序化核检。详见[软硬要求规则](docs/REQUIREMENT_POLICY.md)和[当前提示词](docs/PROMPTS_CURRENT.md)。
 
@@ -114,8 +117,9 @@ uv --cache-dir .runtime/uv-cache sync --locked
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\ruff.exe check tripweave tests
 .\.venv\Scripts\ruff.exe format --check tripweave tests
-Get-Content tripweave/static/app.js -Raw | node --check
-Get-Content tests/frontend_state.cjs -Raw | node
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Get-Content tripweave/static/app.js -Raw -Encoding utf8 | node --check -
+Get-Content tests/frontend_state.cjs -Raw -Encoding utf8 | node -
 ```
 
 测试与真实服务验证分开记录，最新结果见 [v0.2 验证报告](docs/evaluations/V02_QA.md)。
@@ -163,6 +167,8 @@ DeepSeek官方端点显式使用max_tokens（不发送OpenAI默认的max_complet
 2026-11-18 三类 Agent 统一 `high` 的单次真实测试已记录，首稿 89.6 秒，完整方案仍因补查与修订循环而超时。见 [实测记录](docs/evaluations/ALL_HIGH_600S_LIVE_20261118.md)。
 
 补查按地点、旅行日期和字段计数，每个缺口最多实际搜索两次，含研究恢复。预约入口、当天是否必约和余票分开，余票请到官方渠道确认。前端可查看已停止补查的字段与待确认事项。见 [补查与证据边界](docs/RESEARCH_RECOVERY.md#2026-11-19-按字段限制定向搜索)。
+
+网页引文及其上下文须明确支持必约或免约，以及最晚入场钟点。预约入口、闭馆时间和停止售票时间各有独立含义。来源对日期、人群或钟点的说法不明确时保留待确认，可由用户补充。
 
 2026-11-19 的单次真实测试触发两次补查上限，以待确认预约资料结束，详情见 [逐字段限额实测](docs/evaluations/RESEARCH_FIELD_LIMIT_LIVE_20261119.md)。
 

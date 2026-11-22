@@ -565,10 +565,42 @@ function transferSummary(stop) {
   const rests=(items,label)=>(items || []).map(r=>`<span>${label} ${esc(r.start_time)}–${esc(r.end_time)}</span>`).join(' · ');
   return `<div class="leg">结构化衔接：${esc(t.departure_time)} 出发 → ${esc(t.arrival_time)} 到达 · 建议缓冲 ${esc(t.buffer_minutes ?? 0)} 分钟${t.rest_before?.length?'<br>'+rests(t.rest_before,'出发前休息'):''}${t.rest_after?.length?'<br>'+rests(t.rest_after,'到达后休息'):''}</div>`;
 }
-function savedDraftDetails(draft, places, title='查看未核实草稿') {
+function routeEvidenceSummary(route) {
+  if (!route) return '';
+  if (route.status === 'unknown') return '<div class="leg">路线 · 待查询</div>';
+  if (route.status === 'same_place') return '<div class="leg">同一地点 · 无跨地点路线</div>';
+  const buffer = route.buffer_minutes == null ? '' : route.buffer_basis === 'upper_bound'
+    ? ` · 站间最多余 ${esc(route.buffer_minutes)} 分钟，实际出发与休息待确认`
+    : ` · 按当前安排余 ${esc(route.buffer_minutes)} 分钟`;
+  const distance = route.distance_meters ? ` · ${(route.distance_meters/1000).toFixed(1)} 公里` : '';
+  return `<div class="leg">路线 · 已取得高德估算：${esc(route.mode)}约 ${esc(route.duration_minutes)} 分钟${distance}${buffer}</div>`;
+}
+function savedDraftDetails(draft, places, title='查看未核实草稿', routeRows=[]) {
   if (!draft?.stops?.length) return '<p class="muted small">尚未保存行程草稿。</p>';
   const names = new Map((places || []).map(place=>[place.id,place.name]));
-  return `<details class="saved-draft"><summary>${esc(title)}</summary><p class="notice">以下是过程草稿，时间和事实仍可能待核实，不能直接接受。</p><p>${esc(draft.summary)}</p><ol>${draft.stops.map(stop=>`<li><strong>第 ${esc(stop.day)} 天 · ${esc(stop.start_time)}–${esc(stop.end_time)} · ${esc(names.get(stop.place_id) || stop.place_id)}</strong><p>${esc(stop.reason)}</p>${transferSummary(stop)}</li>`).join('')}</ol></details>`;
+  const counters = {};
+  const stops = draft.stops.map(stop => {
+    const number = (counters[stop.day] || 0) + 1;
+    counters[stop.day] = number;
+    const evidence = routeRows.find(row => row.day === stop.day && row.stop_number === number);
+    return `<li><strong>第 ${esc(stop.day)} 天 · ${esc(stop.start_time)}–${esc(stop.end_time)} · ${esc(names.get(stop.place_id) || stop.place_id)}</strong>
+      ${routeEvidenceSummary(evidence)}<p>${esc(stop.reason)}</p>${transferSummary(stop)}</li>`;
+  }).join('');
+  return `<details class="saved-draft"><summary>${esc(title)}</summary><p class="notice">以下是过程草稿，时间和事实仍可能待核实，不能直接接受。</p><p>${esc(draft.summary)}</p><ol>${stops}</ol></details>`;
+}
+function timelineStop(plan, stops, day, index) {
+  const stop = stops[index];
+  const place = plan.places?.find(p=>p.id===stop.place_id) || {};
+  const evidence = plan.route_table?.find(row=>row.day===day && row.stop_number===index+1);
+  const leg = !evidence && plan.routes?.find(row=>row.day===day && (row.stop_index!=null
+    ? row.stop_index===index : row.destination_id===stop.place_id && (index===0 || row.origin_id===stops[index-1].place_id)));
+  const route = evidence ? routeEvidenceSummary(evidence) : leg
+    ? `<div class="leg">↗ 从上一站${esc(leg.mode)}约${esc(leg.duration_minutes)}分钟${leg.distance_meters?' · '+(leg.distance_meters/1000).toFixed(1)+'公里':''} · ${esc(leg.source)}</div>`
+    : '';
+  const kind = ({activity:'城市体验',booking:'固定预约',meal:'用餐建议',hotel:'住宿安排'})[stop.kind] || '活动';
+  return `<article class="stop"><div class="stop-time">${esc(stop.start_time)}<small>至 ${esc(stop.end_time)}</small></div>
+    <div>${transferSummary(stop)}${tag(kind)}<h3>${esc(stopHeading(stop,place))}</h3>${route}
+    <p>安排建议：${esc(stop.reason)}</p><div class="stop-meta">${esc(place.address||'')} · ${esc(place.source||'来源待确认')}</div></div></article>`;
 }
 function queryRecords(items, places) {
   if (!items?.length) return '<p class="muted small">尚无查询记录。</p>';
@@ -585,7 +617,10 @@ function queryRecords(items, places) {
     const phase=({first_draft:'首稿',revision:'修订',review_revision:'协商修订',evidence:'核实资料'})[item.phase] || '';
     const callInfo=[item.model_round != null ? '模型第 '+item.model_round+' 轮' : '',phase,item.elapsed_ms != null ? item.elapsed_ms+'毫秒' : ''].filter(Boolean).join(' · ');
     const error=result.error?.message || result.error?.code || result.error || item.error?.message || item.error;
-    return `<li><strong>${esc(label)} · ${esc(location)}</strong>${query.transport?`<span class="small"> · ${esc(({mixed:'综合交通',walking:'步行'})[query.transport] || query.transport)}</span>`:''}${query.reason?`<p>${esc(query.reason)}</p>`:''}${callInfo?`<p class="small muted">${esc(callInfo)}</p>`:''}${status?`<p class="small">${esc(resultLabel)}</p>`:''}${error?`<p class="danger small">${esc(error)}</p>`:''}</li>`;
+    const options = result.data || item.data;
+    const meals = kind === 'nearby_restaurants' && status === 'ok' && Array.isArray(options) && options.length
+      ? `<p class="small">附近候选（供餐待核实）：${options.map(place=>esc(place.name)).join('、')}</p>` : '';
+    return `<li><strong>${esc(label)} · ${esc(location)}</strong>${query.transport?`<span class="small"> · ${esc(({mixed:'综合交通',walking:'步行'})[query.transport] || query.transport)}</span>`:''}${query.reason?`<p>${esc(query.reason)}</p>`:''}${callInfo?`<p class="small muted">${esc(callInfo)}</p>`:''}${status?`<p class="small">${esc(resultLabel)}</p>`:''}${meals}${error?`<p class="danger small">${esc(error)}</p>`:''}</li>`;
   }).join('')}</ol>`;
 }
 function draftUncertainties(record) {
@@ -597,7 +632,7 @@ function draftUncertainties(record) {
 }
 function draftQueryPanel(plan) {
   if (plan.planning_protocol !== 'draft_first') return '';
-  return `<section class="card usage-panel"><h2>草稿与定向查询</h2><p class="muted small">先保留安排，再按结构化清单查询和修订；只有通过完整检查的候选可以接受。</p>${plan.draft && !plan.review?.initial ? savedDraftDetails(plan.draft,plan.places) : ''}${draftUncertainties(plan)}<details><summary>查看结构化查询记录</summary>${queryRecords(plan.query_log?.length?plan.query_log:plan.query_requests,plan.places)}</details></section>`;
+  return `<section class="card usage-panel"><h2>草稿与定向查询</h2><p class="muted small">先保留安排，再按结构化清单查询和修订；只有通过完整检查的候选可以接受。</p>${plan.draft && !plan.review?.initial ? savedDraftDetails(plan.draft,plan.places,undefined,plan.route_table) : ''}${draftUncertainties(plan)}<details><summary>查看结构化查询记录</summary>${queryRecords(plan.query_log?.length?plan.query_log:plan.query_requests,plan.places)}</details></section>`;
 }
 function planningRunsPanel() {
   if (!S.trip) return '';
@@ -605,7 +640,7 @@ function planningRunsPanel() {
     ? S.planningRuns.length ? S.planningRuns.map(run=>{
       const stale=run.requirements_revision !== S.trip.requirements_revision || run.base_version !== S.trip.accepted_version;
       const status=({running:'执行尚未结束',completed:'流程已完成',incomplete:'流程未完成',interrupted:'执行已中断'})[run.status] || '未完成记录';
-      return `<article class="saved-run"><h4>${esc(run.requirements?.city || '旅行')} · ${esc(run.requirements?.date || '')}</h4><p class="muted small">${esc(displayTime(run.updated_at || run.created_at))} · 依据需求 v${esc(run.requirements_revision)}</p>${tag(status,run.status!=='completed')}${stale?tag('基于旧需求或旧行程',true):''}${run.error?`<p class="danger">${esc(run.error)}</p>`:''}${run.status==='running'?'<p class="muted small">若服务已经退出，此记录不会自动继续执行。</p>':''}${savedDraftDetails(run.draft,run.places)}${draftUncertainties(run)}<details><summary>查看本次查询清单与结果</summary>${queryRecords(run.query_log?.length?run.query_log:run.query_requests,run.places)}</details>${run.candidate_id?'<p class="muted small">最终结果已存入规划记录，请在那里查看候选及检查状态。</p>':''}</article>`;
+      return `<article class="saved-run"><h4>${esc(run.requirements?.city || '旅行')} · ${esc(run.requirements?.date || '')}</h4><p class="muted small">${esc(displayTime(run.updated_at || run.created_at))} · 依据需求 v${esc(run.requirements_revision)}</p>${tag(status,run.status!=='completed')}${stale?tag('基于旧需求或旧行程',true):''}${run.error?`<p class="danger">${esc(run.error)}</p>`:''}${run.status==='running'?'<p class="muted small">若服务已经退出，此记录不会自动继续执行。</p>':''}${savedDraftDetails(run.draft,run.places,undefined,run.route_table)}${draftUncertainties(run)}<details><summary>查看本次查询清单与结果</summary>${queryRecords(run.query_log?.length?run.query_log:run.query_requests,run.places)}</details>${run.candidate_id?'<p class="muted small">最终结果已存入规划记录，请在那里查看候选及检查状态。</p>':''}</article>`;
     }).join('') : '<p class="muted small">尚无过程草稿记录，旧候选仍可在规划记录查看。</p>'
     : ''}</section>`;
 }
@@ -648,7 +683,7 @@ function itinerarySummary(plan, requirements, issues) {
 function itinerary(){const p=shownPlan(),snapshot=planRequirements(p),d=p?(snapshot||{city:'历史',date:'原日期未保存',days:Math.max(1,...(p.itinerary?.stops||[]).map(s=>s.day||1)),party_size:'未记录'}):S.draft;const busy=S.busy?`<div class="busy-panel"><span class="spinner"></span>正在查询地点与路线、安排住宿和活动，请稍候…</div>`:'';const heading=`<div class="page-heading"><div><p class="eyebrow">DAY BY DAY / 一天一天，慢慢出发</p><h1>${esc(d.city)}，${daysLabel(d)}的旅行安排</h1><p class="muted">${esc(d.date)}出发 · ${d.party_size}人 · ${p?'依据需求 v'+p.requirements_revision:S.trip?'需求 v'+S.trip.requirements_revision:'尚未保存需求'}</p></div><div class="actions">${button('修改旅行偏好','preferences','secondary')}${button(p?'用 DeepSeek 重新规划':'用 DeepSeek 生成行程','generate')}</div></div>`;
 if(!p)return heading+planningRecords()+planningRunsPanel()+busy+`<div class="empty"><span class="empty-mark">↗</span><h2>一份属于你的行程，还差一步。</h2><p>${S.config.map_configured&&S.config.model_configured?'DeepSeek 将根据旅行偏好和高德查询结果生成候选，再由程序校验路线和时间。':'请在接入设置保存高德 Web 服务 Key 和 DeepSeek API Key。'}</p><div class="actions" style="justify-content:center">${button('查看旅行偏好','preferences','secondary')}${S.config.map_configured&&S.config.model_configured?'':button('去接入设置','settings')}</div></div>`;
 const day=Math.min(S.day,d.days),stops=isReadyPlan(p)?(p.itinerary?.stops?.filter(s=>(s.day||1)===day)||[]):[];const cost=p.costs||{};const isAccepted=S.trip?.accepted_plan?.id===p.id;const eligible=canAccept(p);const issues=[...(p.error?[p.error]:[]),...(p.issues||[]).map(i=>planningIssueText(i,p))];
-return heading+busy+(stalePlan(p)?'<div class="notice">旅行偏好已修改，下面保留的是原方案及原日期，不能作为新需求的结果接受。请重新规划。</div>':'')+`<div class="actions">${tag(p.data_mode)}${tag(stalePlan(p)?'旧方案 · 待重新规划':isAccepted?'已接受 v'+S.trip.accepted_version:isReadyPlan(p)?'候选 · 待确认':planningOutcomeLabel(p),!isReadyPlan(p))}${isReadyPlan(p) ? button('基于此方案修改','revise','secondary') : ''}${button('导出所示方案','export','tiny secondary')}</div>${itinerarySummary(p,d,issues)}${supplementPanel(p,d)}${p.timing_coverage && p.timing_coverage.explicit_count < p.timing_coverage.stop_count ? `<p class="notice">实际出发与休息分配已提供 ${esc(p.timing_coverage.explicit_count)} / ${esc(p.timing_coverage.stop_count)} 站；未提供的路段仅按站间空档检查，备注中的休息尚不能视为已核对。</p>` : ""}${preferenceDeviationPanel(p)}${reviewPanel(p)}${researchPanel(p)}${draftQueryPanel(p)}${usagePanel(p)}${planningRecords()}${planningRunsPanel()}<div class="day-tabs">${Array.from({length:d.days},(_,i)=>`<button class="${day===i+1?'active':''}" aria-pressed="${day===i+1}" data-day="${i+1}">DAY 0${i+1}<small>${dateFor(i+1,snapshot||{})}</small></button>`).join('')}</div><div class="itinerary-layout"><section><div class="timeline">${stops.length?stops.map((s,index)=>{const place=p.places?.find(t=>t.id===s.place_id)||{};const leg=p.routes?.find(r=>r.day===day && (r.stop_index!=null?r.stop_index===index:r.destination_id===s.place_id && r.origin_id===(index?stops[index-1].place_id:r.origin_id)));return `<article class="stop"><div class="stop-time">${esc(s.start_time)}<small>至 ${esc(s.end_time)}</small></div><div>${transferSummary(s)}${tag(({activity:'城市体验',booking:'固定预约',meal:'用餐建议',hotel:'住宿安排'})[s.kind]||'活动')}<h3>${esc(stopHeading(s,place))}</h3><p>安排建议：${esc(s.reason)}</p><div class="stop-meta">${esc(place.address||'')} · ${esc(place.source||'来源待确认')}</div>${leg?`<div class="leg">↗ 从上一站${esc(leg.mode)}约${esc(leg.duration_minutes)}分钟${leg.distance_meters?' · '+(leg.distance_meters/1000).toFixed(1)+'公里':''} · ${esc(leg.source)}</div>`:''}</div></article>`;}).join(''):'<p class="muted">当前没有可接受安排，请查看上方处理说明。</p>'}</div><div class="card" style="margin-top:20px"><h3>本次查询与检查</h3><ol class="trace">${(p.trace||[]).filter(t=>t.detail).map(t=>`<li>${esc(t.detail)}</li>`).join('')}</ol></div></section><aside class="card summary-card"><h3>这趟旅行的预留</h3><p class="muted small">全体${d.party_size}人 · ${daysLabel(d)}</p>${[['住宿预算预留',cost.accommodation],['餐饮预算预留',cost.food],['门票实际费用',cost.tickets],['市内交通费用',cost.transport],['住宿＋餐饮预留',cost.subtotal],['整趟期望金额',cost.budget]].map(([a,b])=>`<div class="cost-row"><span>${a}</span><strong>${money(b)}</strong></div>`).join('')}<p class="muted small">${esc(cost.scope||'费用未核实')}</p><div class="divider"></div><h3>住宿方案</h3><p class="small">${esc(p.hotel?.name||'当日往返 / 尚未确定')}</p>${button('查看住宿详情','hotels','secondary tiny')}<div class="divider"></div><h3>出发前再确认</h3><ul>${(p.warnings||[]).map(t=>`<li>${esc(t)}</li>`).join('')}</ul>${!isAccepted?button('接受当前候选行程','accept','',!eligible?'disabled':''):tag('当前已接受方案已保存')}<p class="muted small">接受只保存本应用内的版本，不代表完成酒店或门票预订。</p></aside></div>`;}
+return heading+busy+(stalePlan(p)?'<div class="notice">旅行偏好已修改，下面保留的是原方案及原日期，不能作为新需求的结果接受。请重新规划。</div>':'')+`<div class="actions">${tag(p.data_mode)}${tag(stalePlan(p)?'旧方案 · 待重新规划':isAccepted?'已接受 v'+S.trip.accepted_version:isReadyPlan(p)?'候选 · 待确认':planningOutcomeLabel(p),!isReadyPlan(p))}${isReadyPlan(p) ? button('基于此方案修改','revise','secondary') : ''}${button('导出所示方案','export','tiny secondary')}</div>${itinerarySummary(p,d,issues)}${supplementPanel(p,d)}${p.timing_coverage && p.timing_coverage.explicit_count < p.timing_coverage.stop_count ? `<p class="notice">实际出发与休息分配已提供 ${esc(p.timing_coverage.explicit_count)} / ${esc(p.timing_coverage.stop_count)} 站；未提供的路段仅按站间空档检查，备注中的休息尚不能视为已核对。</p>` : ""}${preferenceDeviationPanel(p)}${reviewPanel(p)}${researchPanel(p)}${draftQueryPanel(p)}${usagePanel(p)}${planningRecords()}${planningRunsPanel()}<div class="day-tabs">${Array.from({length:d.days},(_,i)=>`<button class="${day===i+1?'active':''}" aria-pressed="${day===i+1}" data-day="${i+1}">DAY 0${i+1}<small>${dateFor(i+1,snapshot||{})}</small></button>`).join('')}</div><div class="itinerary-layout"><section><div class="timeline">${stops.length?stops.map((_,index)=>timelineStop(p,stops,day,index)).join(''):'<p class="muted">当前没有可接受安排，请查看上方处理说明。</p>'}</div><div class="card" style="margin-top:20px"><h3>本次查询与检查</h3><ol class="trace">${(p.trace||[]).filter(t=>t.detail).map(t=>`<li>${esc(t.detail)}</li>`).join('')}</ol></div></section><aside class="card summary-card"><h3>这趟旅行的预留</h3><p class="muted small">全体${d.party_size}人 · ${daysLabel(d)}</p>${[['住宿预算预留',cost.accommodation],['餐饮预算预留',cost.food],['门票实际费用',cost.tickets],['市内交通费用',cost.transport],['住宿＋餐饮预留',cost.subtotal],['整趟期望金额',cost.budget]].map(([a,b])=>`<div class="cost-row"><span>${a}</span><strong>${money(b)}</strong></div>`).join('')}<p class="muted small">${esc(cost.scope||'费用未核实')}</p><div class="divider"></div><h3>住宿方案</h3><p class="small">${esc(p.hotel?.name||'当日往返 / 尚未确定')}</p>${button('查看住宿详情','hotels','secondary tiny')}<div class="divider"></div><h3>出发前再确认</h3><ul>${(p.warnings||[]).map(t=>`<li>${esc(t)}</li>`).join('')}</ul>${!isAccepted?button('接受当前候选行程','accept','',!eligible?'disabled':''):tag('当前已接受方案已保存')}<p class="muted small">接受只保存本应用内的版本，不代表完成酒店或门票预订。</p></aside></div>`;}
 function settings(){const c=S.config;return `<div class="page-heading"><div><p class="eyebrow">CONNECTED, WITH CLEAR BOUNDARIES</p><h1>接入真实信息，开始真实规划。</h1><p class="muted">在本机工作台填写 Key，即可开始联调。</p></div>${button('刷新配置状态','refresh','secondary')}</div><div class="settings-grid"><section class="card"><h2>配置 API Key</h2>
 <form id="provider-keys" method="post" autocomplete="off">
   <label class="field">高德 Web 服务 Key<input id="amap-key" type="password" maxlength="512" autocomplete="off"></label>

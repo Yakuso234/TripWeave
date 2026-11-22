@@ -10,7 +10,7 @@
   → 首稿即时保存SQLite planning_runs
   → collect_queries（程序按起点/终点/交通方式等清单验证/执行/缓存）
       ├─关键资料请求 → research_information（程序预取来源→研究提取/有限恢复）→propose
-      ├─新证据/待修问题 → propose（仅显式最新状态，不堆旧工具历史）
+      ├─影响决策的证据或待修问题 → propose（优先按受影响日期修订）
       └─证据覆盖、无待处理问题 → check_candidate（整份业务检查）
           ├─错误 → propose按定位修订
           └─通过 → review_candidate独立初审
@@ -68,7 +68,7 @@
 
 ## 四、排程与研究的定向交接
 
-排程Agent仅输出draft_proposal，没有普通工具；query_requests由程序按路线两端ID/交通方式、附近餐饮锚点或明确地点名执行。每轮都交完整草稿与新增清单，不能支付、预订或自行放宽用户硬要求。
+排程 Agent 输出 `draft_proposal`。首稿提交完整草稿，局部修订提交 `patch.days` 中需替换的日期。程序执行 `query_requests` 中的结构化地图清单。重复路线和普通餐厅备选可让当前草稿直接进入硬校验。排程和独立校验使用程序生成的 `route_table`。
 
 遇到关键资料缺口时，排程在DraftProposal.information_needs内填写以下PlanningNeed（不是只返回缺口而没有草稿）：
 
@@ -87,6 +87,8 @@ PlanningInformationRequest(
 `ResearchReport`中的`ResearchFact`必须绑定实际搜索来源编号、仅容忍空白格式差异的连续摘录、地点和日期。程序拒绝无来源、摘录不在来源中、同字段重复/冲突、显式日期不适用等情况；结构化开放钟点必须出现在摘录中，查不到保持未知。资料传回排程时带来源、查询时间和`web_reported`标识。网页报告及其摘要不等于官方确认、未来一定开放或已预约；没有日期的通用说明也不能升级成未来保证。
 
 只有明确提取出的`windows`、`closed`、`last_admission`用于程序时间校验，不从自然语言`value`正则猜完整时段，也不因“未查到”推断关闭。网页事实导致的候选错误交回排程或返回缺资料，不把模型解释当作已证硬互斥。
+
+`reservation_required` 须有针对普通游客的明确必约或免约证据。`last_admission` 须对应原文明示的末次入场或停止入场钟点。程序校验引文及其上下文，含糊时保留待确认。详见 [证据校验](../tripweave/research_evidence.py)。
 
 源码入口：[planning_contracts.py](../tripweave/planning_contracts.py)、[planning_research.py](../tripweave/planning_research.py)。
 

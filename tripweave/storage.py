@@ -573,6 +573,7 @@ class Store:
             "pending_information",
             "assumptions",
             "query_log",
+            "route_table",
             "places",
             "phase",
         )
@@ -605,6 +606,7 @@ class Store:
                 run["draft"] = result.get("itinerary") or result.get("draft") or run["draft"]
                 for key in (
                     "query_log",
+                    "route_table",
                     "query_requests",
                     "pending_information",
                     "assumptions",

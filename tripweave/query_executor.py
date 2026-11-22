@@ -14,7 +14,7 @@ from .maps import MapError, cached_route, transport_allowed
 MAX_BATCH_QUERIES = 24
 QUERY_FIELDS = {
     "route": {"kind", "origin_id", "destination_id", "transport", "reason"},
-    "nearby_restaurants": {"kind", "place_id", "reason"},
+    "nearby_restaurants": {"kind", "place_id", "reason", "purpose"},
     "place_search": {"kind", "query", "reason"},
 }
 PLACE_FIELDS = (
@@ -152,6 +152,8 @@ class QueryExecutor:
             ):
                 return "city_mismatch", "路线起点和终点的供应商城市代码不一致。"
         elif kind == "nearby_restaurants":
+            if query.get("purpose") not in (None, "required_for_plan"):
+                return "invalid_query_purpose", "不支持该餐饮查询用途。"
             if not self._known(query.get("place_id")):
                 return "unknown_place_id", "餐饮查询锚点必须是本次已查询且城市身份适用的地点ID。"
         else:

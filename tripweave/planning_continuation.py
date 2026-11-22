@@ -10,6 +10,7 @@ from pydantic import Field, model_validator
 from .domain import Itinerary, Requirements
 from .planning_contracts import Clock, Contract, PlaceId, TimeWindow
 from .query_executor import query_key
+from .research_evidence import carry_research_fact, reservation_value
 
 
 class FactScope(Contract):
@@ -90,7 +91,7 @@ def user_fact_entries(item: UserFact, req: Requirements) -> list[dict]:
     facts = [
         {
             **entry,
-            "value": "当天必须提前预约" if item.required else "当天不要求提前预约",
+            "value": reservation_value(item.required),
             "reservation_required": item.required,
         }
     ]
@@ -170,7 +171,7 @@ class PlanningContinuation:
         return cls(
             draft=Itinerary.model_validate(source["draft"]),
             places=places,
-            facts=list(latest.values()),
+            facts=[carry_research_fact(fact) for fact in latest.values()],
             new_facts=list(additions.values()),
             requests=requests,
             critical_needs=list(grouped_needs.values()),

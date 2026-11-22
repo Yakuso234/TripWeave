@@ -13,7 +13,7 @@ from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.usage import UsageLimits
 
 from .domain import Itinerary
-from .draft_contracts import QueryRequest
+from .draft_contracts import ItineraryPatch, QueryRequest
 from .pacing import REQUIREMENT_POLICY
 from .planning_contracts import Contract
 from .planning_prompts import planner_instructions
@@ -57,7 +57,7 @@ class ReviewDecision(Contract):
 
 class PlannerReviewResponse(Contract):
     decisions: list[ReviewDecision] = Field(min_length=1, max_length=5)
-    revised_itinerary: Itinerary | None = None
+    patch: ItineraryPatch | None = None
     query_requests: list[QueryRequest] = Field(default_factory=list, max_length=24)
 
     @model_validator(mode="after")
@@ -66,8 +66,8 @@ class PlannerReviewResponse(Contract):
         if len(ids) != len(set(ids)):
             raise ValueError("每条意见只回应一次")
         revised = any(d.action == "revise" for d in self.decisions)
-        if revised != (self.revised_itinerary is not None):
-            raise ValueError("有采纳修订时返回完整行程；全部拒绝时不能夹带修改")
+        if revised != (self.patch is not None):
+            raise ValueError("有采纳意见时返回改动；全部拒绝时不能夹带修改")
         return self
 
 
@@ -76,11 +76,13 @@ REVIEW_INSTRUCTIONS = (
     "revision_request是用户本次修订说明，与本次具体需求一起优先于一般或长期偏好。"
     "程序硬约束校验另行负责，不可放行硬约束失败，不声称需求无解。"
     "结合完整多天安排，核对轻松程度、连续高强度游玩、正餐、交通缓冲及说明与时间字段一致性。"
+    "route_table是程序逐站计算的交通与余量；有地图估算的路段视为已有路线证据，"
+    "如说明仍声称在等待或把上界写成实际缓冲，请指出对应站点。meal_query_results仅是附近候选，不能证明营业或满足特定用餐限制。"
     "核对各站transfer的实际出发、到达、rest_before/rest_after及缓冲，明确安排的休息和时刻不能仅藏在说明中；缺字段时不能把站间空档可行当作已核对全部休息。酒店结束指办理入住和当天活动收尾，不把过夜写成一直活动到23:59。"
     "普通交通缓冲不足5分钟仅作轻量建议，不单凭此要求修订或判分歧；地图路程不足、休息与交通冲突和明确不可突破要求仍严格检查。不是为了提意见而提意见；有具体依据才建议修改，最多5条。"
     "preference_deviations提供软目标偏离；有合理取舍且整体体验合适时接受。"
     "用户希望轻松或少赶路，且全天交通明显超过期望并伴有多段实际缓冲偏紧时，"
-    "结合verified_routes检查是否有可选站绕路，或较晚的非必要等待可前移。"
+    "结合route_table与已查alternative_routes检查是否有可选站绕路，或较晚的非必要等待可前移。"
     "有证据表明可以改善时，指出具体日期、站点及建议，保留必去停留、正餐和明确休息；"
     "没有足以支持调整的证据时，允许有解释的偏离；只核实了当前路线时，不宣称已达到最短耗时。"
     "特别核对notes/custom_*和revision_request的明确不可突破要求；未被程序结构化的文本条件需要你语义检查，不能漏掉。"
@@ -99,8 +101,10 @@ RESPONSE_INSTRUCTIONS = (
     "保留revision_request中的用户本次修改意图，其优先于一般或长期偏好。"
     "意见是建议，不高于用户硬要求；不得删改必去、预约、锁定时间和明确不可突破条件。"
     "普通节奏和期望金额允许具体解释后权衡，不能仅因超过软目标而判失败。"
-    "认为有道理则修订，参考所有日期防止新的冲突。只要有revise，返回修订后的完整"
-    "revised_itinerary；未受影响安排保留。全部decline则不返回行程，程序原样保留草稿。"
+    "认为有道理则修订，参考所有日期防止新的冲突。只要有revise，返回patch；"
+    "patch.days每项包含被替换日期的完整stops，只改采纳意见所涉及的日期。"
+    "更换自动酒店时另含hotel_revision_days中的所有受影响日期。只改行程摘要时可给空days及summary。"
+    "全部decline时patch留空，程序原样保留草稿。"
     "不修改必须说明具体用户需求、现有安排或证据为何支持原案，不用泛泛理由。"
     "修订新增路段或需要餐饮时，用query_requests提交结构化清单，不直接调用普通工具。"
     "这是一轮协商，不直接宣布已通过；程序重新校验，随后校验Agent复核。"
