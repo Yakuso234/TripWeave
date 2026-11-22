@@ -1160,6 +1160,19 @@ async def run_planning_graph(
                 "若当天必须预约，注明预约入口（已知时）、拟定入场时段、预约成功后才执行；"
                 "余票与预约完成情况仍未知，不能写成用户已预约。"
             )
+        if phase == "revision" and req.hotel_nights and not req.hotel_id:
+            hotel_ids = {hotel["id"] for hotel in data["hotels"]}
+            prompt["hotel_route_evidence"] = [
+                {
+                    "origin_id": origin_id,
+                    "destination_id": destination_id,
+                    "transport": transport,
+                    "mode": route["mode"],
+                    "duration_minutes": route["duration_minutes"],
+                }
+                for (origin_id, destination_id, transport), route in maps.cache.items()
+                if origin_id in hotel_ids or destination_id in hotel_ids
+            ]
         # Preserve local-repair scope for known draft errors. New evidence can
         # affect the whole trip, in which case the model receives all days.
         issues = state.get("issues", [])

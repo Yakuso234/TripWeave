@@ -8,9 +8,107 @@ import pytest
 from draft_helpers import packet, reply, route_queries
 from test_planning_research import fact, sources
 from test_planning_workflow import gap, itinerary, map_response, requirements, tool_names
-from test_real_planner import configured
+from test_real_planner import configured, poi
 
 from tripweave.real_planner import run_plan
+
+
+async def test_automatic_hotel_comparisons_keep_verified_routes_across_batches():
+    draft = itinerary(days=2)
+    draft["hotel_id"] = "h0"
+    draft["stops"].insert(
+        1,
+        {
+            "day": 1,
+            "place_id": "h0",
+            "kind": "hotel",
+            "title": "",
+            "start_time": "17:00",
+            "end_time": "18:00",
+            "reason": "过夜当天返回酒店",
+        },
+    )
+    alternative = deepcopy(draft)
+    alternative["hotel_id"] = alternative["stops"][1]["place_id"] = "h2"
+    alternative["summary"] = "合成行程，比较后使用备选住宿。"
+    planner_calls, map_routes = [], []
+    hotel_positions = {
+        f"{121.47 + x / 1000},31.23": duration for x, duration in [(10, 12), (11, 16), (12, 5)]
+    }
+
+    def comparison(hotel_id):
+        return [
+            {
+                "kind": "route",
+                "origin_id": origin_id,
+                "destination_id": destination_id,
+                "transport": "mixed",
+                "reason": "比较备选酒店跨两天的衔接",
+            }
+            for origin_id, destination_id in (("p0", hotel_id), (hotel_id, "p1"))
+        ]
+
+    def provider(request):
+        path = request.url.path
+        if request.url.host != "api.deepseek.com":
+            if request.url.params.get("types") == "100000":
+                return httpx2.Response(
+                    200,
+                    json={
+                        "status": "1",
+                        "pois": [
+                            {
+                                **poi(f"h{i}", f"酒店{i}", "住宿服务;宾馆酒店", x=10 + i),
+                                "citycode": "021",
+                                "cityname": "上海市",
+                            }
+                            for i in range(3)
+                        ],
+                    },
+                )
+            if "/direction/" in path:
+                a, b = request.url.params["origin"], request.url.params["destination"]
+                map_routes.append((a, b))
+                duration = hotel_positions.get(a, hotel_positions.get(b, 5))
+                return httpx2.Response(
+                    200,
+                    json={
+                        "status": "1",
+                        "route": {"paths": [{"duration": str(duration * 60), "distance": "500"}]},
+                    },
+                )
+            return map_response(request)
+        body = json.loads(request.content)
+        prompt = json.loads(body["messages"][-1]["content"])
+        if tool_names(body) == {"review_report"}:
+            assert prompt["draft"]["hotel_id"] == "h2"
+            return reply("review_report", {"summary": "合成校验通过。", "suggestions": []})
+        planner_calls.append(prompt)
+        step = len(planner_calls)
+        if step == 1:
+            return reply("draft_proposal", packet(draft))
+        routes = {
+            (route["origin_id"], route["destination_id"]): route["duration_minutes"]
+            for route in prompt["hotel_route_evidence"]
+        }
+        assert routes["p0", "h0"] == routes["h0", "p1"] == 12
+        if step == 2:
+            return reply("draft_proposal", packet(draft, queries=comparison("h1")))
+        assert routes["p0", "h1"] == routes["h1", "p1"] == 16
+        if step == 3:
+            return reply("draft_proposal", packet(draft, queries=comparison("h2")))
+        assert step == 4 and routes["p0", "h2"] == routes["h2", "p1"] == 5
+        return reply("draft_proposal", packet(alternative, queries=[]))
+
+    result = await run_plan(
+        requirements(days=2, nights=1, pace="relaxed"),
+        "deepseek",
+        configured(),
+        transport=httpx2.MockTransport(provider),
+    )
+    assert result["outcome"] == "ready", result
+    assert result["review"]["status"] == "approved" and result["itinerary"] == alternative
+    assert len(map_routes) == len(set(map_routes)) == 7
 
 
 async def test_first_model_response_is_saved_before_any_declared_map_query_and_has_no_tools():
