@@ -117,6 +117,18 @@ async def test_clean_review_is_required_before_ready_and_uses_default_high_effor
     assert context["requirements"]["notes"] == "用户希望轻松慢游。"
     assert context["route_table"][0]["status"] == "map_estimate"
     assert context["alternative_routes"] == []
+    assert {p["id"] for p in context["known_places"]} == {"o", "p0"}
+    assert "attractions" not in context["queried_data"]
+    assert context["ticket_status"] == {
+        "purchase_requirement": "unverified",
+        "availability": "unverified",
+    }
+    assert context["review_focus"] == []
+    system = "\n".join(
+        m.get("content", "") for m in reviews[0]["messages"] if m["role"] == "system"
+    )
+    assert "checked_modes含transit" in system
+    assert "购票要求和余票待确认" in system
     assert result["api_cost_estimate"]["models"]["status"] != "unavailable"
 
 
@@ -151,6 +163,7 @@ async def test_planner_revision_is_checked_then_reviewed_with_full_context():
     assert final["review"]["planner_decisions"] == response["decisions"]
     assert "original_draft" not in final["review"]
     assert "revised_itinerary" not in final["review"]
+    assert final["review"]["original_positions"] == [{**itinerary()["stops"][0], "stop_number": 1}]
     assert json.loads(reviews[0]["messages"][-1]["content"])["draft"] == itinerary()
     assert final["program_issues"] == []
     assert sum(event["event"] == "validation" for event in result["trace"]) == 2
@@ -549,7 +562,10 @@ async def test_negotiation_handoffs_do_not_share_other_agents_private_thinking()
         if role == "reviewer":
             reviewers += 1
             if reviewers == 2:
-                assert "PRIVATE-reviewer" in serialized
+                assert "PRIVATE-reviewer" not in serialized
+                context = json.loads(body["messages"][-1]["content"])
+                assert context["review"]["initial"] == report(suggestion())
+                assert context["review"]["planner_decisions"] == [decision()]
             reply = completion(
                 "review_report", report(suggestion()) if reviewers == 1 else report(), len(calls)
             )
@@ -557,6 +573,8 @@ async def test_negotiation_handoffs_do_not_share_other_agents_private_thinking()
             context = json.loads(body["messages"][-1]["content"])
             assert context["review"]["initial"] == report(suggestion())
             assert context["draft"] == itinerary()
+            assert context["queried_data"]["attractions"]
+            assert "review_focus" not in context
             reply = completion("respond_to_review", {"decisions": [decision()]}, len(calls))
         else:
             reply = completion(

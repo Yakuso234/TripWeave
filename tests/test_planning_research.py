@@ -358,6 +358,17 @@ async def test_quote_explicitly_about_another_date_is_not_bound_to_the_requested
         ),
         ("last_admission", "17:00停止售票。", None, "17:00", "admission_meaning_not_supported"),
         ("last_admission", "16:00停止入场，17:00闭馆。", None, "16:00", None),
+        ("last_admission", "下午5点停止入场。", None, "17:00", None),
+        ("last_admission", "Last admission at 5:30 p.m.", None, "17:30", None),
+        ("last_admission", "中午12点停止入场。", None, "12:00", None),
+        ("last_admission", "下午5点停止入场。", None, "05:00", "admission_time_not_in_quote"),
+        (
+            "last_admission",
+            "Last admission at 5:30 p.m.",
+            "Last admission at 5:30",
+            "05:30",
+            "admission_meaning_not_supported",
+        ),
         (
             "last_admission",
             "16:00停止入场，17:00闭馆。",

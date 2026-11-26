@@ -136,17 +136,20 @@ test('pending candidate accepts scoped booking details from the form and resumes
   assert.doesNotMatch(h.itinerary(), /补充资料并继续规划/);
 });
 
-test('changing destination invalidates hotel results, fixed place and manual hotel', () => {
+test('changing destination invalidates hotel results and old city-specific places', () => {
   const h = harness();
   h.S.hotels = [{id:'h2', name:'查询缓存的上海酒店'}];
   h.S.hotelContext = h.hotelQueryContext(h.S.draft);
   h.S.draft.hotel_id = 'h2';
+  h.S.draft.must_visit = ['上海测试景点'];
   assert.equal(h.currentHotels().length, 1);
   h.changeDraft('city', '杭州');
   assert.equal(h.currentHotels().length, 0);
   assert.equal(h.S.draft.booking_query, '');
   assert.equal(h.S.draft.origin_query, '');
   assert.equal(h.S.draft.hotel_id, null);
+  assert.equal(h.S.draft.must_visit.length, 0);
+  assert.match(h.elements.get('toast').textContent, /必去景点.*已清空/);
   assert.doesNotMatch(h.hotels(), /上海测试酒店|查询缓存的上海酒店/);
 });
 
@@ -1079,9 +1082,27 @@ test('the route table provides route status independently of legacy route rows a
   assert.match(html,/同一地点 · 无跨地点路线/);
   assert.match(html,/路线 · 待查询/);
   assert.match(html,/是否需要预约仍待确认/);
-  assert.doesNotMatch(html,/99分钟|按当前安排余 3 分钟/);
+  assert.doesNotMatch(html,/99分钟|按当前安排余 3 分钟|已查询方式/);
+  candidate.route_table[0].checked_modes=['walking'];
+  assert.match(h.itinerary(),/已查询方式 步行<\/div>/);
+  candidate.route_table[0].checked_modes.push('transit');
+  assert.match(h.itinerary(),/已查询方式 步行、公共交通<\/div>/);
   delete candidate.route_table;
   assert.match(h.itinerary(),/99分钟/);
+});
+
+
+test('unverified ticket status remains distinct from user-supplied reservation facts', () => {
+  const h=harness();
+  const candidate=h.S.candidate;
+  const stop=candidate.itinerary.stops[0];
+  candidate.research_facts=[{day:1,place_id:stop.place_id,field:'reservation_requirement',
+    evidence_status:'user_reported',value:'须实名预约'}];
+  assert.doesNotMatch(h.itinerary(),/票务核实状态/);
+  candidate.ticket_status={purchase_requirement:'unverified',availability:'unverified'};
+  const html=h.itinerary();
+  assert.match(html,/票务核实状态<\/strong> 购票要求待核实 · 实时余票待核实/);
+  assert.match(html,/你补充的资料.*须实名预约/);
 });
 
 

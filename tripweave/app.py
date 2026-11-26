@@ -1,7 +1,7 @@
 """Local HTTP workspace. Provider calls run outside short storage transactions."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -477,11 +477,11 @@ def create_app(database: str | None = None) -> FastAPI:
                 continuation=continuation,
             )
             candidate.update(result)
-            await run_in_threadpool(store.add_candidate, candidate)
             await run_in_threadpool(store.finish_planning_run, trip_id, run["id"], candidate)
         except Exception, asyncio.CancelledError:
             # Keep provider/SQL exception details out of the saved record.
-            await run_in_threadpool(store.finish_planning_run, trip_id, run["id"])
+            with suppress(StoreError):
+                await run_in_threadpool(store.finish_planning_run, trip_id, run["id"])
             raise
         return candidate
 

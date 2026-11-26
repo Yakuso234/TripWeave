@@ -14,6 +14,7 @@ from test_research_planner_context import completion
 
 import tripweave.app as application
 from tripweave.domain import Requirements
+from tripweave.planning_continuation import PlanningContinuation, UserReservationRequirement
 from tripweave.real_planner import run_plan
 
 PRIVATE_NOTE = "PRIVATE-NOTE-MUST-NOT-REACH-RESEARCH"
@@ -859,3 +860,68 @@ def test_user_reservation_information_resumes_saved_draft_through_review(tmp_pat
         assert history[1]["outcome"] == "needs_information" and history[1]["draft"] == original
         assert client.post(base + f"/candidates/{candidate['id']}/accept").status_code == 200
         assert client.post(base + "/plan", json=payload).status_code == 409
+
+
+@pytest.mark.parametrize("also_missing", [False, True])
+async def test_repeating_user_supplied_facts_does_not_mark_them_missing(also_missing):
+    req = requirements()
+    original = itinerary()
+    need = gap(field="reservation_requirement")["needs"][0]
+    continuation = PlanningContinuation.from_candidate(
+        req,
+        {
+            "outcome": "needs_information",
+            "draft": original,
+            "places": [{"id": "p0"}],
+            "issues": [
+                {
+                    "category": "missing_fact",
+                    "place_id": "p0",
+                    "day": 1,
+                    "missing_fields": ["reservation_requirement"],
+                }
+            ],
+        },
+        [
+            UserReservationRequirement(
+                field="reservation_requirement", place_id="p0", day=1, required=True
+            )
+        ],
+    )
+    if also_missing:
+        need["fields"].append("ticket_availability")
+    prompts = []
+
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            return map_response(request)
+        assert request.url.path.endswith("/chat/completions")
+        body = json.loads(request.content)
+        context = json.loads(body["messages"][-1]["content"])
+        if tool_names(body) == {"review_report"}:
+            assert not also_missing and context["program_issues"] == []
+            assert context["queried_data"]["planning_facts"][0]["reservation_required"] is True
+            return completion(
+                "review_report", {"summary": "已查看用户提供资料。", "suggestions": []}, 3
+            )
+        assert tool_names(body) == {"draft_proposal"}
+        prompts.append(context)
+        return completion("draft_proposal", packet(original, needs=[need]), len(prompts))
+
+    result = await run_plan(
+        req,
+        "deepseek",
+        configured(),
+        transport=httpx2.MockTransport(provider),
+        continuation=continuation,
+    )
+    assert result["outcome"] == ("needs_information" if also_missing else "ready"), result
+    assert result["research_search_calls"] == 0 and len(prompts) == 2
+    assert prompts[1]["research_limits"][0]["code"] == "user_fact_supplied"
+    if also_missing:
+        assert result["draft"] == original
+    else:
+        assert result["itinerary"] == original and result["review"]["status"] == "approved"
+    missing = [field for issue in result["issues"] for field in issue.get("missing_fields", [])]
+    assert missing == (["ticket_availability"] if also_missing else [])
+    assert any(fact.get("reservation_required") is True for fact in result["research_facts"])

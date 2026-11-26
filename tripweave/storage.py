@@ -473,29 +473,32 @@ class Store:
             )
         return trip
 
+    def _insert_candidate(self, connection, candidate: dict) -> None:
+        connection.execute(
+            candidates.insert().values(
+                id=candidate["id"],
+                trip_id=candidate["trip_id"],
+                body=encode(candidate),
+            )
+        )
+        self._event(
+            connection,
+            candidate["trip_id"],
+            "candidate_generated",
+            {
+                "candidate_id": candidate["id"],
+                "status": candidate["status"],
+                "requirements_revision": candidate["requirements_revision"],
+                "base_version": candidate["base_version"],
+                "mode": candidate.get("mode"),
+            },
+            candidate_id=candidate["id"],
+        )
+
     def add_candidate(self, candidate: dict) -> dict:
         with self._transaction() as connection:
             self._read(connection, candidate["trip_id"])
-            connection.execute(
-                candidates.insert().values(
-                    id=candidate["id"],
-                    trip_id=candidate["trip_id"],
-                    body=encode(candidate),
-                )
-            )
-            self._event(
-                connection,
-                candidate["trip_id"],
-                "candidate_generated",
-                {
-                    "candidate_id": candidate["id"],
-                    "status": candidate["status"],
-                    "requirements_revision": candidate["requirements_revision"],
-                    "base_version": candidate["base_version"],
-                    "mode": candidate.get("mode"),
-                },
-                candidate_id=candidate["id"],
-            )
+            self._insert_candidate(connection, candidate)
         return candidate
 
     def start_planning_run(
@@ -574,6 +577,7 @@ class Store:
             "assumptions",
             "query_log",
             "route_table",
+            "issues",
             "places",
             "phase",
         )
@@ -588,15 +592,20 @@ class Store:
     def finish_planning_run(
         self, trip_id: str, run_id: str, result: dict | None = None, *, error: str | None = None
     ) -> dict:
+        """Publish the candidate and settle its execution record together."""
         with self._transaction() as connection:
             old_body, run = self._read_planning_run(connection, trip_id, run_id)
             if run["status"] != "running":
+                if result is not None and result["id"] != run["candidate_id"]:
+                    raise StoreError(409, "本次规划已经结束，请查看已有执行记录。")
                 return run
             if result is not None:
-                if result["trip_id"] != trip_id or (
+                if (
+                    result["trip_id"],
+                    result.get("planning_run_id"),
                     result["requirements_revision"],
                     result["base_version"],
-                ) != (run["requirements_revision"], run["base_version"]):
+                ) != (trip_id, run_id, run["requirements_revision"], run["base_version"]):
                     raise StoreError(409, "规划结果与执行记录依据不一致。")
                 run["candidate_id"] = result["id"]
                 run["outcome"] = result.get("outcome", result["status"])
@@ -617,6 +626,7 @@ class Store:
                         run[key] = result[key]
                 run["error"] = result.get("error")
                 run["phase"] = "finished"
+                self._insert_candidate(connection, result)
             else:
                 run.update(
                     status="interrupted",

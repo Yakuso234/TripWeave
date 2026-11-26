@@ -319,4 +319,11 @@ def check_draft_identity(
                 scheduled_start=stop.start_time,
                 scheduled_end=stop.end_time,
             )
+    for day in range(1, req.days + 1):
+        if day not in counters:
+            fail(
+                "missing_day",
+                f"草稿遗漏第{day}天，请补齐该天的安排。用餐或住宿也可作为站点。",
+                day=day,
+            )
     return issues

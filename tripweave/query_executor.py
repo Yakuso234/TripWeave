@@ -36,6 +36,7 @@ ROUTE_FIELDS = (
     "duration_minutes",
     "distance_meters",
     "mode",
+    "checked_modes",
     "source",
     "queried_at",
 )
@@ -239,7 +240,7 @@ class QueryExecutor:
                                 self.req.city,
                                 query["transport"],
                             )
-                            item["data"] = _project(result, ROUTE_FIELDS)
+                            item["data"] = deepcopy(_project(result, ROUTE_FIELDS))
                         elif query["kind"] == "nearby_restaurants":
                             places = await self.maps.nearby(self.maps.places[query["place_id"]])
                             accepted = [place for place in places if self._same_city(place)]

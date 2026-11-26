@@ -1,7 +1,9 @@
 """Project the cached routes used by a draft, without making map requests."""
 
+from math import isfinite
+
 from .domain import Itinerary, Requirements, RestPeriod, Stop, minutes
-from .maps import cached_route
+from .maps import cached_route, distance
 
 
 def planned_legs(req: Requirements, draft: Itinerary, origin_id: str):
@@ -70,6 +72,7 @@ def route_table(req: Requirements, draft: Itinerary, origin_id: str, cache: dict
                 "status": "same_place" if same_place else "map_estimate" if leg else "unknown",
                 "duration_minutes": duration,
                 "mode": leg.get("mode") if leg else None,
+                "checked_modes": leg.get("checked_modes") if leg else None,
                 "source": leg.get("source") if leg else None,
                 "distance_meters": leg.get("distance_meters") if leg else None,
                 "buffer_minutes": buffer,
@@ -79,34 +82,115 @@ def route_table(req: Requirements, draft: Itinerary, origin_id: str, cache: dict
     return rows
 
 
-def hotel_comparisons(req: Requirements, draft: Itinerary, hotels: list[dict], cache: dict):
-    """Compare the same evening and morning anchors for all affected days."""
+def _hotel_anchors(req: Requirements, draft: Itinerary) -> tuple[tuple[int, str, bool], ...]:
     if not req.hotel_nights or req.hotel_id or not draft.hotel_id:
-        return {}
-
-    def duration(start, end):
-        if start == end:
-            return 0
-        route = cached_route(cache, start, end, req.transport)
-        return route["duration_minutes"] if route is not None else None
+        return ()
 
     anchors = []
     for night in range(1, req.hotel_nights + 1):
         evening = [s for s in draft.stops if s.day == night]
         morning = next((s for s in draft.stops if s.day == night + 1), None)
-        if len(evening) < 2 or morning is None:
-            # These interfaces need the same real stops on both sides to compare.
-            return {}
+        if (
+            len(evening) < 2
+            or evening[-1].kind != "hotel"
+            or evening[-1].place_id != draft.hotel_id
+            or evening[-2].place_id == draft.hotel_id
+            or morning is None
+            or morning.kind == "hotel"
+            or morning.place_id == draft.hotel_id
+        ):
+            # A meal or activity at the selected hotel can move with the hotel.
+            # It cannot serve as an independent anchor for the comparison.
+            return ()
         anchors += [
             (night, evening[-2].place_id, True),
             (night + 1, morning.place_id, False),
         ]
+    return tuple(anchors)
 
-    original = [
-        duration(anchor, draft.hotel_id) if returning else duration(draft.hotel_id, anchor)
-        for _, anchor, returning in anchors
-    ]
-    if any(value is None for value in original):
+
+def _hotel_route(hotel_id: str, anchor_id: str, returning: bool) -> tuple[str, str]:
+    return (anchor_id, hotel_id) if returning else (hotel_id, anchor_id)
+
+
+def _duration(cache, start, end, transport) -> int | None:
+    if start == end:
+        return 0
+    route = cached_route(cache, start, end, transport)
+    return route["duration_minutes"] if route is not None else None
+
+
+def _hotel_minutes(anchors, hotel_id, cache, transport) -> list[int] | None:
+    durations = []
+    for _, anchor_id, returning in anchors:
+        start, end = _hotel_route(hotel_id, anchor_id, returning)
+        duration = _duration(cache, start, end, transport)
+        if duration is None:
+            return None
+        durations.append(duration)
+    return durations
+
+
+def hotel_shortlist(
+    req: Requirements,
+    draft: Itinerary,
+    hotels: list[dict],
+    places: dict,
+    cache: dict,
+    *,
+    max_queries: int = 24,
+    min_leg_minutes: int = 0,
+):
+    """Rank up to three alternatives and return only their missing paired routes."""
+    anchors = _hotel_anchors(req, draft)
+    if not anchors:
+        return None
+    original = _hotel_minutes(anchors, draft.hotel_id, cache, req.transport)
+    if original is None or max(original) < min_leg_minutes:
+        return None
+
+    standings = []
+    for hotel_id in {hotel["id"] for hotel in hotels} - {draft.hotel_id}:
+        try:
+            score = sum(distance(places[hotel_id], places[anchor]) for _, anchor, _ in anchors)
+        except KeyError, TypeError, ValueError:
+            continue
+        if isfinite(score):
+            standings.append((score, hotel_id))
+
+    shortlisted, missing = [], {}
+    for _, hotel_id in sorted(standings)[:3]:
+        pairs = dict.fromkeys(
+            _hotel_route(hotel_id, anchor, returning) for _, anchor, returning in anchors
+        )
+        needed = [
+            (start, end)
+            for start, end in pairs
+            if (start, end) not in missing and _duration(cache, start, end, req.transport) is None
+        ]
+        if len(missing) + len(needed) > max_queries:
+            continue
+        shortlisted.append(hotel_id)
+        for start, end in needed:
+            missing[start, end] = {
+                "kind": "route",
+                "origin_id": start,
+                "destination_id": end,
+                "transport": req.transport,
+                "reason": "比较同一过夜前接驳和次日出发地点的自动酒店备选。",
+            }
+    if not shortlisted:
+        return None
+    return (req.transport, anchors), tuple(shortlisted), list(missing.values())
+
+
+def hotel_comparisons(req: Requirements, draft: Itinerary, hotels: list[dict], cache: dict):
+    """Compare the same evening and morning anchors for all affected days."""
+    anchors = _hotel_anchors(req, draft)
+    if not anchors:
+        return {}
+    original = _hotel_minutes(anchors, draft.hotel_id, cache, req.transport)
+    if original is None:
         return {}
 
     comparisons = {}
@@ -116,8 +200,8 @@ def hotel_comparisons(req: Requirements, draft: Itinerary, hotels: list[dict], c
             continue
         legs = []
         for (day, anchor, returning), current in zip(anchors, original, strict=True):
-            start, end = (anchor, hotel_id) if returning else (hotel_id, anchor)
-            travel = duration(start, end)
+            start, end = _hotel_route(hotel_id, anchor, returning)
+            travel = _duration(cache, start, end, req.transport)
             if travel is None:
                 break
             legs.append(

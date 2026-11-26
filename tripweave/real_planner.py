@@ -55,9 +55,9 @@ from .planning_review import (
     validate_positions,
     validate_response,
 )
-from .query_executor import QueryExecutor, query_key
+from .query_executor import MAX_BATCH_QUERIES, QueryExecutor, query_key
 from .research_evidence import FIELD_NAMES, usable_research_fact
-from .route_evidence import hotel_comparisons, planned_legs, route_table
+from .route_evidence import hotel_comparisons, hotel_shortlist, planned_legs, route_table
 from .settings import Settings
 
 
@@ -267,6 +267,14 @@ def buffer_advisories(req, output, data, maps, *, routes=None):
             }
         )
     return warnings
+
+
+def ticket_status(itinerary: Itinerary | None):
+    if itinerary and any(stop.kind in {"activity", "booking"} for stop in itinerary.stops):
+        # Reservation facts do not say whether a ticket purchase is required
+        # or whether admission inventory is available.
+        return {"purchase_requirement": "unverified", "availability": "unverified"}
+    return None
 
 
 def preference_deviations(req, output, data, maps, metrics=None):
@@ -969,6 +977,7 @@ async def run_planning_graph(
     executor = None
     repeated = {}
     checked = set()
+    compared_hotel_anchors = set()
     delivered_meal_decisions = set()
     research_attempts = dict(continuation.search_attempts) if continuation else {}
     informed_limits = {fact_key(item): item for item in continuation.limits} if continuation else {}
@@ -1020,6 +1029,7 @@ async def run_planning_graph(
                         q.model_dump(mode="json") if hasattr(q, "model_dump") else q
                         for q in state.get("query_requests", [])
                     ],
+                    "issues": state.get("issues", []),
                     "pending_information": state.get("information_request").model_dump(mode="json")
                     if state.get("information_request")
                     else None,
@@ -1180,6 +1190,7 @@ async def run_planning_graph(
             prompt["route_table"] = route_table(
                 req, state["candidate"], data["origin"]["id"], maps.cache
             )
+            prompt["ticket_status"] = ticket_status(state["candidate"])
         # Local repairs use day replacements. When the scope is unknown, the
         # model can still return a new complete draft.
         issues = state.get("issues", [])
@@ -1333,11 +1344,34 @@ async def run_planning_graph(
         )
         comparison_before = hotel_comparisons(req, draft, data["hotels"], maps.cache)
         if light_issues:
+            diagnostics = [
+                {
+                    key: issue[key]
+                    for key in ("code", "day", "stop_number", "place_id")
+                    if key in issue
+                }
+                for issue in light_issues
+            ]
+            trace.append(
+                {
+                    "event": "draft_light_check",
+                    "phase": state["planning_phase"],
+                    "model_round": usage.requests,
+                    "issues": diagnostics,
+                    "detail": "草稿轻量检查待修订（"
+                    + "、".join(
+                        f"第{issue['day']}天 {issue['code']}" if "day" in issue else issue["code"]
+                        for issue in diagnostics
+                    )
+                    + "）",
+                }
+            )
             result = {
                 "results": [
                     {
                         "query": q.model_dump(mode="json"),
                         "status": "not_executed",
+                        "code": "draft_light_check_failed",
                         "error": "草稿存在结构或身份问题，先修订草稿后再查询。",
                         "data": None,
                         "cache_hit": False,
@@ -1354,6 +1388,46 @@ async def run_planning_graph(
                 phase=state["planning_phase"],
                 model_round=usage.requests,
             )
+            if (
+                (req.pace == "relaxed" or req.max_transport_minutes is not None)
+                and not state.get("information_request")
+                and not required_routes(draft)[0]
+            ):
+                # Mixed route lookup may consume a walking and a transit call.
+                route_call_bound = 2 if req.transport == "mixed" else 1
+                shortlist = hotel_shortlist(
+                    req,
+                    draft,
+                    data["hotels"],
+                    known_places(),
+                    maps.cache,
+                    max_queries=min(
+                        MAX_BATCH_QUERIES, max(0, maps.max_calls - maps.calls) // route_call_bound
+                    ),
+                    min_leg_minutes=30,
+                )
+                if shortlist is not None:
+                    anchors, hotel_ids, queries = shortlist
+                    if anchors not in compared_hotel_anchors:
+                        compared_hotel_anchors.add(anchors)
+                        if queries:
+                            coverage = await executor.execute(
+                                queries, phase=state["planning_phase"], model_round=usage.requests
+                            )
+                            result["results"].extend(
+                                {**item, "requested_by": "hotel_shortlist"}
+                                for item in coverage["results"]
+                            )
+                            result["new_information"] |= coverage["new_information"]
+                        trace.append(
+                            {
+                                "event": "hotel_shortlist",
+                                "model_round": usage.requests,
+                                "hotel_ids": list(hotel_ids),
+                                "query_count": len(queries),
+                                "detail": f"按相同晚间及次晨地点对照{len(hotel_ids)}家备选住宿，补查{len(queries)}条路线。",
+                            }
+                        )
         results = result["results"]
         log = state.get("query_log", []) + results
         missing, missing_days = ([], []) if light_issues else required_routes(draft)
@@ -1402,6 +1476,10 @@ async def run_planning_graph(
                             trip_wide_decision = True
                 if not required_meal or item["data"]:
                     continue
+            elif item.get("requested_by") == "hotel_shortlist":
+                # These routes compare optional alternatives; the actual draft
+                # still needs verified routes and the full hard-constraint check.
+                continue
             elif not (
                 required_meal
                 or kind == "place_search"
@@ -1540,8 +1618,6 @@ async def run_planning_graph(
         issues = report.get("issues", [])
         can_return = outcome in {"complete", "needs_information"}
         if not eligible and not newly_limited:
-            outcome, can_return = "needs_information", False
-            report["error"] = "规划仍在请求已拦截的资料，已停止本轮补查并保留草稿与历次证据。"
             issues = [
                 {
                     **item,
@@ -1550,12 +1626,22 @@ async def run_planning_graph(
                     "missing_fields": [item["field"]],
                 }
                 for item in limit_feedback
+                if not item["fact_available"]
             ]
-            trace.append({"event": "research_no_progress", "detail": report["error"]})
+            can_return = False
+            if issues:
+                outcome = "needs_information"
+                detail = "规划仍在请求已拦截的资料，已停止本轮补查并保留草稿与历次证据。"
+                report["error"] = detail
+            else:
+                outcome = None
+                detail = "重复请求的资料已经具备，使用当前草稿继续校验。"
+            trace.append({"event": "research_no_progress", "detail": detail})
         elif newly_limited and not eligible:
             issues = [
                 {**item, "category": "missing_fact", "missing_fields": [item["field"]]}
                 for item in newly_limited
+                if not item["fact_available"]
             ]
         if (
             can_return
@@ -1657,13 +1743,17 @@ async def run_planning_graph(
             "draft": state["candidate"].model_dump(mode="json"),
             "program_issues": state["issues"],
             "preference_deviations": preference_deviations(req, state["candidate"], data, maps),
-            # Avoid repeating full original and revised itineraries inside review.
-            # The latest full draft is above; the reviewer's own history retains
-            # its original input, while only explicit decisions cross roles.
+            "ticket_status": ticket_status(state["candidate"]),
+            # Only the cited original positions reach final independent review.
             "review": {
                 "status": state["review"]["status"],
                 "initial": state["review"].get("initial"),
                 "planner_decisions": state["review"].get("planner_response", {}).get("decisions"),
+                **(
+                    {"original_draft": state["review"]["original_draft"]}
+                    if state["review"]["status"] == "awaiting_adjudication"
+                    else {}
+                ),
             },
         }
 
@@ -1835,7 +1925,9 @@ async def run_planning_graph(
         return "propose" if state["issues"] or state.get("facts_updated") else "check_candidate"
 
     def after_research(state):
-        return END if state.get("outcome") else "propose"
+        if state.get("outcome"):
+            return END
+        return "propose" if state.get("facts_updated") or state["issues"] else "check_candidate"
 
     def next_step(state):
         if state.get("outcome"):
@@ -2125,6 +2217,7 @@ async def run_plan(
             "must_visit_ids": [place["id"] for place in data.get("must_visit", [])],
             "routes": itinerary_routes,
             "route_table": route_rows,
+            "ticket_status": ticket_status(measured),
             "daily_metrics": metrics,
             "timing_coverage": {
                 "stop_count": len(measured.stops),

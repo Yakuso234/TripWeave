@@ -83,6 +83,7 @@ async def test_direction_mode_and_phase_are_bound_and_duplicate_reasons_do_not_s
         assert first["new_information"] is True and second["new_information"] is False
         assert first["data"]["origin_id"] == "a" and first["data"]["destination_id"] == "b"
         assert first["data"]["duration_minutes"] == 10
+        assert first["data"]["checked_modes"] == second["data"]["checked_modes"] == ["walking"]
         assert maps.calls == len(calls) == 1
         assert [event["model_round"] for event in trace] == [1, 1]
         assert all(event["phase"] == "draft_evidence" for event in trace)
@@ -91,14 +92,17 @@ async def test_direction_mode_and_phase_are_bound_and_duplicate_reasons_do_not_s
 
 
 async def test_reverse_route_is_a_new_query_and_caller_mutation_does_not_corrupt_cache():
-    async with workspace() as (executor, _, _, calls):
+    async with workspace() as (executor, maps, _, calls):
         first = await executor.execute([route()])
         first["results"][0]["data"]["duration_minutes"] = 999
+        first["results"][0]["data"]["checked_modes"].append("transit")
         reverse = await executor.execute([route(origin_id="b", destination_id="a")])
         repeated = await executor.execute([route()], phase="revision", model_round=3)
         assert len(calls) == 2 and reverse["new_information"] is True
         assert repeated["new_information"] is False
         assert repeated["results"][0]["data"]["duration_minutes"] == 10
+        assert repeated["results"][0]["data"]["checked_modes"] == ["walking"]
+        assert maps.cache[("a", "b", "mixed")]["checked_modes"] == ["walking"]
         assert repeated["results"][0]["phase"] == "revision"
         assert repeated["results"][0]["model_round"] == 3
 
@@ -313,6 +317,7 @@ async def test_mixed_accepts_walking_and_reuses_it_even_after_map_budget_is_exha
         second = await executor.execute([route()])
         assert second["results"][0]["status"] == "ok"
         assert second["results"][0]["cache_hit"]
+        assert second["results"][0]["data"]["checked_modes"] == ["walking"]
         assert len(calls) == before == 1
 
 

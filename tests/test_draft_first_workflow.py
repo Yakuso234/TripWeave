@@ -125,6 +125,81 @@ async def test_automatic_hotel_comparisons_reopen_planning_only_for_useful_alter
     assert len(map_routes) == len(set(map_routes)) == (7 if can_improve else 5)
 
 
+async def test_program_adds_bounded_hotel_comparisons_when_planner_only_queries_draft_routes():
+    draft = itinerary(days=2)
+    draft["hotel_id"] = "h0"
+    draft["stops"].insert(
+        1,
+        {
+            **draft["stops"][0],
+            "place_id": "h0",
+            "kind": "hotel",
+            "start_time": "17:00",
+            "end_time": "18:00",
+        },
+    )
+    switched = deepcopy(draft)
+    switched["hotel_id"] = switched["stops"][1]["place_id"] = "h3"
+    hotels = [
+        {
+            **poi(f"h{i}", f"合成住宿{i}", "住宿服务;宾馆酒店", x=x),
+            "citycode": "021",
+            "cityname": "上海市",
+        }
+        for i, x in enumerate((15, 4, 5, 6, 20))
+    ]
+    hotel_durations = {
+        raw["location"]: duration
+        for raw, duration in zip(hotels, (45, 32, 32, 15, 60), strict=True)
+    }
+    directions, planning = [], []
+
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            if request.url.params.get("types") == "100000":
+                return httpx2.Response(200, json={"status": "1", "pois": deepcopy(hotels)})
+            if "/direction/" in request.url.path:
+                pair = request.url.params["origin"], request.url.params["destination"]
+                directions.append(pair)
+                duration = hotel_durations.get(pair[0], hotel_durations.get(pair[1], 5))
+                return httpx2.Response(
+                    200,
+                    json={
+                        "status": "1",
+                        "route": {"paths": [{"duration": str(duration * 60), "distance": "500"}]},
+                    },
+                )
+            return map_response(request)
+        body = json.loads(request.content)
+        prompt = json.loads(body["messages"][-1]["content"])
+        if tool_names(body) == {"review_report"}:
+            assert prompt["draft"] == switched
+            return reply("review_report", {"summary": "合成通过。", "suggestions": []})
+        planning.append(prompt)
+        if len(planning) == 1:
+            return reply(
+                "draft_proposal", packet(draft, queries=route_queries(draft, transport="walking"))
+            )
+        assert set(prompt["hotel_comparisons"]) == {"h1", "h2", "h3"}
+        assert len(planning) == 2
+        return reply("draft_proposal", phase_packet(prompt, switched, queries=[]))
+
+    output = await run_plan(
+        requirements(days=2, nights=1, pace="relaxed", transport="walking"),
+        "deepseek",
+        configured(),
+        transport=httpx2.MockTransport(provider),
+    )
+    assert output["outcome"] == "ready", output
+    assert output["itinerary"] == switched
+    assert len(directions) == len(set(directions)) == 9
+    assert (
+        len([item for item in output["query_log"] if item.get("requested_by") == "hotel_shortlist"])
+        == 6
+    )
+    assert len([item for item in output["trace"] if item["event"] == "hotel_shortlist"]) == 1
+
+
 async def test_first_model_response_is_saved_before_any_declared_map_query_and_has_no_tools():
     calls, saved, directions = [], [], []
 
@@ -208,6 +283,54 @@ async def test_cache_reuse_is_normal_and_does_not_trigger_false_no_progress():
     assert len(result["query_log"]) == 2 and result["query_log"][1]["cache_hit"]
 
 
+@pytest.mark.parametrize("first_draft_days", [[], [1]])
+async def test_missing_dates_are_repaired_by_day_before_routes_and_review(first_draft_days):
+    plan = itinerary(days=2)
+    plan["stops"][1]["kind"] = "meal"
+    first = {**plan, "stops": [s for s in plan["stops"] if s["day"] in first_draft_days]}
+    events = []
+
+    def provider(request):
+        if request.url.host != "api.deepseek.com":
+            if "/direction/" in request.url.path:
+                events.append("route")
+            return map_response(request)
+        body = json.loads(request.content)
+        context = json.loads(body["messages"][-1]["content"])
+        if tool_names(body) == {"review_report"}:
+            events.append("review")
+            assert context["draft"] == plan and context["program_issues"] == []
+            return reply("review_report", {"summary": "合成复核通过。", "suggestions": []})
+        if context["task"] == "first_draft":
+            events.append("first_draft")
+            return reply("draft_proposal", packet(first))
+        events.append("repair")
+        missing = sorted({1, 2} - set(first_draft_days))
+        assert context["revision_days"] == missing
+        assert [(i["code"], i["day"]) for i in context["validation_issues"]] == [
+            ("missing_day", day) for day in missing
+        ]
+        return reply("draft_proposal", phase_packet(context, plan))
+
+    result = await run_plan(
+        requirements(days=2, nights=0),
+        "deepseek",
+        configured(),
+        transport=httpx2.MockTransport(provider),
+    )
+    assert result["outcome"] == "ready" and result["itinerary"] == plan, result
+    assert events == ["first_draft", "repair", "route", "route", "review"]
+    feedback = next(row for row in result["trace"] if row["event"] == "draft_light_check")
+    assert feedback["model_round"] == 1
+    assert feedback["issues"] == [
+        {"code": "missing_day", "day": day} for day in sorted({1, 2} - set(first_draft_days))
+    ]
+    assert result["ticket_status"] == {
+        "purchase_requirement": "unverified",
+        "availability": "unverified",
+    }
+
+
 @pytest.mark.parametrize("mode", ["ordinary", "empty", "failed", "required", "hard_overlap"])
 async def test_restaurant_results_skip_replanning_except_when_decisive_or_draft_is_invalid(mode):
     plan = itinerary()
@@ -233,6 +356,7 @@ async def test_restaurant_results_skip_replanning_except_when_decisive_or_draft_
                             **poi("r", "合成餐厅", "餐饮服务"),
                             "citycode": "021",
                             "cityname": "上海市",
+                            "biz_ext": {"rating": "4.5"},
                         }
                     ]
                 )
@@ -271,8 +395,8 @@ async def test_restaurant_results_skip_replanning_except_when_decisive_or_draft_
     if mode == "failed":
         assert meal_evidence == [] and result["query_log"][-1]["status"] == "error"
     else:
-        assert [item["id"] for item in meal_evidence[0]["options"]] == (
-            [] if mode == "empty" else ["r"]
+        assert [(item["id"], item["rating"]) for item in meal_evidence[0]["options"]] == (
+            [] if mode == "empty" else [("r", 4.5)]
         )
 
 

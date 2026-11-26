@@ -117,6 +117,7 @@ async def test_missing_walk_can_use_real_transit_response_only_in_mixed_mode():
         b = {"id": "b", "name": "B", "longitude": 121.5, "latitude": 31.3}
         leg = await maps.route(a, b, "上海", "mixed")
         assert leg["duration_minutes"] == 15 and leg["mode"] == "公共交通"
+        assert leg["checked_modes"] == ["walking", "transit"]
         assert len(calls) == 2
         with pytest.raises(MapError, match="可用路线"):
             await maps.route(a, b, "上海", "walking")

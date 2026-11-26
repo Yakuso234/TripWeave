@@ -229,6 +229,7 @@ class MapClient:
                 "duration_minutes": 0,
                 "distance_meters": 0,
                 "mode": "同一地点",
+                "checked_modes": [],
                 "source": "同一POI",
                 "queried_at": datetime.now(UTC).isoformat(),
             }
@@ -264,6 +265,7 @@ class MapClient:
             return valid
 
         paths = read_routes(walk, "paths", walk_path)
+        checked_modes = ["walking"]
         best, transport = min(paths) if paths else None, "步行"
         if mode == "mixed" and (best is None or best[0] > 1800):
             transit_path = "/v3/direction/transit/integrated"
@@ -272,6 +274,7 @@ class MapClient:
                 {**params, "city": city, "cityd": city, "extensions": "base"},
             )
             alternatives = read_routes(transit, "transits", transit_path)
+            checked_modes.append("transit")
             if alternatives:
                 candidate = min(alternatives)
                 if best is None or candidate[0] < best[0]:
@@ -285,6 +288,7 @@ class MapClient:
             "duration_minutes": duration,
             "distance_meters": meters,
             "mode": transport,
+            "checked_modes": checked_modes,
             "source": "高德路线查询（估算）",
             "queried_at": datetime.now(UTC).isoformat(),
         }

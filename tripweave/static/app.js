@@ -565,6 +565,11 @@ function transferSummary(stop) {
   const rests=(items,label)=>(items || []).map(r=>`<span>${label} ${esc(r.start_time)}–${esc(r.end_time)}</span>`).join(' · ');
   return `<div class="leg">结构化衔接：${esc(t.departure_time)} 出发 → ${esc(t.arrival_time)} 到达 · 建议缓冲 ${esc(t.buffer_minutes ?? 0)} 分钟${t.rest_before?.length?'<br>'+rests(t.rest_before,'出发前休息'):''}${t.rest_after?.length?'<br>'+rests(t.rest_after,'到达后休息'):''}</div>`;
 }
+function checkedRouteModes(route) {
+  if (!Array.isArray(route?.checked_modes)) return '';
+  return [route.checked_modes.includes('walking') ? '步行' : '',
+    route.checked_modes.includes('transit') ? '公共交通' : ''].filter(Boolean).join('、');
+}
 function routeEvidenceSummary(route) {
   if (!route) return '';
   if (route.status === 'unknown') return '<div class="leg">路线 · 待查询</div>';
@@ -573,7 +578,8 @@ function routeEvidenceSummary(route) {
     ? ` · 站间最多余 ${esc(route.buffer_minutes)} 分钟，实际出发与休息待确认`
     : ` · 按当前安排余 ${esc(route.buffer_minutes)} 分钟`;
   const distance = route.distance_meters ? ` · ${(route.distance_meters/1000).toFixed(1)} 公里` : '';
-  return `<div class="leg">路线 · 已取得高德估算：${esc(route.mode)}约 ${esc(route.duration_minutes)} 分钟${distance}${buffer}</div>`;
+  const modes = checkedRouteModes(route);
+  return `<div class="leg">路线 · 已取得高德估算：${esc(route.mode)}约 ${esc(route.duration_minutes)} 分钟${distance}${buffer}${modes?` · 已查询方式 ${modes}`:''}</div>`;
 }
 function savedDraftDetails(draft, places, title='查看未核实草稿', routeRows=[]) {
   if (!draft?.stops?.length) return '<p class="muted small">尚未保存行程草稿。</p>';
@@ -618,9 +624,10 @@ function queryRecords(items, places) {
     const callInfo=[item.model_round != null ? '模型第 '+item.model_round+' 轮' : '',phase,item.elapsed_ms != null ? item.elapsed_ms+'毫秒' : ''].filter(Boolean).join(' · ');
     const error=result.error?.message || result.error?.code || result.error || item.error?.message || item.error;
     const options = result.data || item.data;
+    const modes = kind === 'route' ? checkedRouteModes(options) : '';
     const meals = kind === 'nearby_restaurants' && status === 'ok' && Array.isArray(options) && options.length
       ? `<p class="small">附近候选（供餐待核实）：${options.map(place=>esc(place.name)).join('、')}</p>` : '';
-    return `<li><strong>${esc(label)} · ${esc(location)}</strong>${query.transport?`<span class="small"> · ${esc(({mixed:'综合交通',walking:'步行'})[query.transport] || query.transport)}</span>`:''}${query.reason?`<p>${esc(query.reason)}</p>`:''}${callInfo?`<p class="small muted">${esc(callInfo)}</p>`:''}${status?`<p class="small">${esc(resultLabel)}</p>`:''}${meals}${error?`<p class="danger small">${esc(error)}</p>`:''}</li>`;
+    return `<li><strong>${esc(label)} · ${esc(location)}</strong>${query.transport?`<span class="small"> · ${esc(({mixed:'综合交通',walking:'步行'})[query.transport] || query.transport)}</span>`:''}${query.reason?`<p>${esc(query.reason)}</p>`:''}${callInfo?`<p class="small muted">${esc(callInfo)}</p>`:''}${status?`<p class="small">${esc(resultLabel)}</p>`:''}${modes?`<p class="small">已查询方式 ${modes}</p>`:''}${meals}${error?`<p class="danger small">${esc(error)}</p>`:''}</li>`;
   }).join('')}</ol>`;
 }
 function draftUncertainties(record) {
@@ -669,11 +676,16 @@ function itinerarySummary(plan, requirements, issues) {
   const pending = (requirements.must_visit || []).map(name => `<li>${esc(name)} · 暂无安排记录</li>`).join('');
   const check = planningOutcomeLabel(plan);
   const supplied = (plan.research_facts || []).filter(fact => fact.evidence_status === 'user_reported');
+  const ticketChecks = [
+    plan.ticket_status?.purchase_requirement === 'unverified' ? '购票要求待核实' : '',
+    plan.ticket_status?.availability === 'unverified' ? '实时余票待核实' : '',
+  ].filter(Boolean);
   return `<section class="card summary-card">
     <div class="section-title"><h2>行程摘要</h2>${tag(check, !isReadyPlan(plan))}</div>
     ${plan.revision_notes ? `<p><strong>本次修改要求</strong> ${esc(plan.revision_notes)}</p>` : ''}
     ${required || pending ? `<h3>必去景点</h3><ul>${required || pending}</ul>` : ''}
     ${planningOutcomeMessage(plan) ? `<p class="small">${esc(planningOutcomeMessage(plan))}</p>` : ''}
+    ${ticketChecks.length ? `<p class="notice"><strong>票务核实状态</strong> ${ticketChecks.join(' · ')}</p>` : ''}
     ${issues.length ? `<div class="notice danger">${issues.map(esc).join('<br>')}</div>` : ''}
     ${supplied.length ? `<h3>你补充的资料</h3><ul>${supplied.map(fact=>`<li>${esc(dateFor(fact.day,requirements))} · ${esc(places.get(fact.place_id) || fact.place_id)} · ${esc(researchFieldLabels[fact.field] || fact.field)}：${esc(fact.value)}${(fact.windows || []).map(window=>` ${esc(window.start_time)}–${esc(window.end_time)}`).join('、')}</li>`).join('')}</ul>` : ''}
     ${pacingSummary(plan)}
@@ -1000,7 +1012,11 @@ function changeDraft(key, value) {
     // A destination change invalidates city-specific facts, including a previous booking.
     S.draft.origin_query = ''; S.draft.booking_query = ''; S.draft.hotel_id = null;
     S.draft.selected_attractions = [];
-    if (S.draft.visit_constraints?.length) toast('目的地已变更，原城市的景点时间要求已清空，请重新填写。');
+    const cleared = [];
+    if (S.draft.must_visit?.length) cleared.push('必去景点');
+    if (S.draft.visit_constraints?.length) cleared.push('景点时间要求');
+    if (cleared.length) toast('目的地已变更，原城市的'+cleared.join('和')+'已清空，请重新填写。');
+    S.draft.must_visit = [];
     S.draft.visit_constraints = [];
     S.visitDayInputs = Object.create(null);
     resetHotels();

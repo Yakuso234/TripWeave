@@ -265,7 +265,15 @@ def test_early_identity_check_rejects_unknown_place_day_hotel_and_reversed_time_
     )
     before = plan.model_dump()
     issues = check_draft_identity(req, plan, {"museum": {}}, [{"id": "manual"}])
-    assert {i["code"] for i in issues} == {"hotel", "hotel_choice", "day", "identity", "time"}
+    assert {i["code"] for i in issues} == {
+        "hotel",
+        "hotel_choice",
+        "day",
+        "identity",
+        "time",
+        "missing_day",
+    }
+    assert [i["day"] for i in issues if i["code"] == "missing_day"] == [1, 2]
     assert plan.model_dump() == before
     assert next(i for i in issues if i["code"] == "identity")["day"] == 3
 
@@ -282,7 +290,15 @@ def test_selected_hotel_and_hotel_stop_identity_are_checked():
                 "start_time": "19:00",
                 "end_time": "20:00",
                 "reason": "return",
-            }
+            },
+            {
+                "day": 2,
+                "place_id": "manual",
+                "kind": "meal",
+                "start_time": "09:00",
+                "end_time": "10:00",
+                "reason": "附近用餐",
+            },
         ],
     )
     issues = check_draft_identity(req, plan, {"manual": {}, "other": {}}, {"manual": {}})

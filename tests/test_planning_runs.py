@@ -160,6 +160,10 @@ def test_api_draft_callback_persists_before_completion_and_links_final_candidate
         assert run["draft"] == draft("根据资料修改后的安排")
         assert run["status"] == ("completed" if ready else "incomplete")
         assert run["query_log"] == candidate["query_log"]
+        assert app.state.store.finish_planning_run(trip["id"], run["id"], candidate) == run
+        history = client.get(base + "/history").json()
+        assert [item["id"] for item in history["candidates"]] == [candidate["id"]]
+        assert sum(event["kind"] == "candidate_generated" for event in history["events"]) == 1
         assert client.get(base).json()["accepted_version"] == 0
         assert client.post(base + f"/candidates/{run['id']}/accept").status_code == 404
     with TestClient(application.create_app(database)) as restarted:
@@ -189,6 +193,40 @@ def test_model_exception_keeps_first_draft_and_does_not_save_private_exception_b
         assert "PRIVATE-" not in str(run)
         assert client.get(base + "/history").json()["candidates"] == []
         assert client.get(base).json()["accepted_version"] == 0
+
+
+def test_failed_run_finalization_does_not_publish_a_candidate_or_generation_event(
+    tmp_path, monkeypatch
+):
+    settings(monkeypatch)
+    replace_run = Store._replace_planning_run
+
+    def reject_completion(self, connection, old_body, run):
+        if run["status"] == "completed":
+            raise StoreError(503, "模拟运行记录写入失败")
+        return replace_run(self, connection, old_body, run)
+
+    async def simulated(*args, on_draft, **kwargs):
+        await on_draft(progress())
+        return {
+            "status": "ready",
+            "outcome": "ready",
+            "itinerary": draft("正式候选"),
+            "review": {"status": "approved"},
+            "issues": [],
+        }
+
+    monkeypatch.setattr(Store, "_replace_planning_run", reject_completion)
+    monkeypatch.setattr(application, "run_plan", simulated)
+    with TestClient(application.create_app(str(tmp_path / "atomic-result.sqlite3"))) as client:
+        _, base = create_trip(client)
+        assert client.post(base + "/plan", json={}).status_code == 503
+        history = client.get(base + "/history").json()
+        assert history["candidates"] == []
+        assert all(event["kind"] != "candidate_generated" for event in history["events"])
+        run = client.get(base + "/planning-runs").json()["runs"][0]
+        assert run["status"] == "interrupted" and run["candidate_id"] is None
+        assert run["draft"] == draft()
 
 
 def test_run_listing_is_trip_scoped_and_missing_keys_do_not_create_execution(tmp_path, monkeypatch):

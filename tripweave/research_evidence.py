@@ -15,14 +15,19 @@ FIELD_NAMES = {
 }
 
 _ENTRY = r"(?:入场|入馆|入园|进馆|入内|检票)"
-_CLOCK = r"((?<!\d)(?:[01]?\d|2[0-3])(?::[0-5]\d|[点时](?:[0-5]?\d分?)?)(?!\d))"
+_CLOCK = (
+    r"(?<![\d:])(?:(?P<period_cn>凌晨|早上|上午|中午|下午|傍晚|晚上)\s*)?"
+    r"(?P<hour>[01]?\d|2[0-3])(?::(?P<minute>[0-5]\d)|[点时](?:(?P<minute_cn>[0-5]?\d)分?|(?P<half>半))?)"
+    r"(?![\d:])(?:\s*(?P<period_en>[ap]\.?m\.?)(?![a-z]))?"
+)
+_CLOCK_IN_TEXT = re.compile(_CLOCK, re.IGNORECASE)
 _ADMISSION_PATTERNS = (
     re.compile(
         rf"(?:最晚{_ENTRY}|(?:停止|截止){_ENTRY}|{_ENTRY}(?:时间)?截止|"
         rf"last\s+(?:entry|admission))(?:时间)?\s*(?:[:：为是]|(?:is|at)\b)?\s*{_CLOCK}",
         re.IGNORECASE,
     ),
-    re.compile(rf"{_CLOCK}\s*(?:后|以后|起)?(?:停止|截止|不再(?:允许)?)\s*{_ENTRY}"),
+    re.compile(rf"{_CLOCK}\s*(?:后|以后|起)?(?:停止|截止|不再(?:允许)?)\s*{_ENTRY}", re.IGNORECASE),
 )
 _RESERVATION_EXEMPT = re.compile(
     r"(?:无需|无须|不用|不必|不再需要|不再要求|不需要|不需|不强制)(?:提前|事先|实名|线上)*预约|"
@@ -46,16 +51,40 @@ _GROUP_ONLY = re.compile(r"团队|团体|旅行团|group\s+(?:visits?|tours?|boo
 _CLAUSE_BREAK = re.compile(r"[，,。！？!?；;\n]+")
 
 
+def _time_of_day(match: re.Match[str]) -> str | None:
+    hour = int(match["hour"])
+    minute = 30 if match["half"] else int(match["minute"] or match["minute_cn"] or 0)
+    period = None
+    if match["period_cn"]:
+        period = "am" if match["period_cn"] in ("凌晨", "早上", "上午") else "pm"
+    if match["period_en"]:
+        suffix = match["period_en"][0].lower() + "m"
+        if not 1 <= hour <= 12 or (period and period != suffix):
+            return None
+        period = suffix
+    if period == "am":
+        if hour > 12:
+            return None
+        hour %= 12
+    elif period == "pm" and hour < 12:
+        hour += 12
+    return f"{hour:02d}:{minute:02d}"
+
+
 def admission_supported(value: str, quote: str, target_date: str | None = None) -> bool:
     clocks = []
     for clause in _CLAUSE_BREAK.split(normalize("NFKC", quote)):
-        stated = [match[1] for pattern in _ADMISSION_PATTERNS for match in pattern.finditer(clause)]
+        stated = [
+            _time_of_day(match)
+            for pattern in _ADMISSION_PATTERNS
+            for match in pattern.finditer(clause)
+        ]
         if not stated or _GROUP_ONLY.search(clause) or conflicting_dates(target_date, clause):
             continue
         if _CONDITIONAL_SCOPE.search(clause) or re.search(r"夜场|夜游|night\s+session", clause):
             return False
         clocks.extend(stated)
-    return bool(clocks) and all(clock_in_quote(value, clock) for clock in clocks)
+    return bool(clocks) and all(clock == value for clock in clocks)
 
 
 def reservation_in_quote(quote: str, target_date: str | None = None) -> bool | None:
@@ -152,14 +181,9 @@ def conflicting_dates(target: str | None, text: str) -> list[str]:
 
 
 def clock_in_quote(value: str, quote: str) -> bool:
-    hour, minute = map(int, value.split(":"))
-    for match in re.finditer(r"(?<!\d)(\d{1,2})[:：](\d{2})(?!\d)", quote):
-        if (int(match[1]), int(match[2])) == (hour, minute):
-            return True
-    for match in re.finditer(r"(?<!\d)(\d{1,2})[点时](?:(\d{1,2})分?)?", quote):
-        if (int(match[1]), int(match[2] or 0)) == (hour, minute):
-            return True
-    return False
+    return any(
+        _time_of_day(match) == value for match in _CLOCK_IN_TEXT.finditer(normalize("NFKC", quote))
+    )
 
 
 def match_quote(quote: str, excerpt: str) -> tuple[str, str] | None:
@@ -357,7 +381,7 @@ def validate_evidence(empty_facts, proposals, searches):
             if not cutoff:
                 reject("extraction", "admission_structure_missing", "缺少明确的最晚入场钟点。")
                 continue
-            if not clock_in_quote(cutoff, normalize("NFKC", source_quote)):
+            if not clock_in_quote(cutoff, source_quote):
                 reject(
                     "evidence",
                     "admission_time_not_in_quote",
